@@ -146,7 +146,6 @@ def main():
     tgt = torch.cat(all_tgt, dim=0)
 
     print(f"[data] windows={len(tgt):,} vocab={tok.vocab_size}")
-
     model = VQWordGNN(
         vocab_size=tok.vocab_size,
         d_model=args.d_model,
@@ -154,45 +153,8 @@ def main():
         n_layers=args.n_layers,
     ).to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-    n = len(tgt)
-
-    for ep in range(1, args.epochs + 1):
-        perm = torch.randperm(n)
-        total_loss = 0.0
-        total_ce = 0.0
-
-        model.train()
-        pbar = tqdm(range(0, n, args.batch_size), desc=f"[train] epoch {ep}")
-
-        for start in pbar:
-            idx = perm[start:start + args.batch_size]
-            xb = ctx[idx].to(device)
-            yb = tgt[idx].to(device)
-
-            loss, logits, _ = model(xb, yb)
-
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-
-            bs = len(idx)
-            total_loss += float(loss.detach()) * bs
-            total_ce += float(loss.detach()) * bs
-
-            denom = max(1, start + bs)
-            pbar.set_postfix(
-                loss=total_loss / denom,
-                ppl=math.exp(min(20, total_ce / denom)),
-            )
-
-        print(
-            f"[epoch {ep}] "
-            f"ce={total_ce/n:.4f} "
-            f"ppl={math.exp(min(20, total_ce/n)):.2f}"
-        )
+    # No pretraining.
+    # Directly encode local token windows and run KMeans.
 
     print("[kmeans] collecting embeddings")
     z = collect_embeddings(model, ctx, args.batch_size, device)
