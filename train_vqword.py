@@ -219,9 +219,6 @@ def main():
         {
             "model": model.state_dict(),
             "centroids": centroids,
-            "vq_ids": vq_ids,
-            "ctx": ctx,
-            "tgt": tgt,
             "args": vars(args),
             "tokenizer": args.tokenizer,
             "pad_token_id": tok.pad_token_id,
