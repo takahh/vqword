@@ -226,6 +226,18 @@ def main():
         args.out,
     )
 
+    id_out = args.out.replace(".pt", "_ids.pt")
+    torch.save(
+        {
+            "vq_ids": vq_ids,
+            "tgt": tgt,
+        },
+        id_out,
+    )
+
+    print(f"[save model] {args.out}")
+    print(f"[save ids] {id_out}")
+
     print(f"[save] {args.out}")
 
 
