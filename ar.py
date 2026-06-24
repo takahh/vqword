@@ -60,14 +60,15 @@ class ARVQWordLM(nn.Module):
         dropout=0.1,
         max_len=512,
         use_token_input=True,
+        use_vq_input=True,
     ):
         super().__init__()
         self.use_token_input = use_token_input
+        self.use_vq_input = use_vq_input
 
-        self.vq_emb = nn.Embedding(vq_vocab_size, d_model)
+        self.vq_emb = nn.Embedding(vq_vocab_size, d_model) if use_vq_input else None
         self.tok_emb = nn.Embedding(vocab_size, d_model) if use_token_input else None
         self.pos_emb = nn.Embedding(max_len, d_model)
-
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -86,10 +87,13 @@ class ARVQWordLM(nn.Module):
         B, L = tok_in.shape
         pos = torch.arange(L, device=tok_in.device)[None, :]
 
-        h = self.vq_emb(vq_in) + self.pos_emb(pos)
+        h = self.pos_emb(pos).expand(B, L, -1)
+
+        if self.use_vq_input:
+            h = h + self.vq_emb(vq_in)
+
         if self.use_token_input:
             h = h + self.tok_emb(tok_in)
-
         causal = torch.triu(
             torch.ones(L, L, device=tok_in.device, dtype=torch.bool),
             diagonal=1,
@@ -102,7 +106,6 @@ class ARVQWordLM(nn.Module):
         )
         h = self.norm(h)
         return self.tok_head(h), self.vq_head(h)
-
 
 @torch.no_grad()
 def evaluate(model, loader, device, aux_lambda):
@@ -156,12 +159,20 @@ def main():
     ap.add_argument("--aux_lambda", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vq_only", action="store_true")
+    ap.add_argument("--token_only", action="store_true")
+
     args = ap.parse_args()
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if args.vq_only and args.token_only:
+        raise ValueError("Choose at most one of --vq_only or --token_only")
+
+    use_token_input = not args.vq_only
+    use_vq_input = not args.token_only
 
     data = torch.load(args.ids, map_location="cpu")
     samples = data["samples"]
@@ -208,7 +219,8 @@ def main():
         n_heads=args.n_heads,
         dropout=args.dropout,
         max_len=1024,
-        use_token_input=not args.vq_only,
+        use_token_input=use_token_input,
+        use_vq_input=use_vq_input,
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
