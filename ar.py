@@ -163,6 +163,14 @@ def main():
 
     args = ap.parse_args()
 
+    history = {
+        "epoch": [],
+        "valid_loss": [],
+        "valid_ppl": [],
+        "test_loss": [],
+        "test_ppl": [],
+    }
+
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -285,8 +293,15 @@ def main():
                 "pad_token_id": pad_token_id,
                 "valid_loss": valid_loss,
                 "test_loss": test_loss,
+                "history": history,
             }, args.out)
             print(f"[save] {args.out}")
+
+        history["epoch"].append(ep)
+        history["valid_loss"].append(valid_loss)
+        history["valid_ppl"].append(valid_ppl)
+        history["test_loss"].append(test_loss)
+        history["test_ppl"].append(test_ppl)
 
 
 if __name__ == "__main__":
