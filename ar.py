@@ -129,21 +129,26 @@ def evaluate(model, loader, device, aux_lambda):
             ignore_index=-100,
             reduction="sum",
         )
-        vq_loss = F.cross_entropy(
-            vq_logits.reshape(-1, vq_logits.size(-1)),
-            vq_y.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
 
         n = tok_y.ne(-100).sum().item()
-        loss = tok_loss + aux_lambda * vq_loss
+
+        if aux_lambda > 0:
+            vq_loss = F.cross_entropy(
+                vq_logits.reshape(-1, vq_logits.size(-1)),
+                vq_y.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            loss = tok_loss + aux_lambda * vq_loss
+        else:
+            vq_loss = torch.tensor(0.0, device=device)
+            loss = tok_loss
+
         total_loss += loss.item()
         total_tok += n
 
     avg = total_loss / max(total_tok, 1)
     return avg, math.exp(min(avg, 20))
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -254,13 +259,16 @@ def main():
                 tok_y.reshape(-1),
                 ignore_index=-100,
             )
-            vq_loss = F.cross_entropy(
-                vq_logits.reshape(-1, vq_logits.size(-1)),
-                vq_y.reshape(-1),
-                ignore_index=-100,
-            )
-
-            loss = tok_loss + args.aux_lambda * vq_loss
+            if args.aux_lambda > 0:
+                vq_loss = F.cross_entropy(
+                    vq_logits.reshape(-1, vq_logits.size(-1)),
+                    vq_y.reshape(-1),
+                    ignore_index=-100,
+                )
+                loss = tok_loss + args.aux_lambda * vq_loss
+            else:
+                vq_loss = torch.tensor(0.0, device=device)
+                loss = tok_loss
 
             opt.zero_grad()
             loss.backward()
@@ -302,6 +310,18 @@ def main():
                 "history": history,
             }, args.out)
             print(f"[save] {args.out}")
+
+        torch.save({
+            "model": model.state_dict(),
+            "args": vars(args),
+            "tokenizer": data["tokenizer"],
+            "vq_vocab_size": vq_vocab_size,
+            "vq_pad_id": vq_pad_id,
+            "pad_token_id": pad_token_id,
+            "valid_loss": valid_loss,
+            "test_loss": test_loss,
+            "history": history,
+        }, args.out.replace(".pt", "_last.pt"))
 
 
 
