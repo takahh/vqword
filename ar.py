@@ -282,6 +282,12 @@ def main():
             f"test_loss={test_loss:.4f} test_ppl={test_ppl:.2f}"
         )
 
+        history["epoch"].append(ep)
+        history["valid_loss"].append(valid_loss)
+        history["valid_ppl"].append(valid_ppl)
+        history["test_loss"].append(test_loss)
+        history["test_ppl"].append(test_ppl)
+
         if valid_loss < best_valid:
             best_valid = valid_loss
             torch.save({
@@ -297,11 +303,6 @@ def main():
             }, args.out)
             print(f"[save] {args.out}")
 
-        history["epoch"].append(ep)
-        history["valid_loss"].append(valid_loss)
-        history["valid_ppl"].append(valid_ppl)
-        history["test_loss"].append(test_loss)
-        history["test_ppl"].append(test_ppl)
 
 
 if __name__ == "__main__":
