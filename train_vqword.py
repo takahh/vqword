@@ -161,14 +161,23 @@ def main():
     z_np = z.numpy()
 
     print("[kmeans] fitting")
+    # kmeans = MiniBatchKMeans(
+    #     n_clusters=args.codebook_size,
+    #     batch_size=args.kmeans_batch_size,
+    #     random_state=0,
+    #     verbose=1,
+    #     n_init="auto",
+    # )
     kmeans = MiniBatchKMeans(
         n_clusters=args.codebook_size,
         batch_size=args.kmeans_batch_size,
         random_state=0,
         verbose=1,
-        n_init="auto",
+        n_init=3,
+        max_iter=20,
+        max_no_improvement=20,
+        reassignment_ratio=0.0,
     )
-
     vq_ids = kmeans.fit_predict(z_np)
 
     used = len(set(vq_ids.tolist()))
