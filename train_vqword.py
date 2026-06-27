@@ -21,6 +21,46 @@ def make_adj(seq_len, hop, device):
     adj = adj / deg
     return adj
 
+from sklearn.cluster import MiniBatchKMeans
+import numpy as np
+
+@torch.no_grad()
+def fit_kmeans_streaming(model, ctx, batch_size, device, args):
+    model.eval()
+
+    kmeans = MiniBatchKMeans(
+        n_clusters=args.codebook_size,
+        batch_size=args.kmeans_batch_size,
+        init="random",
+        n_init=1,
+        max_iter=1,              # partial_fitなので1でよい
+        reassignment_ratio=0.0,
+        random_state=0,
+        verbose=1,
+    )
+
+    print("[kmeans] partial_fit streaming")
+    for start in tqdm(range(0, len(ctx), batch_size), desc="[kmeans fit]"):
+        xb = ctx[start:start + batch_size].to(device)
+        z = model.encode_context(xb).cpu().numpy().astype(np.float32)
+        kmeans.partial_fit(z)
+
+    return kmeans
+
+
+@torch.no_grad()
+def predict_kmeans_streaming(model, kmeans, ctx, batch_size, device):
+    model.eval()
+    ids = []
+
+    print("[kmeans] predict streaming")
+    for start in tqdm(range(0, len(ctx), batch_size), desc="[kmeans predict]"):
+        xb = ctx[start:start + batch_size].to(device)
+        z = model.encode_context(xb).cpu().numpy().astype(np.float32)
+        pred = kmeans.predict(z)
+        ids.append(torch.from_numpy(pred).long())
+
+    return torch.cat(ids, dim=0)
 
 class AdjGNNLayer(nn.Module):
     def __init__(self, d_model):
@@ -156,29 +196,45 @@ def main():
     # No pretraining.
     # Directly encode local token windows and run KMeans.
 
-    print("[kmeans] collecting embeddings")
-    z = collect_embeddings(model, ctx, args.batch_size, device)
-    z_np = z.numpy()
-
-    print("[kmeans] fitting")
+    # print("[kmeans] collecting embeddings")
+    # z = collect_embeddings(model, ctx, args.batch_size, device)
+    # z_np = z.numpy()
+    #
+    # print("[kmeans] fitting")
+    # # kmeans = MiniBatchKMeans(
+    # #     n_clusters=args.codebook_size,
+    # #     batch_size=args.kmeans_batch_size,
+    # #     random_state=0,
+    # #     verbose=1,
+    # #     n_init="auto",
+    # # )
     # kmeans = MiniBatchKMeans(
     #     n_clusters=args.codebook_size,
     #     batch_size=args.kmeans_batch_size,
     #     random_state=0,
     #     verbose=1,
-    #     n_init="auto",
+    #     n_init=3,
+    #     max_iter=20,
+    #     max_no_improvement=20,
+    #     reassignment_ratio=0.0,
     # )
-    kmeans = MiniBatchKMeans(
-        n_clusters=args.codebook_size,
-        batch_size=args.kmeans_batch_size,
-        random_state=0,
-        verbose=1,
-        n_init=3,
-        max_iter=20,
-        max_no_improvement=20,
-        reassignment_ratio=0.0,
+    # vq_ids = kmeans.fit_predict(z_np)
+
+    kmeans = fit_kmeans_streaming(
+        model=model,
+        ctx=ctx,
+        batch_size=args.batch_size,
+        device=device,
+        args=args,
     )
-    vq_ids = kmeans.fit_predict(z_np)
+
+    vq_ids = predict_kmeans_streaming(
+        model=model,
+        kmeans=kmeans,
+        ctx=ctx,
+        batch_size=args.batch_size,
+        device=device,
+    )
 
     used = len(set(vq_ids.tolist()))
     print(f"[kmeans] used={used}/{args.codebook_size}")
