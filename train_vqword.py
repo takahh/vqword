@@ -33,20 +33,44 @@ def fit_kmeans_streaming(model, ctx, batch_size, device, args):
         batch_size=args.kmeans_batch_size,
         init="random",
         n_init=1,
-        max_iter=1,              # partial_fitなので1でよい
+        max_iter=1,
         reassignment_ratio=0.0,
         random_state=0,
         verbose=1,
     )
 
     print("[kmeans] partial_fit streaming")
+
+    init_buf = []
+    init_n = 0
+    initialized = False
+
     for start in tqdm(range(0, len(ctx), batch_size), desc="[kmeans fit]"):
         xb = ctx[start:start + batch_size].to(device)
         z = model.encode_context(xb).cpu().numpy().astype(np.float32)
-        kmeans.partial_fit(z)
+
+        if not initialized:
+            init_buf.append(z)
+            init_n += len(z)
+
+            if init_n < args.codebook_size:
+                continue
+
+            z0 = np.concatenate(init_buf, axis=0)
+            kmeans.partial_fit(z0)
+
+            initialized = True
+            init_buf = []
+        else:
+            kmeans.partial_fit(z)
+
+    if not initialized:
+        raise ValueError(
+            f"Not enough samples for codebook_size={args.codebook_size}. "
+            f"Only got {init_n} samples."
+        )
 
     return kmeans
-
 
 @torch.no_grad()
 def predict_kmeans_streaming(model, kmeans, ctx, batch_size, device):
