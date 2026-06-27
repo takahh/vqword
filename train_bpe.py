@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-
-import argparse
-import os
-
+import argparse, os
 from datasets import load_dataset
 from tokenizers import ByteLevelBPETokenizer
-from transformers import GPT2TokenizerFast
-
+from transformers import PreTrainedTokenizerFast
 
 def main():
     ap = argparse.ArgumentParser()
@@ -20,11 +16,10 @@ def main():
 
     out_dir = args.out_dir or f"bpe_{args.vocab_size}"
     corpus_file = "bpe_corpus.txt"
+    os.makedirs(out_dir, exist_ok=True)
 
-    print("[load dataset]")
     ds = load_dataset(args.dataset, split="train")
 
-    print("[write corpus]")
     with open(corpus_file, "w", encoding="utf-8") as f:
         for i, ex in enumerate(ds):
             if i >= args.max_samples:
@@ -32,37 +27,28 @@ def main():
             text = ex[args.text_col].replace("\n", " ")
             f.write(text + "\n")
 
-    os.makedirs(out_dir, exist_ok=True)
-
-    print("[train BPE]")
     tokenizer = ByteLevelBPETokenizer()
     tokenizer.train(
         files=[corpus_file],
         vocab_size=args.vocab_size,
         min_frequency=args.min_frequency,
-        special_tokens=[
-            "<|endoftext|>",
-            "<|pad|>",
-        ],
+        special_tokens=["<|endoftext|>", "<|pad|>"],
     )
 
-    tokenizer.save_model(out_dir)
+    tokenizer_json = os.path.join(out_dir, "tokenizer.json")
+    tokenizer.save(tokenizer_json)
 
-    print("[save HF tokenizer]")
-    hf_tok = GPT2TokenizerFast(
-        vocab_file=os.path.join(out_dir, "vocab.json"),
-        merges_file=os.path.join(out_dir, "merges.txt"),
+    hf_tok = PreTrainedTokenizerFast(
+        tokenizer_file=tokenizer_json,
         eos_token="<|endoftext|>",
         unk_token="<|endoftext|>",
         pad_token="<|pad|>",
     )
-
     hf_tok.save_pretrained(out_dir)
 
-    print()
-    print("Saved tokenizer to:", out_dir)
-    print("Vocabulary size:", hf_tok.vocab_size)
-
+    print("saved:", out_dir)
+    print("vocab size:", hf_tok.vocab_size)
+    print("test encode:", hf_tok.encode("Once upon a time, there was a little girl."))
 
 if __name__ == "__main__":
     main()
