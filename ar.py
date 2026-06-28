@@ -326,16 +326,18 @@ def main():
                 vq=f"{vq_loss.item():.3f}",
             )
 
-        valid_loss, valid_ppl = evaluate(
-            model, valid_loader, device, args.aux_lambda, args.main_target
-        )
-        test_loss, test_ppl = evaluate(
-            model, test_loader, device, args.aux_lambda, args.main_target
-        )
+        valid = evaluate(model, valid_loader, device, args.aux_lambda, args.main_target)
+        test = evaluate(model, test_loader, device, args.aux_lambda, args.main_target)
+
+        valid_loss = valid["main_loss"]
+        test_loss = test["main_loss"]
+
         print(
             f"[eval] ep={ep} "
-            f"valid_loss={valid_loss:.4f} valid_ppl={valid_ppl:.2f} "
-            f"test_loss={test_loss:.4f} test_ppl={test_ppl:.2f}"
+            f"valid_tok_ppl={valid['tok_ppl']:.2f} valid_vq_ppl={valid['vq_ppl']:.2f} "
+            f"valid_main_loss={valid['main_loss']:.4f} "
+            f"test_tok_ppl={test['tok_ppl']:.2f} test_vq_ppl={test['vq_ppl']:.2f} "
+            f"test_main_loss={test['main_loss']:.4f}"
         )
 
         history["epoch"].append(ep)
