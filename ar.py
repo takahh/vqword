@@ -189,8 +189,12 @@ def main():
         "epoch": [],
         "valid_loss": [],
         "valid_ppl": [],
+        "valid_tok_ppl": [],
+        "valid_vq_ppl": [],
         "test_loss": [],
         "test_ppl": [],
+        "test_tok_ppl": [],
+        "test_vq_ppl": [],
     }
 
     random.seed(args.seed)
@@ -341,10 +345,16 @@ def main():
         )
 
         history["epoch"].append(ep)
-        history["valid_loss"].append(valid_loss)
-        history["valid_ppl"].append(valid_ppl)
-        history["test_loss"].append(test_loss)
-        history["test_ppl"].append(test_ppl)
+
+        history["valid_loss"].append(valid["main_loss"])
+        history["valid_ppl"].append(valid["main_ppl"])
+        history["valid_tok_ppl"].append(valid["tok_ppl"])
+        history["valid_vq_ppl"].append(valid["vq_ppl"])
+
+        history["test_loss"].append(test["main_loss"])
+        history["test_ppl"].append(test["main_ppl"])
+        history["test_tok_ppl"].append(test["tok_ppl"])
+        history["test_vq_ppl"].append(test["vq_ppl"])
 
         if valid_loss < best_valid:
             best_valid = valid_loss
