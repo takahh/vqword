@@ -136,6 +136,7 @@ def evaluate(model, loader, device, aux_lambda, main_target):
             vq_logits.reshape(-1, vq_logits.size(-1)),
             vq_y.reshape(-1),
             ignore_index=-100,
+            reduction="sum",
         )
 
         if main_target == "tok":
@@ -295,6 +296,7 @@ def main():
                 vq_logits.reshape(-1, vq_logits.size(-1)),
                 vq_y.reshape(-1),
                 ignore_index=-100,
+                reduction="sum",
             )
 
             if args.main_target == "tok":
