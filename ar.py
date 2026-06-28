@@ -319,9 +319,12 @@ def main():
                 vq=f"{vq_loss.item():.3f}",
             )
 
-        valid_loss, valid_ppl = evaluate(model, valid_loader, device, args.aux_lambda)
-        test_loss, test_ppl = evaluate(model, test_loader, device, args.aux_lambda)
-
+        valid_loss, valid_ppl = evaluate(
+            model, valid_loader, device, args.aux_lambda, args.main_target
+        )
+        test_loss, test_ppl = evaluate(
+            model, test_loader, device, args.aux_lambda, args.main_target
+        )
         print(
             f"[eval] ep={ep} "
             f"valid_loss={valid_loss:.4f} valid_ppl={valid_ppl:.2f} "
