@@ -291,12 +291,10 @@ def main():
                 tok_y.reshape(-1),
                 ignore_index=-100,
             )
-
             vq_loss = F.cross_entropy(
                 vq_logits.reshape(-1, vq_logits.size(-1)),
                 vq_y.reshape(-1),
                 ignore_index=-100,
-                reduction="sum",
             )
 
             if args.main_target == "tok":
