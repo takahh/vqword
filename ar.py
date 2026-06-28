@@ -152,7 +152,10 @@ def evaluate(model, loader, device, aux_lambda):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ids", default="tiny_vqword_ids.pt")
+    ap.add_argument("--data", required=True, help="path to VQWord AR training data .pt")
+    ap.add_argument("--tokenizer", default=None, help="local tokenizer dir or HF tokenizer name")
+    ap.add_argument("--token_vocab_size", type=int, default=None)
+    ap.add_argument("--vq_vocab_size", type=int, default=None)
     ap.add_argument("--out", default="ar_vqword_lm.pt")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=10)
@@ -187,17 +190,39 @@ def main():
     use_token_input = not args.vq_only
     use_vq_input = not args.token_only
 
-    data = torch.load(args.ids, map_location="cpu")
+    data = torch.load(args.data, map_location="cpu")
     samples = data["samples"]
 
-    tok = AutoTokenizer.from_pretrained(data["tokenizer"])
+    tokenizer_name = args.tokenizer or data.get("tokenizer", None)
+    if tokenizer_name is None:
+        raise ValueError("Tokenizer is not specified. Use --tokenizer or include data['tokenizer'].")
+
+    print(f"[data] {args.data}")
+    print(f"[tokenizer] {tokenizer_name}")
+
+    tok = AutoTokenizer.from_pretrained(tokenizer_name)
+
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
     pad_token_id = tok.pad_token_id
-    vq_vocab_size = int(data["vq_ids_flat"].max().item()) + 1
-    vq_pad_id = vq_vocab_size
-    vq_vocab_size += 1
+
+    token_vocab_size = args.token_vocab_size or len(tok)
+
+    if args.vq_vocab_size is not None:
+        base_vq_vocab_size = args.vq_vocab_size
+    elif "vq_vocab_size" in data:
+        base_vq_vocab_size = int(data["vq_vocab_size"])
+    else:
+        base_vq_vocab_size = int(data["vq_ids_flat"].max().item()) + 1
+
+    vq_pad_id = base_vq_vocab_size
+    vq_vocab_size = base_vq_vocab_size + 1
+
+    print(f"[token_vocab_size] {token_vocab_size}")
+    print(f"[base_vq_vocab_size] {base_vq_vocab_size}")
+    print(f"[vq_pad_id] {vq_pad_id}")
+    print(f"[vq_vocab_size incl pad] {vq_vocab_size}")
 
     random.shuffle(samples)
     n = len(samples)
@@ -225,7 +250,7 @@ def main():
     test_loader = make_loader(test_ds, False)
 
     model = ARVQWordLM(
-        vocab_size=tok.vocab_size,
+        vocab_size=token_vocab_size,
         vq_vocab_size=vq_vocab_size,
         d_model=args.d_model,
         n_layers=args.n_layers,
@@ -301,7 +326,10 @@ def main():
             torch.save({
                 "model": model.state_dict(),
                 "args": vars(args),
-                "tokenizer": data["tokenizer"],
+                "data": args.data,
+                "tokenizer": tokenizer_name,
+                "token_vocab_size": token_vocab_size,
+                "base_vq_vocab_size": base_vq_vocab_size,
                 "vq_vocab_size": vq_vocab_size,
                 "vq_pad_id": vq_pad_id,
                 "pad_token_id": pad_token_id,
