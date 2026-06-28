@@ -108,7 +108,7 @@ class ARVQWordLM(nn.Module):
         return self.tok_head(h), self.vq_head(h)
 
 @torch.no_grad()
-def evaluate(model, loader, device, aux_lambda):
+def evaluate(model, loader, device, aux_lambda, main_target):
     model.eval()
     total_loss = 0.0
     total_tok = 0
@@ -132,17 +132,22 @@ def evaluate(model, loader, device, aux_lambda):
 
         n = tok_y.ne(-100).sum().item()
 
-        if aux_lambda > 0:
-            vq_loss = F.cross_entropy(
-                vq_logits.reshape(-1, vq_logits.size(-1)),
-                vq_y.reshape(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
-            loss = tok_loss + aux_lambda * vq_loss
-        else:
-            vq_loss = torch.tensor(0.0, device=device)
-            loss = tok_loss
+        vq_loss = F.cross_entropy(
+            vq_logits.reshape(-1, vq_logits.size(-1)),
+            vq_y.reshape(-1),
+            ignore_index=-100,
+        )
+
+        if main_target == "tok":
+            if aux_lambda > 0:
+                loss = tok_loss + aux_lambda * vq_loss
+            else:
+                loss = tok_loss
+        else:  # main_target == "vq"
+            if aux_lambda > 0:
+                loss = vq_loss + aux_lambda * tok_loss
+            else:
+                loss = vq_loss
 
         total_loss += loss.item()
         total_tok += n
@@ -162,6 +167,7 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--d_model", type=int, default=256)
     ap.add_argument("--n_layers", type=int, default=6)
+    ap.add_argument("--main_target", choices=["tok", "vq"], default="tok")
     ap.add_argument("--n_heads", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--aux_lambda", type=float, default=0.1)
@@ -284,16 +290,23 @@ def main():
                 tok_y.reshape(-1),
                 ignore_index=-100,
             )
-            if args.aux_lambda > 0:
-                vq_loss = F.cross_entropy(
-                    vq_logits.reshape(-1, vq_logits.size(-1)),
-                    vq_y.reshape(-1),
-                    ignore_index=-100,
-                )
-                loss = tok_loss + args.aux_lambda * vq_loss
-            else:
-                vq_loss = torch.tensor(0.0, device=device)
-                loss = tok_loss
+
+            vq_loss = F.cross_entropy(
+                vq_logits.reshape(-1, vq_logits.size(-1)),
+                vq_y.reshape(-1),
+                ignore_index=-100,
+            )
+
+            if args.main_target == "tok":
+                if args.aux_lambda > 0:
+                    loss = tok_loss + args.aux_lambda * vq_loss
+                else:
+                    loss = tok_loss
+            else:  # main_target == "vq"
+                if args.aux_lambda > 0:
+                    loss = vq_loss + args.aux_lambda * tok_loss
+                else:
+                    loss = vq_loss
 
             opt.zero_grad()
             loss.backward()
