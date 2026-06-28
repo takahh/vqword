@@ -110,7 +110,9 @@ class ARVQWordLM(nn.Module):
 @torch.no_grad()
 def evaluate(model, loader, device, aux_lambda, main_target):
     model.eval()
-    total_loss = 0.0
+    total_tok_loss = 0.0
+    total_vq_loss = 0.0
+    total_main_loss = 0.0
     total_tok = 0
 
     for tok_in, vq_in, tok_y, vq_y, attn_mask in loader:
@@ -129,9 +131,6 @@ def evaluate(model, loader, device, aux_lambda, main_target):
             ignore_index=-100,
             reduction="sum",
         )
-
-        n = tok_y.ne(-100).sum().item()
-
         vq_loss = F.cross_entropy(
             vq_logits.reshape(-1, vq_logits.size(-1)),
             vq_y.reshape(-1),
@@ -139,22 +138,30 @@ def evaluate(model, loader, device, aux_lambda, main_target):
             reduction="sum",
         )
 
-        if main_target == "tok":
-            if aux_lambda > 0:
-                loss = tok_loss + aux_lambda * vq_loss
-            else:
-                loss = tok_loss
-        else:  # main_target == "vq"
-            if aux_lambda > 0:
-                loss = vq_loss + aux_lambda * tok_loss
-            else:
-                loss = vq_loss
+        n = tok_y.ne(-100).sum().item()
 
-        total_loss += loss.item()
+        if main_target == "tok":
+            main_loss = tok_loss + aux_lambda * vq_loss if aux_lambda > 0 else tok_loss
+        else:
+            main_loss = vq_loss + aux_lambda * tok_loss if aux_lambda > 0 else vq_loss
+
+        total_tok_loss += tok_loss.item()
+        total_vq_loss += vq_loss.item()
+        total_main_loss += main_loss.item()
         total_tok += n
 
-    avg = total_loss / max(total_tok, 1)
-    return avg, math.exp(min(avg, 20))
+    tok_ce = total_tok_loss / max(total_tok, 1)
+    vq_ce = total_vq_loss / max(total_tok, 1)
+    main_ce = total_main_loss / max(total_tok, 1)
+
+    return {
+        "main_loss": main_ce,
+        "main_ppl": math.exp(min(main_ce, 20)),
+        "tok_loss": tok_ce,
+        "tok_ppl": math.exp(min(tok_ce, 20)),
+        "vq_loss": vq_ce,
+        "vq_ppl": math.exp(min(vq_ce, 20)),
+    }
 
 def main():
     ap = argparse.ArgumentParser()
