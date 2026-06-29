@@ -291,6 +291,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vq_beta", type=float, default=1.0)
     ap.add_argument("--ema_decay", type=float, default=0.99)
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--lr", type=float, default=2e-4)
 
     args = ap.parse_args()
 
