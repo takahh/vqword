@@ -182,7 +182,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vq_only", action="store_true")
     ap.add_argument("--token_only", action="store_true")
-
+    ap.add_argument("--init_from", default=None, help="pretrained AR checkpoint .pt")
+    ap.add_argument("--reset_heads", action="store_true")
     args = ap.parse_args()
 
     history = {
@@ -278,6 +279,20 @@ def main():
         use_token_input=use_token_input,
         use_vq_input=use_vq_input,
     ).to(device)
+    
+    if args.init_from is not None:
+        ckpt = torch.load(args.init_from, map_location="cpu")
+        sd = ckpt["model"]
+
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"[init_from] {args.init_from}")
+        print(f"[init] missing={missing}")
+        print(f"[init] unexpected={unexpected}")
+
+        if args.reset_heads:
+            print("[init] reset tok_head / vq_head")
+            model.tok_head.reset_parameters()
+            model.vq_head.reset_parameters()
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
