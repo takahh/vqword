@@ -407,7 +407,9 @@ def main():
     ap.add_argument("--n_partitions", type=int, default=256)
     ap.add_argument("--partition_base", type=int, default=0)
     args = ap.parse_args()
-
+    assert args.codebook_size % args.n_partitions == 0
+    assert args.partition_base >= 0
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     pad_id = 0
@@ -490,61 +492,6 @@ def main():
 
     centroids = centroids.cpu().float()
     vq_ids = vq_ids_kmeans.long()
-
-    # Skip CE/EMA fine-tuning for now.
-    # It caused codebook collapse in the non-partitioned version.
-
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    #
-    # centroids = centroids.to(device)
-    #
-    # for epoch in range(args.epochs):
-    #     model.train()
-    #     total_loss = 0.0
-    #
-    #     for start in tqdm(range(0, len(ctx), args.batch_size), desc=f"[train {epoch + 1}]"):
-    #         xb = ctx[start:start + args.batch_size].to(device)
-    #         yb = tgt[start:start + args.batch_size].to(device)
-    #
-    #         z = model.encode_context(xb)
-    #         z = F.normalize(z, dim=-1)
-    #
-    #         with torch.no_grad():
-    #             ids = assign_blockwise(z, centroids, k_block=args.k_block)
-    #
-    #         q = centroids[ids]
-    #
-    #         # VQ-style commitment loss
-    #         vq_loss = F.mse_loss(z, q.detach())
-    #
-    #         # optional decoder CE loss
-    #         logits = model.decoder(z)
-    #         ce_loss = F.cross_entropy(logits, yb)
-    #
-    #         loss = ce_loss + args.vq_beta * vq_loss
-    #
-    #         optimizer.zero_grad()
-    #         loss.backward()
-    #         optimizer.step()
-    #
-    #         with torch.no_grad():
-    #             z2 = model.encode_context(xb)
-    #             z2 = F.normalize(z2, dim=-1)
-    #             ids2 = assign_blockwise(z2, centroids, k_block=args.k_block)
-    #             ema_update_codebook(centroids, z2, ids2, decay=args.ema_decay)
-    #
-    #         total_loss += loss.item()
-    #
-    #     print(f"[epoch {epoch + 1}] loss={total_loss:.4f}")
-
-    # vq_ids = predict_kmeans_torch_streaming(
-    #     model=model,
-    #     centers=centroids,
-    #     ctx=ctx,
-    #     batch_size=args.batch_size,
-    #     device=device,
-    #     args=args,
-    # )
 
     metrics = compute_cluster_metrics(vq_ids, K_req=args.codebook_size)
     print(
