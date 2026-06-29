@@ -58,8 +58,19 @@ def fit_kmeans_partitioned_streaming(model, ctx, tgt, batch_size, device, args):
             z = model.encode_context(xb).float()
             z = F.normalize(z, dim=-1)
 
-            ids = assign_partitioned(z, centers, part, Kp)
-            local_ids = ids % Kp
+            ids = assign_partitioned(
+                z,
+                centers,
+                part,
+                Kp,
+                partition_base=args.partition_base,
+            )
+
+            _, local_ids = global_to_local(
+                ids,
+                codes_per_partition=Kp,
+                partition_base=args.partition_base,
+            )
 
             for p in part.unique():
                 m = part == p
@@ -96,8 +107,13 @@ def predict_partitioned_streaming(model, centers, ctx, tgt, batch_size, device, 
         part = part_all[start:start+batch_size].to(device)
 
         z = model.encode_context(xb).float()
-        pred = assign_partitioned(z, centers, part, Kp)
-
+        pred = assign_partitioned(
+            z,
+            centers,
+            part,
+            Kp,
+            partition_base=args.partition_base,
+        )
         ids_all.append(pred.cpu())
 
     return torch.cat(ids_all, dim=0)
@@ -134,7 +150,7 @@ def init_centers_partitioned_random(model, ctx, tgt, P, Kp, batch_size, device):
 
 
 @torch.no_grad()
-def assign_partitioned(z, centers, part_ids, codes_per_part, k_block=4096):
+def assign_partitioned(z, centers, part_ids, codes_per_part, partition_base=0, k_block=4096):
     """
     z: [B, D]
     centers: [P, Kp, D]
@@ -155,7 +171,12 @@ def assign_partitioned(z, centers, part_ids, codes_per_part, k_block=4096):
         sim = zp @ cp.T                    # [Bp, Kp]
         local_id = sim.argmax(dim=1)       # [Bp]
 
-        global_id = p * codes_per_part + local_id
+        global_id = local_to_global(
+            part_ids=p,
+            local_ids=local_id,
+            codes_per_partition=codes_per_part,
+            partition_base=partition_base,
+        )
         out[mask] = global_id
 
     return out
@@ -327,6 +348,16 @@ def ema_update_codebook(centroids, z, ids, decay=0.99):
 def get_partitions(target_ids, n_partitions):
     return target_ids % n_partitions
 
+def local_to_global(part_ids, local_ids, codes_per_partition, partition_base=0):
+    return partition_base + part_ids * codes_per_partition + local_ids
+
+
+def global_to_local(global_ids, codes_per_partition, partition_base=0):
+    x = global_ids - partition_base
+    part_ids = x // codes_per_partition
+    local_ids = x % codes_per_partition
+    return part_ids, local_ids
+
 def make_windows(token_ids, hop, pad_id):
     ids = torch.tensor(token_ids, dtype=torch.long)
     padded = F.pad(ids, (hop, hop), value=pad_id)
@@ -374,6 +405,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--n_partitions", type=int, default=256)
+    ap.add_argument("--partition_base", type=int, default=0)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -538,6 +570,10 @@ def main():
             "partitioned": True,
             "n_partitions": args.n_partitions,
             "codes_per_partition": args.codebook_size // args.n_partitions,
+            "id_scheme": "partition_offset",
+            "partition_base": args.partition_base,
+            "global_id_min": args.partition_base,
+            "global_id_max": args.partition_base + args.codebook_size - 1,
         },
         args.out,
     )
@@ -555,6 +591,10 @@ def main():
             "partitioned": True,
             "n_partitions": args.n_partitions,
             "codes_per_partition": args.codebook_size // args.n_partitions,
+            "id_scheme": "partition_offset",
+            "partition_base": args.partition_base,
+            "global_id_min": args.partition_base,
+            "global_id_max": args.partition_base + args.codebook_size - 1,
         },
         id_out,
     )
