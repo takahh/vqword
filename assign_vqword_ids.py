@@ -3,11 +3,15 @@ import argparse
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from train_vqword import VQWordGNN, make_windows
+import re
 
+WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+|[^\w\s]")
+
+def word_tokenize(text):
+    return WORD_RE.findall(text)
 
 @torch.no_grad()
 def assign_ids(model, centroids, ctx, batch_size, device):
@@ -20,10 +24,10 @@ def assign_ids(model, centroids, ctx, batch_size, device):
         z = model.encode_context(xb)
         z = F.normalize(z, dim=-1)
 
-        # cosine nearest centroid
         sim = z @ centroids.T
-        ids = sim.argmax(dim=-1)
-        all_ids.append(ids.cpu())
+        pred = sim.argmax(dim=1)
+
+        all_ids.append(pred.cpu())
 
     return torch.cat(all_ids, dim=0)
 
@@ -43,25 +47,27 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     ckpt = torch.load(args.ckpt, map_location="cpu")
+    word2id = ckpt["word2id"]
+    id2word = ckpt["id2word"]
+
+    pad_id = ckpt.get("pad_token_id", 0)
+    unk_id = ckpt.get("unk_token_id", 1)
+
+    vocab_size = len(word2id)
     cargs = ckpt["args"]
 
-    tok = AutoTokenizer.from_pretrained(ckpt["tokenizer"])
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
     model = VQWordGNN(
-        vocab_size=tok.vocab_size,
-        d_model=cargs["d_model"],
-        hop=cargs["hop"],
-        n_layers=cargs["n_layers"],
+        vocab_size=vocab_size,
+        d_model=ckpt["args"]["d_model"],
+        hop=ckpt["args"]["hop"],
+        n_layers=ckpt["args"]["n_layers"],
     ).to(device)
 
     model.load_state_dict(ckpt["model"])
-    centroids = ckpt["centroids"]
+    centroids = ckpt["centroids"].to(device)
 
     ds = load_dataset(args.dataset, split=args.split)
 
-    rows = []
     all_ctx = []
     all_tgt = []
     offsets = []
@@ -69,7 +75,8 @@ def main():
     print("[data] tokenizing")
     for i, ex in enumerate(tqdm(ds.select(range(min(args.max_samples, len(ds)))))):
         text = ex[args.text_col]
-        ids = tok.encode(text, add_special_tokens=False)[:args.seq_len]
+        words = word_tokenize(text)
+        ids = [word2id.get(w, unk_id) for w in words[:args.seq_len]]
 
         if len(ids) < 2 * cargs["hop"] + 2:
             continue
@@ -83,11 +90,9 @@ def main():
         all_ctx.append(ctx)
         all_tgt.append(tgt)
 
-    ctx = torch.cat(all_ctx, dim=0)
-    tgt = torch.cat(all_tgt, dim=0)
+    ctx, tgt = make_windows(ids, cargs["hop"], pad_id)
 
     print(f"[data] windows={len(tgt):,}")
-
     vq_ids = assign_ids(model, centroids, ctx, args.batch_size, device)
 
     # sampleごとに戻す
@@ -105,7 +110,11 @@ def main():
         "vq_ids_flat": vq_ids,
         "token_ids_flat": tgt,
         "offsets": offsets,
-        "tokenizer": ckpt["tokenizer"],
+        "word2id": word2id,
+        "id2word": id2word,
+        "pad_token_id": pad_id,
+        "unk_token_id": unk_id,
+        "vocab_type": "word",
         "hop": cargs["hop"],
         "ckpt": args.ckpt,
     }, args.out)
