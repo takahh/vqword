@@ -31,56 +31,134 @@ def compute_cluster_metrics(y, K_req, topk=5):
         "singleton_ratio": float((nz == 1).float().mean().item()) if nz.numel() else 0.0,
     }
 
+@torch.no_grad()
+def fit_kmeans_partitioned_streaming(model, ctx, tgt, batch_size, device, args):
+    model.eval()
+
+    P = args.n_partitions
+    Kp = args.codebook_size // P
+    D = args.d_model
+
+    centers = init_centers_partitioned_random(
+        model, ctx, tgt, P, Kp, batch_size, device
+    )
+
+    part_all = get_partitions(tgt, P)
+
+    for it in range(args.kmeans_iters):
+        print(f"[pkmeans] iter {it + 1}/{args.kmeans_iters}")
+
+        sums = torch.zeros(P, Kp, D, device=device)
+        counts = torch.zeros(P, Kp, device=device, dtype=torch.long)
+
+        for start in tqdm(range(0, len(ctx), batch_size), desc="[pkmeans assign/update]"):
+            xb = ctx[start:start+batch_size].to(device)
+            part = part_all[start:start+batch_size].to(device)
+
+            z = model.encode_context(xb).float()
+            z = F.normalize(z, dim=-1)
+
+            ids = assign_partitioned(z, centers, part, Kp)
+            local_ids = ids % Kp
+
+            for p in part.unique():
+                m = part == p
+                sums[p].index_add_(0, local_ids[m], z[m])
+                counts[p].index_add_(0, local_ids[m], torch.ones_like(local_ids[m], dtype=torch.long))
+
+        nonempty = counts > 0
+        new_centers = centers.clone()
+        new_centers[nonempty] = sums[nonempty] / counts[nonempty].float().unsqueeze(1)
+        new_centers = F.normalize(new_centers, dim=-1)
+
+        shift = (new_centers - centers).pow(2).sum(dim=-1).sqrt().mean()
+        centers = new_centers
+
+        used = int(nonempty.sum().item())
+        print(f"[pkmeans] used={used}/{args.codebook_size} shift={shift.item():.6f}")
+
+    return centers
 
 @torch.no_grad()
-def init_centers_random(model, ctx, K, batch_size, device):
-    """
-    Randomly sample K encoded windows without storing all embeddings.
-    """
-    N = len(ctx)
-    if N < K:
-        raise ValueError(f"Not enough windows: N={N}, K={K}")
+def predict_partitioned_streaming(model, centers, ctx, tgt, batch_size, device, args):
+    model.eval()
+    ids_all = []
 
-    idx = torch.randperm(N)[:K]
-    idx, _ = torch.sort(idx)
+    P = args.n_partitions
+    Kp = args.codebook_size // P
+    part_all = get_partitions(tgt, P)
 
-    centers = []
-    for s in tqdm(range(0, K, batch_size), desc="[kmeans init]"):
-        batch_idx = idx[s:s + batch_size]
-        xb = ctx[batch_idx].to(device)
-        z = model.encode_context(xb)
-        centers.append(z.float())
+    centers = centers.to(device)
 
-    centers = torch.cat(centers, dim=0)
-    centers = F.normalize(centers, dim=-1)
+    print("[pkmeans] predict partitioned")
+    for start in tqdm(range(0, len(ctx), batch_size), desc="[pkmeans predict]"):
+        xb = ctx[start:start+batch_size].to(device)
+        part = part_all[start:start+batch_size].to(device)
+
+        z = model.encode_context(xb).float()
+        pred = assign_partitioned(z, centers, part, Kp)
+
+        ids_all.append(pred.cpu())
+
+    return torch.cat(ids_all, dim=0)
+
+
+@torch.no_grad()
+def init_centers_partitioned_random(model, ctx, tgt, P, Kp, batch_size, device):
+    D = model.tok_emb.embedding_dim
+    centers = torch.zeros(P, Kp, D, device=device)
+
+    part_all = get_partitions(tgt, P)
+
+    for p in tqdm(range(P), desc="[partition init]"):
+        idx = torch.where(part_all == p)[0]
+
+        if len(idx) == 0:
+            centers[p] = F.normalize(torch.randn(Kp, D, device=device), dim=-1)
+            continue
+
+        if len(idx) >= Kp:
+            sel = idx[torch.randperm(len(idx))[:Kp]]
+        else:
+            sel = idx[torch.randint(0, len(idx), (Kp,))]
+
+        zs = []
+        for s in range(0, len(sel), batch_size):
+            xb = ctx[sel[s:s+batch_size]].to(device)
+            z = model.encode_context(xb)
+            zs.append(z.float())
+
+        centers[p] = F.normalize(torch.cat(zs, dim=0)[:Kp], dim=-1)
+
     return centers
 
 
 @torch.no_grad()
-def assign_blockwise(z, centers, k_block=4096):
+def assign_partitioned(z, centers, part_ids, codes_per_part, k_block=4096):
     """
-    z:       [B, D]
-    centers:[K, D]
-    returns [B]
+    z: [B, D]
+    centers: [P, Kp, D]
+    part_ids: [B]
+    returns global_ids [B]
     """
     z = F.normalize(z.float(), dim=-1)
     centers = F.normalize(centers.float(), dim=-1)
 
     B = z.size(0)
-    best_val = torch.full((B,), -float("inf"), device=z.device)
-    best_idx = torch.zeros((B,), dtype=torch.long, device=z.device)
+    out = torch.empty(B, dtype=torch.long, device=z.device)
 
-    K = centers.size(0)
-    for k0 in range(0, K, k_block):
-        k1 = min(k0 + k_block, K)
-        sim = z @ centers[k0:k1].T
-        val, idx = sim.max(dim=1)
+    for p in part_ids.unique():
+        mask = part_ids == p
+        zp = z[mask]                       # [Bp, D]
+        cp = centers[p]                    # [Kp, D]
 
-        update = val > best_val
-        best_val = torch.where(update, val, best_val)
-        best_idx = torch.where(update, idx + k0, best_idx)
+        sim = zp @ cp.T                    # [Bp, Kp]
+        local_id = sim.argmax(dim=1)       # [Bp]
 
-    return best_idx
+        global_id = p * codes_per_part + local_id
+        out[mask] = global_id
+
+    return out
 
 
 @torch.no_grad()
@@ -246,6 +324,8 @@ def ema_update_codebook(centroids, z, ids, decay=0.99):
     centroids.mul_(decay).add_(batch_means, alpha=1 - decay)
     centroids.copy_(F.normalize(centroids, dim=-1))
 
+def get_partitions(target_ids, n_partitions):
+    return target_ids % n_partitions
 
 def make_windows(token_ids, hop, pad_id):
     ids = torch.tensor(token_ids, dtype=torch.long)
@@ -293,7 +373,7 @@ def main():
     ap.add_argument("--ema_decay", type=float, default=0.99)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=2e-4)
-
+    ap.add_argument("--n_partitions", type=int, default=256)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -344,22 +424,26 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    centroids = fit_kmeans_torch_streaming(
+    centroids = fit_kmeans_partitioned_streaming(
         model=model,
         ctx=ctx,
+        tgt=tgt,
         batch_size=args.batch_size,
         device=device,
         args=args,
     )
 
-    vq_ids = predict_kmeans_torch_streaming(
+    vq_ids = predict_partitioned_streaming(
         model=model,
         centers=centroids,
         ctx=ctx,
+        tgt=tgt,
         batch_size=args.batch_size,
         device=device,
         args=args,
     )
+    # keep the clean partitioned KMeans IDs
+    vq_ids_kmeans = vq_ids.clone()
 
     metrics = compute_cluster_metrics(vq_ids, K_req=args.codebook_size)
     print(
@@ -373,58 +457,62 @@ def main():
     )
 
     centroids = centroids.cpu().float()
-    vq_ids = vq_ids.long()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    vq_ids = vq_ids_kmeans.long()
 
-    centroids = centroids.to(device)
+    # Skip CE/EMA fine-tuning for now.
+    # It caused codebook collapse in the non-partitioned version.
 
-    for epoch in range(args.epochs):
-        model.train()
-        total_loss = 0.0
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    #
+    # centroids = centroids.to(device)
+    #
+    # for epoch in range(args.epochs):
+    #     model.train()
+    #     total_loss = 0.0
+    #
+    #     for start in tqdm(range(0, len(ctx), args.batch_size), desc=f"[train {epoch + 1}]"):
+    #         xb = ctx[start:start + args.batch_size].to(device)
+    #         yb = tgt[start:start + args.batch_size].to(device)
+    #
+    #         z = model.encode_context(xb)
+    #         z = F.normalize(z, dim=-1)
+    #
+    #         with torch.no_grad():
+    #             ids = assign_blockwise(z, centroids, k_block=args.k_block)
+    #
+    #         q = centroids[ids]
+    #
+    #         # VQ-style commitment loss
+    #         vq_loss = F.mse_loss(z, q.detach())
+    #
+    #         # optional decoder CE loss
+    #         logits = model.decoder(z)
+    #         ce_loss = F.cross_entropy(logits, yb)
+    #
+    #         loss = ce_loss + args.vq_beta * vq_loss
+    #
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         optimizer.step()
+    #
+    #         with torch.no_grad():
+    #             z2 = model.encode_context(xb)
+    #             z2 = F.normalize(z2, dim=-1)
+    #             ids2 = assign_blockwise(z2, centroids, k_block=args.k_block)
+    #             ema_update_codebook(centroids, z2, ids2, decay=args.ema_decay)
+    #
+    #         total_loss += loss.item()
+    #
+    #     print(f"[epoch {epoch + 1}] loss={total_loss:.4f}")
 
-        for start in tqdm(range(0, len(ctx), args.batch_size), desc=f"[train {epoch + 1}]"):
-            xb = ctx[start:start + args.batch_size].to(device)
-            yb = tgt[start:start + args.batch_size].to(device)
-
-            z = model.encode_context(xb)
-            z = F.normalize(z, dim=-1)
-
-            with torch.no_grad():
-                ids = assign_blockwise(z, centroids, k_block=args.k_block)
-
-            q = centroids[ids]
-
-            # VQ-style commitment loss
-            vq_loss = F.mse_loss(z, q.detach())
-
-            # optional decoder CE loss
-            logits = model.decoder(z)
-            ce_loss = F.cross_entropy(logits, yb)
-
-            loss = ce_loss + args.vq_beta * vq_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            with torch.no_grad():
-                z2 = model.encode_context(xb)
-                z2 = F.normalize(z2, dim=-1)
-                ids2 = assign_blockwise(z2, centroids, k_block=args.k_block)
-                ema_update_codebook(centroids, z2, ids2, decay=args.ema_decay)
-
-            total_loss += loss.item()
-
-        print(f"[epoch {epoch + 1}] loss={total_loss:.4f}")
-
-    vq_ids = predict_kmeans_torch_streaming(
-        model=model,
-        centers=centroids,
-        ctx=ctx,
-        batch_size=args.batch_size,
-        device=device,
-        args=args,
-    )
+    # vq_ids = predict_kmeans_torch_streaming(
+    #     model=model,
+    #     centers=centroids,
+    #     ctx=ctx,
+    #     batch_size=args.batch_size,
+    #     device=device,
+    #     args=args,
+    # )
 
     metrics = compute_cluster_metrics(vq_ids, K_req=args.codebook_size)
     print(
@@ -447,6 +535,9 @@ def main():
             "pad_token_id": pad_id,
             "unk_token_id": unk_id,
             "vocab_type": "word",
+            "partitioned": True,
+            "n_partitions": args.n_partitions,
+            "codes_per_partition": args.codebook_size // args.n_partitions,
         },
         args.out,
     )
@@ -461,6 +552,9 @@ def main():
             "pad_token_id": pad_id,
             "unk_token_id": unk_id,
             "vocab_type": "word",
+            "partitioned": True,
+            "n_partitions": args.n_partitions,
+            "codes_per_partition": args.codebook_size // args.n_partitions,
         },
         id_out,
     )
