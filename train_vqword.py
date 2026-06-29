@@ -229,6 +229,23 @@ class VQWordGNN(nn.Module):
         loss = F.cross_entropy(logits, target_ids)
         return loss, logits, z
 
+@torch.no_grad()
+def ema_update_codebook(centroids, z, ids, decay=0.99):
+    K, D = centroids.shape
+
+    sums = torch.zeros_like(centroids)
+    counts = torch.zeros(K, device=z.device)
+
+    sums.index_add_(0, ids, z)
+    counts.index_add_(0, ids, torch.ones_like(ids, dtype=torch.float))
+
+    nonempty = counts > 0
+    batch_means = centroids.clone()
+    batch_means[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1)
+
+    centroids.mul_(decay).add_(batch_means, alpha=1 - decay)
+    centroids.copy_(F.normalize(centroids, dim=-1))
+
 
 def make_windows(token_ids, hop, pad_id):
     ids = torch.tensor(token_ids, dtype=torch.long)
@@ -272,6 +289,8 @@ def main():
     ap.add_argument("--kmeans_iters", type=int, default=20)
     ap.add_argument("--k_block", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--vq_beta", type=float, default=1.0)
+    ap.add_argument("--ema_decay", type=float, default=0.99)
 
     args = ap.parse_args()
 
@@ -320,32 +339,6 @@ def main():
         n_layers=args.n_layers,
     ).to(device)
 
-    # No pretraining.
-    # Directly encode local token windows and run KMeans.
-
-    # print("[kmeans] collecting embeddings")
-    # z = collect_embeddings(model, ctx, args.batch_size, device)
-    # z_np = z.numpy()
-    #
-    # print("[kmeans] fitting")
-    # # kmeans = MiniBatchKMeans(
-    # #     n_clusters=args.codebook_size,
-    # #     batch_size=args.kmeans_batch_size,
-    # #     random_state=0,
-    # #     verbose=1,
-    # #     n_init="auto",
-    # # )
-    # kmeans = MiniBatchKMeans(
-    #     n_clusters=args.codebook_size,
-    #     batch_size=args.kmeans_batch_size,
-    #     random_state=0,
-    #     verbose=1,
-    #     n_init=3,
-    #     max_iter=20,
-    #     max_no_improvement=20,
-    #     reassignment_ratio=0.0,
-    # )
-    # vq_ids = kmeans.fit_predict(z_np)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -379,6 +372,48 @@ def main():
 
     centroids = centroids.cpu().float()
     vq_ids = vq_ids.long()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    centroids = centroids.to(device)
+
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0.0
+
+        for start in tqdm(range(0, len(ctx), args.batch_size), desc=f"[train {epoch + 1}]"):
+            xb = ctx[start:start + args.batch_size].to(device)
+            yb = tgt[start:start + args.batch_size].to(device)
+
+            z = model.encode_context(xb)
+            z = F.normalize(z, dim=-1)
+
+            with torch.no_grad():
+                ids = assign_blockwise(z, centroids, k_block=args.k_block)
+
+            q = centroids[ids]
+
+            # VQ-style commitment loss
+            vq_loss = F.mse_loss(z, q.detach())
+
+            # optional decoder CE loss
+            logits = model.decoder(z)
+            ce_loss = F.cross_entropy(logits, yb)
+
+            loss = ce_loss + args.vq_beta * vq_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                z2 = model.encode_context(xb)
+                z2 = F.normalize(z2, dim=-1)
+                ids2 = assign_blockwise(z2, centroids, k_block=args.k_block)
+                ema_update_codebook(centroids, z2, ids2, decay=args.ema_decay)
+
+            total_loss += loss.item()
+
+        print(f"[epoch {epoch + 1}] loss={total_loss:.4f}")
 
     torch.save(
         {
