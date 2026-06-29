@@ -216,7 +216,7 @@ def main():
         ds = load_dataset(args.dataset, split="train")
     else:
         ds = load_dataset(args.dataset, args.dataset_config, split="train")
-        
+
     word2id, id2word = build_word_vocab(
         ds=ds,
         text_col=args.text_col,
@@ -244,7 +244,7 @@ def main():
     ctx = torch.cat(all_ctx, dim=0)
     tgt = torch.cat(all_tgt, dim=0)
 
-    print(f"[data] windows={len(tgt):,} vocab={tok.vocab_size}")
+    print(f"[data] windows={len(tgt):,} vocab={vocab_size}")
     model = VQWordGNN(
         vocab_size=tok.vocab_size,
         d_model=args.d_model,
