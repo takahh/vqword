@@ -192,6 +192,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="roneneldan/TinyStories")
     ap.add_argument("--text_col", default="text")
+    ap.add_argument("--dataset_config", default=None)
     ap.add_argument("--min_freq", type=int, default=1)
     ap.add_argument("--max_samples", type=int, default=20000)
     ap.add_argument("--seq_len", type=int, default=256)
@@ -211,8 +212,11 @@ def main():
     pad_id = 0
     unk_id = 1
 
-    ds = load_dataset(args.dataset, split="train")
-
+    if args.dataset_config is None:
+        ds = load_dataset(args.dataset, split="train")
+    else:
+        ds = load_dataset(args.dataset, args.dataset_config, split="train")
+        
     word2id, id2word = build_word_vocab(
         ds=ds,
         text_col=args.text_col,
