@@ -7,6 +7,28 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 from sklearn.cluster import MiniBatchKMeans
+import re
+from collections import Counter
+
+WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+|[^\w\s]")
+
+def word_tokenize(text):
+    return WORD_RE.findall(text)
+
+def build_word_vocab(ds, text_col, max_samples, min_freq=1):
+    cnt = Counter()
+
+    for ex in tqdm(ds.select(range(min(max_samples, len(ds)))), desc="[vocab]"):
+        words = word_tokenize(ex[text_col])
+        cnt.update(words)
+
+    word2id = {"<pad>": 0, "<unk>": 1}
+    for w, c in cnt.most_common():
+        if c >= min_freq and w not in word2id:
+            word2id[w] = len(word2id)
+
+    id2word = {i: w for w, i in word2id.items()}
+    return word2id, id2word
 
 
 def make_adj(seq_len, hop, device):
@@ -169,8 +191,8 @@ def collect_embeddings(model, ctx, batch_size, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="roneneldan/TinyStories")
-    ap.add_argument("--tokenizer", default="gpt2")
     ap.add_argument("--text_col", default="text")
+    ap.add_argument("--min_freq", type=int, default=1)
     ap.add_argument("--max_samples", type=int, default=20000)
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--hop", type=int, default=3)
@@ -186,23 +208,32 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    tok = AutoTokenizer.from_pretrained(args.tokenizer)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    pad_id = 0
+    unk_id = 1
 
     ds = load_dataset(args.dataset, split="train")
+
+    word2id, id2word = build_word_vocab(
+        ds=ds,
+        text_col=args.text_col,
+        max_samples=args.max_samples,
+        min_freq=args.min_freq,
+    )
+
+    vocab_size = len(word2id)
+    print(f"[word_vocab_size] {vocab_size}")
 
     all_ctx, all_tgt = [], []
 
     print("[data] tokenizing")
     for ex in tqdm(ds.select(range(min(args.max_samples, len(ds))))):
         text = ex[args.text_col]
-        ids = tok.encode(text, add_special_tokens=False)[:args.seq_len]
-
+        words = word_tokenize(text)
+        ids = [word2id.get(w, unk_id) for w in words[:args.seq_len]]
         if len(ids) < 2 * args.hop + 2:
             continue
 
-        ctx, tgt = make_windows(ids, args.hop, tok.pad_token_id)
+        ctx, tgt = make_windows(ids, args.hop, pad_id)
         all_ctx.append(ctx)
         all_tgt.append(tgt)
 
@@ -271,8 +302,11 @@ def main():
             "model": model.state_dict(),
             "centroids": centroids,
             "args": vars(args),
-            "tokenizer": args.tokenizer,
-            "pad_token_id": tok.pad_token_id,
+            "word2id": word2id,
+            "id2word": id2word,
+            "pad_token_id": pad_id,
+            "unk_token_id": unk_id,
+            "vocab_type": "word",
         },
         args.out,
     )
@@ -282,6 +316,11 @@ def main():
         {
             "vq_ids": vq_ids,
             "tgt": tgt,
+            "word2id": word2id,
+            "id2word": id2word,
+            "pad_token_id": pad_id,
+            "unk_token_id": unk_id,
+            "vocab_type": "word",
         },
         id_out,
     )
