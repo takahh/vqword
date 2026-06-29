@@ -246,7 +246,7 @@ def main():
 
     print(f"[data] windows={len(tgt):,} vocab={vocab_size}")
     model = VQWordGNN(
-        vocab_size=tok.vocab_size,
+        vocab_size=vocab_size,
         d_model=args.d_model,
         hop=args.hop,
         n_layers=args.n_layers,
