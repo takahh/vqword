@@ -1,16 +1,132 @@
 #!/usr/bin/env python3
-import argparse, math
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AutoTokenizer
 from tqdm import tqdm
-from sklearn.cluster import MiniBatchKMeans
 import re
 from collections import Counter
 
 WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+|[^\w\s]")
+
+import numpy as np
+
+@torch.no_grad()
+def compute_cluster_metrics(y, K_req, topk=5):
+    y = y.long().view(-1)
+    N = y.numel()
+    bc = torch.bincount(y, minlength=K_req)
+    nz = bc[bc > 0]
+    p = nz.float() / max(1, N)
+
+    return {
+        "N": int(N),
+        "K_req": int(K_req),
+        "K_eff": int(nz.numel()),
+        "max_frac": float(p.max().item()) if nz.numel() else 0.0,
+        "top5_frac": float(torch.topk(p, min(topk, p.numel())).values.sum().item()) if nz.numel() else 0.0,
+        "entropy": float(-(p * torch.log(p.clamp_min(1e-12))).sum().item()) if nz.numel() else 0.0,
+        "perplexity": float(torch.exp(-(p * torch.log(p.clamp_min(1e-12))).sum()).item()) if nz.numel() else 1.0,
+        "singleton_ratio": float((nz == 1).float().mean().item()) if nz.numel() else 0.0,
+    }
+
+
+@torch.no_grad()
+def init_centers_random(model, ctx, K, batch_size, device):
+    """
+    Randomly sample K encoded windows without storing all embeddings.
+    """
+    N = len(ctx)
+    if N < K:
+        raise ValueError(f"Not enough windows: N={N}, K={K}")
+
+    idx = torch.randperm(N)[:K]
+    idx, _ = torch.sort(idx)
+
+    centers = []
+    for s in tqdm(range(0, K, batch_size), desc="[kmeans init]"):
+        batch_idx = idx[s:s + batch_size]
+        xb = ctx[batch_idx].to(device)
+        z = model.encode_context(xb)
+        centers.append(z.float())
+
+    centers = torch.cat(centers, dim=0)
+    centers = F.normalize(centers, dim=-1)
+    return centers
+
+
+@torch.no_grad()
+def assign_blockwise(z, centers, k_block=4096):
+    """
+    z:       [B, D]
+    centers:[K, D]
+    returns [B]
+    """
+    z = F.normalize(z.float(), dim=-1)
+    centers = F.normalize(centers.float(), dim=-1)
+
+    B = z.size(0)
+    best_val = torch.full((B,), -float("inf"), device=z.device)
+    best_idx = torch.zeros((B,), dtype=torch.long, device=z.device)
+
+    K = centers.size(0)
+    for k0 in range(0, K, k_block):
+        k1 = min(k0 + k_block, K)
+        sim = z @ centers[k0:k1].T
+        val, idx = sim.max(dim=1)
+
+        update = val > best_val
+        best_val = torch.where(update, val, best_val)
+        best_idx = torch.where(update, idx + k0, best_idx)
+
+    return best_idx
+
+
+@torch.no_grad()
+def fit_kmeans_torch_streaming(model, ctx, batch_size, device, args):
+    model.eval()
+
+    K = args.codebook_size
+    D = args.d_model
+
+    print("[kmeans] torch blockwise init")
+    centers = init_centers_random(
+        model=model,
+        ctx=ctx,
+        K=K,
+        batch_size=batch_size,
+        device=device,
+    )
+
+    for it in range(args.kmeans_iters):
+        print(f"[kmeans] iter {it + 1}/{args.kmeans_iters}")
+
+        sums = torch.zeros(K, D, device=device, dtype=torch.float32)
+        counts = torch.zeros(K, device=device, dtype=torch.long)
+
+        for start in tqdm(range(0, len(ctx), batch_size), desc="[kmeans assign/update]"):
+            xb = ctx[start:start + batch_size].to(device)
+            z = model.encode_context(xb).float()
+            z = F.normalize(z, dim=-1)
+
+            y = assign_blockwise(z, centers, k_block=args.k_block)
+
+            sums.index_add_(0, y, z)
+            counts.index_add_(0, y, torch.ones_like(y, dtype=torch.long))
+
+        nonempty = counts > 0
+        new_centers = centers.clone()
+        new_centers[nonempty] = sums[nonempty] / counts[nonempty].float().unsqueeze(1)
+        new_centers = F.normalize(new_centers, dim=-1)
+
+        shift = (new_centers - centers).pow(2).sum(dim=1).sqrt().mean()
+        centers = new_centers
+
+        used = int(nonempty.sum().item())
+        print(f"[kmeans] used={used}/{K} shift={shift.item():.6f}")
+
+    return centers
 
 def word_tokenize(text):
     return WORD_RE.findall(text)
@@ -43,68 +159,19 @@ def make_adj(seq_len, hop, device):
     adj = adj / deg
     return adj
 
-from sklearn.cluster import MiniBatchKMeans
-import numpy as np
-
 @torch.no_grad()
-def fit_kmeans_streaming(model, ctx, batch_size, device, args):
-    model.eval()
-
-    kmeans = MiniBatchKMeans(
-        n_clusters=args.codebook_size,
-        batch_size=args.kmeans_batch_size,
-        init="random",
-        n_init=1,
-        max_iter=1,
-        reassignment_ratio=0.0,
-        random_state=0,
-        verbose=1,
-    )
-
-    print("[kmeans] partial_fit streaming")
-
-    init_buf = []
-    init_n = 0
-    initialized = False
-
-    for start in tqdm(range(0, len(ctx), batch_size), desc="[kmeans fit]"):
-        xb = ctx[start:start + batch_size].to(device)
-        z = model.encode_context(xb).cpu().numpy().astype(np.float32)
-
-        if not initialized:
-            init_buf.append(z)
-            init_n += len(z)
-
-            if init_n < args.codebook_size:
-                continue
-
-            z0 = np.concatenate(init_buf, axis=0)
-            kmeans.partial_fit(z0)
-
-            initialized = True
-            init_buf = []
-        else:
-            kmeans.partial_fit(z)
-
-    if not initialized:
-        raise ValueError(
-            f"Not enough samples for codebook_size={args.codebook_size}. "
-            f"Only got {init_n} samples."
-        )
-
-    return kmeans
-
-@torch.no_grad()
-def predict_kmeans_streaming(model, kmeans, ctx, batch_size, device):
+def predict_kmeans_torch_streaming(model, centers, ctx, batch_size, device, args):
     model.eval()
     ids = []
 
-    print("[kmeans] predict streaming")
+    centers = centers.to(device)
+
+    print("[kmeans] predict torch blockwise")
     for start in tqdm(range(0, len(ctx), batch_size), desc="[kmeans predict]"):
         xb = ctx[start:start + batch_size].to(device)
-        z = model.encode_context(xb).cpu().numpy().astype(np.float32)
-        pred = kmeans.predict(z)
-        ids.append(torch.from_numpy(pred).long())
+        z = model.encode_context(xb).float()
+        pred = assign_blockwise(z, centers, k_block=args.k_block)
+        ids.append(pred.cpu())
 
     return torch.cat(ids, dim=0)
 
@@ -201,10 +268,11 @@ def main():
     ap.add_argument("--d_model", type=int, default=256)
     ap.add_argument("--n_layers", type=int, default=3)
     ap.add_argument("--batch_size", type=int, default=256)
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--kmeans_batch_size", type=int, default=8192)
     ap.add_argument("--out", default="vqword_gnn_kmeans.pt")
+    ap.add_argument("--kmeans_iters", type=int, default=20)
+    ap.add_argument("--k_block", type=int, default=4096)
+    ap.add_argument("--seed", type=int, default=0)
+
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -278,8 +346,10 @@ def main():
     #     reassignment_ratio=0.0,
     # )
     # vq_ids = kmeans.fit_predict(z_np)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
-    kmeans = fit_kmeans_streaming(
+    centroids = fit_kmeans_torch_streaming(
         model=model,
         ctx=ctx,
         batch_size=args.batch_size,
@@ -287,19 +357,28 @@ def main():
         args=args,
     )
 
-    vq_ids = predict_kmeans_streaming(
+    vq_ids = predict_kmeans_torch_streaming(
         model=model,
-        kmeans=kmeans,
+        centers=centroids,
         ctx=ctx,
         batch_size=args.batch_size,
         device=device,
+        args=args,
     )
 
-    used = len(set(vq_ids.tolist()))
-    print(f"[kmeans] used={used}/{args.codebook_size}")
+    metrics = compute_cluster_metrics(vq_ids, K_req=args.codebook_size)
+    print(
+        f"[CLST] N={metrics['N']} "
+        f"K_eff={metrics['K_eff']}/{metrics['K_req']} "
+        f"max_frac={metrics['max_frac']:.4f} "
+        f"top5_frac={metrics['top5_frac']:.4f} "
+        f"H={metrics['entropy']:.4f} "
+        f"ppl={metrics['perplexity']:.2f} "
+        f"singleton_ratio={metrics['singleton_ratio']:.4f}"
+    )
 
-    centroids = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
-    vq_ids = torch.tensor(vq_ids, dtype=torch.long)
+    centroids = centroids.cpu().float()
+    vq_ids = vq_ids.long()
 
     torch.save(
         {
