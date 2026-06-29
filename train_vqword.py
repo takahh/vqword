@@ -417,10 +417,30 @@ def main():
 
         print(f"[epoch {epoch + 1}] loss={total_loss:.4f}")
 
+    vq_ids = predict_kmeans_torch_streaming(
+        model=model,
+        centers=centroids,
+        ctx=ctx,
+        batch_size=args.batch_size,
+        device=device,
+        args=args,
+    )
+
+    metrics = compute_cluster_metrics(vq_ids, K_req=args.codebook_size)
+    print(
+        f"[FINAL CLST] N={metrics['N']} "
+        f"K_eff={metrics['K_eff']}/{metrics['K_req']} "
+        f"max_frac={metrics['max_frac']:.4f} "
+        f"top5_frac={metrics['top5_frac']:.4f} "
+        f"H={metrics['entropy']:.4f} "
+        f"ppl={metrics['perplexity']:.2f} "
+        f"singleton_ratio={metrics['singleton_ratio']:.4f}"
+    )
+
     torch.save(
         {
             "model": model.state_dict(),
-            "centroids": centroids,
+            "centroids": centroids.cpu().float(),
             "args": vars(args),
             "word2id": word2id,
             "id2word": id2word,
