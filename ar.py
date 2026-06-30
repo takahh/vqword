@@ -77,12 +77,6 @@ class ARVQWordLM(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.vq_to_tok = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, vocab_size),
-        )
         self.tr = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(d_model)
 
