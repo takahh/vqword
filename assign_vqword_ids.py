@@ -64,7 +64,12 @@ def main():
     ).to(device)
 
     model.load_state_dict(ckpt["model"])
-    centroids = ckpt["centroids"].to(device)
+    centroids = ckpt["centroids"]
+
+    if centroids.dim() == 3:
+        centroids = centroids.reshape(-1, centroids.size(-1))
+
+    print("[debug] centroids shape:", centroids.shape)
 
     ds = load_dataset(args.dataset, split=args.split)
     all_ctx = []
