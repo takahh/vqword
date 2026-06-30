@@ -326,9 +326,13 @@ def main():
             model.vq_head.reset_parameters()
 
     if args.freeze_vq_backbone:
-        for name, p in model.named_parameters():
+        for p in model.parameters():
             p.requires_grad = False
 
+        for p in model.tok_head.parameters():
+            p.requires_grad = True
+
+        # vq_to_tok も使うなら
         for p in model.vq_to_tok.parameters():
             p.requires_grad = True
 
