@@ -151,7 +151,7 @@ def evaluate(model, loader, device, aux_lambda, main_target):
             main_loss = vq_loss + aux_lambda * tok_loss if aux_lambda > 0 else vq_loss
 
         elif main_target == "both":
-            main_loss = tok_from_vq_loss
+            main_loss = tok_loss + aux_lambda * vq_loss
 
         total_tok_loss += tok_loss.item()
         total_vq_loss += vq_loss.item()
