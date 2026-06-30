@@ -111,21 +111,11 @@ class ARVQWordLM(nn.Module):
             src_key_padding_mask=key_padding_mask,
         )
         h = self.norm(h)
-
+        # forward内
         tok_logits = self.tok_head(h)
         vq_logits = self.vq_head(h)
 
-        # predicted VQW -> Word module
-        pred_vq_id = vq_logits.detach().argmax(dim=-1)
-
-        if self.vq_emb is not None:
-            pred_vq_emb = self.vq_emb(pred_vq_id)
-        else:
-            pred_vq_emb = h.detach()
-
-        tok_logits_from_vq = self.vq_to_tok(pred_vq_emb.detach())
-
-        return tok_logits, vq_logits, tok_logits_from_vq
+        return tok_logits, vq_logits
 
 @torch.no_grad()
 def evaluate(model, loader, device, aux_lambda, main_target):
