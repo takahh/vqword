@@ -332,9 +332,7 @@ def main():
         for p in model.tok_head.parameters():
             p.requires_grad = True
 
-        # vq_to_tok も使うなら
-        for p in model.vq_to_tok.parameters():
-            p.requires_grad = True
+        print("[freeze] train only tok_head")
 
         print("[freeze] train only vq_to_tok")
 
