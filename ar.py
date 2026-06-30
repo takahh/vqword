@@ -77,6 +77,12 @@ class ARVQWordLM(nn.Module):
             batch_first=True,
             norm_first=True,
         )
+        self.vq_to_tok = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, vocab_size),
+        )
         self.tr = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(d_model)
 
@@ -105,7 +111,21 @@ class ARVQWordLM(nn.Module):
             src_key_padding_mask=key_padding_mask,
         )
         h = self.norm(h)
-        return self.tok_head(h), self.vq_head(h)
+
+        tok_logits = self.tok_head(h)
+        vq_logits = self.vq_head(h)
+
+        # predicted VQW -> Word module
+        pred_vq_id = vq_logits.detach().argmax(dim=-1)
+
+        if self.vq_emb is not None:
+            pred_vq_emb = self.vq_emb(pred_vq_id)
+        else:
+            pred_vq_emb = h.detach()
+
+        tok_logits_from_vq = self.vq_to_tok(pred_vq_emb.detach())
+
+        return tok_logits, vq_logits, tok_logits_from_vq
 
 @torch.no_grad()
 def evaluate(model, loader, device, aux_lambda, main_target):
@@ -123,10 +143,16 @@ def evaluate(model, loader, device, aux_lambda, main_target):
         attn_mask = attn_mask.to(device)
 
         key_padding_mask = ~attn_mask
-        tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
+        tok_logits, vq_logits, tok_logits_from_vq = model(tok_in, vq_in, key_padding_mask)
 
         tok_loss = F.cross_entropy(
             tok_logits.reshape(-1, tok_logits.size(-1)),
+            tok_y.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+        tok_from_vq_loss = F.cross_entropy(
+            tok_logits_from_vq.reshape(-1, tok_logits_from_vq.size(-1)),
             tok_y.reshape(-1),
             ignore_index=-100,
             reduction="sum",
@@ -142,8 +168,12 @@ def evaluate(model, loader, device, aux_lambda, main_target):
 
         if main_target == "tok":
             main_loss = tok_loss + aux_lambda * vq_loss if aux_lambda > 0 else tok_loss
-        else:
+
+        elif main_target == "vq":
             main_loss = vq_loss + aux_lambda * tok_loss if aux_lambda > 0 else vq_loss
+
+        elif main_target == "both":
+            main_loss = tok_from_vq_loss
 
         total_tok_loss += tok_loss.item()
         total_vq_loss += vq_loss.item()
@@ -175,7 +205,8 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--d_model", type=int, default=256)
     ap.add_argument("--n_layers", type=int, default=6)
-    ap.add_argument("--main_target", choices=["tok", "vq"], default="tok")
+    ap.add_argument("--main_target", choices=["tok", "vq", "both"], default="tok")
+    ap.add_argument("--freeze_vq_backbone", action="store_true")
     ap.add_argument("--n_heads", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--aux_lambda", type=float, default=0.1)
@@ -279,7 +310,7 @@ def main():
         use_token_input=use_token_input,
         use_vq_input=use_vq_input,
     ).to(device)
-    
+
     if args.init_from is not None:
         ckpt = torch.load(args.init_from, map_location="cpu")
         sd = ckpt["model"]
@@ -294,8 +325,20 @@ def main():
             model.tok_head.reset_parameters()
             model.vq_head.reset_parameters()
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    if args.freeze_vq_backbone:
+        for name, p in model.named_parameters():
+            p.requires_grad = False
 
+        for p in model.vq_to_tok.parameters():
+            p.requires_grad = True
+
+        print("[freeze] train only vq_to_tok")
+
+    opt = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=0.01,
+    )
     best_valid = float("inf")
 
     for ep in range(1, args.epochs + 1):
@@ -310,13 +353,20 @@ def main():
             attn_mask = attn_mask.to(device)
 
             key_padding_mask = ~attn_mask
-            tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
+            tok_logits, vq_logits, tok_logits_from_vq = model(tok_in, vq_in, key_padding_mask)
 
             tok_loss = F.cross_entropy(
                 tok_logits.reshape(-1, tok_logits.size(-1)),
                 tok_y.reshape(-1),
                 ignore_index=-100,
             )
+
+            tok_from_vq_loss = F.cross_entropy(
+                tok_logits_from_vq.reshape(-1, tok_logits_from_vq.size(-1)),
+                tok_y.reshape(-1),
+                ignore_index=-100,
+            )
+
             vq_loss = F.cross_entropy(
                 vq_logits.reshape(-1, vq_logits.size(-1)),
                 vq_y.reshape(-1),
@@ -324,15 +374,13 @@ def main():
             )
 
             if args.main_target == "tok":
-                if args.aux_lambda > 0:
-                    loss = tok_loss + args.aux_lambda * vq_loss
-                else:
-                    loss = tok_loss
-            else:  # main_target == "vq"
-                if args.aux_lambda > 0:
-                    loss = vq_loss + args.aux_lambda * tok_loss
-                else:
-                    loss = vq_loss
+                loss = tok_loss + args.aux_lambda * vq_loss
+
+            elif args.main_target == "vq":
+                loss = vq_loss + args.aux_lambda * tok_loss
+
+            elif args.main_target == "both":
+                loss = tok_from_vq_loss
 
             opt.zero_grad()
             loss.backward()
@@ -343,6 +391,7 @@ def main():
                 loss=f"{loss.item():.3f}",
                 tok=f"{tok_loss.item():.3f}",
                 vq=f"{vq_loss.item():.3f}",
+                vq2tok=f"{tok_from_vq_loss.item():.3f}",
             )
 
         valid = evaluate(model, valid_loader, device, args.aux_lambda, args.main_target)
