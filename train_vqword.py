@@ -409,7 +409,7 @@ def main():
     args = ap.parse_args()
     assert args.codebook_size % args.n_partitions == 0
     assert args.partition_base >= 0
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     pad_id = 0
@@ -476,6 +476,29 @@ def main():
         device=device,
         args=args,
     )
+
+    from collections import defaultdict, Counter
+
+    cluster_counter = defaultdict(Counter)
+
+    tgt_cpu = tgt.cpu().tolist()
+    vq_cpu = vq_ids.cpu().tolist()
+
+    for wid, cid in zip(tgt_cpu, vq_cpu):
+        cluster_counter[cid][wid] += 1
+
+    cluster_dict = {
+        cid: [
+            (wid, id2word[wid], count)
+            for wid, count in counter.most_common()
+        ]
+        for cid, counter in cluster_counter.items()
+    }
+
+    dict_out = args.out.replace(".pt", "_dictionary.pt")
+    torch.save(cluster_dict, dict_out)
+    print(f"[save dictionary] {dict_out}")
+
     # keep the clean partitioned KMeans IDs
     vq_ids_kmeans = vq_ids.clone()
 
