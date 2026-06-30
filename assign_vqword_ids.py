@@ -81,7 +81,8 @@ def main():
         if len(ids) < 2 * cargs["hop"] + 2:
             continue
 
-        ctx, tgt = make_windows(ids, cargs["hop"], ckpt["pad_token_id"])
+        ctx = torch.cat(all_ctx, dim=0)
+        tgt = torch.cat(all_tgt, dim=0)
 
         start = sum(len(x) for x in all_tgt)
         end = start + len(tgt)
@@ -100,8 +101,8 @@ def main():
     for sample_idx, start, end, n_tok in offsets:
         samples.append({
             "sample_idx": sample_idx,
-            "token_ids": tgt[start:end],
-            "vqword_ids": vq_ids[start:end],
+            "token_ids": tgt[start:end].cpu(),
+            "vqword_ids": vq_ids[start:end].cpu(),
             "length": n_tok,
         })
 
