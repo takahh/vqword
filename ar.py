@@ -372,7 +372,7 @@ def main():
                 loss = vq_loss + args.aux_lambda * tok_loss
 
             elif args.main_target == "both":
-                loss = tok_from_vq_loss
+                loss = tok_loss + args.aux_lambda * vq_loss
 
             opt.zero_grad()
             loss.backward()
