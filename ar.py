@@ -371,7 +371,6 @@ def main():
                 loss=f"{loss.item():.3f}",
                 tok=f"{tok_loss.item():.3f}",
                 vq=f"{vq_loss.item():.3f}",
-                vq2tok=f"{tok_from_vq_loss.item():.3f}",
             )
 
         valid = evaluate(model, valid_loader, device, args.aux_lambda, args.main_target)
