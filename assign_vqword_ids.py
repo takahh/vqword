@@ -67,33 +67,42 @@ def main():
     centroids = ckpt["centroids"].to(device)
 
     ds = load_dataset(args.dataset, split=args.split)
-
     all_ctx = []
     all_tgt = []
     offsets = []
 
     print("[data] tokenizing")
+
     for i, ex in enumerate(tqdm(ds.select(range(min(args.max_samples, len(ds)))))):
         text = ex[args.text_col]
         words = word_tokenize(text)
-        ids = [word2id.get(w, unk_id) for w in words[:args.seq_len]]
+        ids = [word2id.get(w, unk_id) for w in words]
 
         if len(ids) < 2 * cargs["hop"] + 2:
             continue
 
-        ctx = torch.cat(all_ctx, dim=0)
-        tgt = torch.cat(all_tgt, dim=0)
+        ids = torch.tensor(ids, dtype=torch.long)
+
+        ctx_i, tgt_i = make_windows(ids, cargs["hop"], pad_id)
+
+        if len(tgt_i) == 0:
+            continue
 
         start = sum(len(x) for x in all_tgt)
-        end = start + len(tgt)
+        end = start + len(tgt_i)
 
         offsets.append((i, start, end, len(ids)))
-        all_ctx.append(ctx)
-        all_tgt.append(tgt)
+        all_ctx.append(ctx_i)
+        all_tgt.append(tgt_i)
 
-    ctx, tgt = make_windows(ids, cargs["hop"], pad_id)
+    if len(all_ctx) == 0:
+        raise ValueError("No windows created. Try checking text_col, word vocab, or make_windows.")
+
+    ctx = torch.cat(all_ctx, dim=0)
+    tgt = torch.cat(all_tgt, dim=0)
 
     print(f"[data] windows={len(tgt):,}")
+
     vq_ids = assign_ids(model, centroids, ctx, args.batch_size, device)
 
     # sampleごとに戻す
