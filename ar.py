@@ -133,16 +133,10 @@ def evaluate(model, loader, device, aux_lambda, main_target):
         attn_mask = attn_mask.to(device)
 
         key_padding_mask = ~attn_mask
-        tok_logits, vq_logits, tok_logits_from_vq = model(tok_in, vq_in, key_padding_mask)
+        tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
         tok_loss = F.cross_entropy(
             tok_logits.reshape(-1, tok_logits.size(-1)),
-            tok_y.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
-        tok_from_vq_loss = F.cross_entropy(
-            tok_logits_from_vq.reshape(-1, tok_logits_from_vq.size(-1)),
             tok_y.reshape(-1),
             ignore_index=-100,
             reduction="sum",
@@ -345,16 +339,10 @@ def main():
             attn_mask = attn_mask.to(device)
 
             key_padding_mask = ~attn_mask
-            tok_logits, vq_logits, tok_logits_from_vq = model(tok_in, vq_in, key_padding_mask)
+            tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
             tok_loss = F.cross_entropy(
                 tok_logits.reshape(-1, tok_logits.size(-1)),
-                tok_y.reshape(-1),
-                ignore_index=-100,
-            )
-
-            tok_from_vq_loss = F.cross_entropy(
-                tok_logits_from_vq.reshape(-1, tok_logits_from_vq.size(-1)),
                 tok_y.reshape(-1),
                 ignore_index=-100,
             )
