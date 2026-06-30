@@ -111,8 +111,17 @@ class ARVQWordLM(nn.Module):
 
         return tok_logits, vq_logits
 
+def load_vq_dictionary(path):
+    raw = torch.load(path, map_location="cpu")
+
+    vq2word_ids = {}
+    for vq_id, entries in raw.items():
+        vq2word_ids[int(vq_id)] = [int(wid) for wid, word, count in entries]
+
+    return vq2word_ids
+
 @torch.no_grad()
-def evaluate(model, loader, device, aux_lambda, main_target):
+def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, dict_loss=False):
     model.eval()
     total_tok_loss = 0.0
     total_vq_loss = 0.0
@@ -129,12 +138,20 @@ def evaluate(model, loader, device, aux_lambda, main_target):
         key_padding_mask = ~attn_mask
         tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
-        tok_loss = F.cross_entropy(
-            tok_logits.reshape(-1, tok_logits.size(-1)),
-            tok_y.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
+        if dict_loss and vq2word_ids is not None:
+            tok_loss = masked_token_ce_by_true_vq(
+                tok_logits=tok_logits,
+                tok_y=tok_y,
+                vq_y=vq_y,
+                vq2word_ids=vq2word_ids,
+            ) * tok_y.ne(-100).sum()
+        else:
+            tok_loss = F.cross_entropy(
+                tok_logits.reshape(-1, tok_logits.size(-1)),
+                tok_y.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
         vq_loss = F.cross_entropy(
             vq_logits.reshape(-1, vq_logits.size(-1)),
             vq_y.reshape(-1),
@@ -171,6 +188,46 @@ def evaluate(model, loader, device, aux_lambda, main_target):
         "vq_ppl": math.exp(min(vq_ce, 20)),
     }
 
+def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
+    """
+    tok_logits: [B, T, vocab_size]
+    tok_y:      [B, T]
+    vq_y:       [B, T]
+    """
+
+    B, T, V = tok_logits.shape
+    flat_logits = tok_logits.reshape(B * T, V)
+    flat_tok_y = tok_y.reshape(B * T)
+    flat_vq_y = vq_y.reshape(B * T)
+
+    masked_logits = torch.full_like(flat_logits, -1e9)
+
+    for i in range(flat_logits.size(0)):
+        if flat_tok_y[i].item() == -100:
+            continue
+
+        vq_id = int(flat_vq_y[i].item())
+
+        if vq_id not in vq2word_ids:
+            masked_logits[i] = flat_logits[i]
+            continue
+
+        cand = torch.tensor(
+            vq2word_ids[vq_id],
+            device=flat_logits.device,
+            dtype=torch.long,
+        )
+
+        masked_logits[i, cand] = flat_logits[i, cand]
+
+    loss = F.cross_entropy(
+        masked_logits,
+        flat_tok_y,
+        ignore_index=-100,
+    )
+
+    return loss
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="path to VQWord AR training data .pt")
@@ -193,6 +250,8 @@ def main():
     ap.add_argument("--token_only", action="store_true")
     ap.add_argument("--init_from", default=None, help="pretrained AR checkpoint .pt")
     ap.add_argument("--reset_heads", action="store_true")
+    ap.add_argument("--dictionary", default=None)
+    ap.add_argument("--dict_loss", action="store_true")
     args = ap.parse_args()
 
     history = {
@@ -220,6 +279,18 @@ def main():
 
     data = torch.load(args.data, map_location="cpu")
     samples = data["samples"]
+
+    if args.dictionary is not None:
+        raw_dict = torch.load(args.dictionary, map_location="cpu")
+
+        vq2word_ids = {
+            int(vq_id): [int(wid) for wid, word, count in entries]
+            for vq_id, entries in raw_dict.items()
+        }
+
+        print(f"[dictionary] loaded {len(vq2word_ids)} VQ entries")
+    else:
+        vq2word_ids = None
 
     tokenizer_name = args.tokenizer or data.get("tokenizer", None)
     if tokenizer_name is None:
@@ -335,11 +406,19 @@ def main():
             key_padding_mask = ~attn_mask
             tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
-            tok_loss = F.cross_entropy(
-                tok_logits.reshape(-1, tok_logits.size(-1)),
-                tok_y.reshape(-1),
-                ignore_index=-100,
-            )
+            if args.dict_loss and vq2word_ids is not None:
+                tok_loss = masked_token_ce_by_true_vq(
+                    tok_logits=tok_logits,
+                    tok_y=tok_y,
+                    vq_y=vq_y,
+                    vq2word_ids=vq2word_ids,
+                )
+            else:
+                tok_loss = F.cross_entropy(
+                    tok_logits.reshape(-1, tok_logits.size(-1)),
+                    tok_y.reshape(-1),
+                    ignore_index=-100,
+                )
 
             vq_loss = F.cross_entropy(
                 vq_logits.reshape(-1, vq_logits.size(-1)),
@@ -366,9 +445,20 @@ def main():
                 tok=f"{tok_loss.item():.3f}",
                 vq=f"{vq_loss.item():.3f}",
             )
+            
+        valid = evaluate(
+            model, valid_loader, device,
+            args.aux_lambda, args.main_target,
+            vq2word_ids=vq2word_ids,
+            dict_loss=args.dict_loss,
+        )
 
-        valid = evaluate(model, valid_loader, device, args.aux_lambda, args.main_target)
-        test = evaluate(model, test_loader, device, args.aux_lambda, args.main_target)
+        test = evaluate(
+            model, test_loader, device,
+            args.aux_lambda, args.main_target,
+            vq2word_ids=vq2word_ids,
+            dict_loss=args.dict_loss,
+        )
 
         valid_loss = valid["main_loss"]
         test_loss = test["main_loss"]
