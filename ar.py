@@ -290,7 +290,7 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
                 model=model,
                 h=h,
                 tok_y=tok_y,
-                vq_y=vq_y,
+                vq_logits=vq_logits,
                 vq2word_ids=vq2word_ids,
                 topk=16,
             ) * tok_y.ne(-100).sum()
