@@ -209,7 +209,7 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
                 tok_y=tok_y,
                 vq_y=vq_y,
                 vq2word_ids=vq2word_ids,
-                topk=32,
+                topk=16,
             ) * tok_y.ne(-100).sum()
         else:
             if tok_logits is None:
@@ -508,7 +508,7 @@ def main():
                     tok_y=tok_y,
                     vq_y=vq_y,
                     vq2word_ids=vq2word_ids,
-                    topk=32,
+                    topk=16,
                 )
             else:
                 if tok_logits is None:
