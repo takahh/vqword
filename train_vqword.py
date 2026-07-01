@@ -327,6 +327,103 @@ def make_windows(token_ids, hop, pad_id):
 
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
 
+@torch.no_grad()
+def fit_kmeans_torch_streaming(model, ctx, batch_size, device, args):
+    model.eval()
+
+    K = args.codebook_size
+    D = args.d_model
+
+    print("[kmeans] torch blockwise init")
+    centers = init_centers_random(
+        model=model,
+        ctx=ctx,
+        K=K,
+        batch_size=batch_size,
+        device=device,
+    )
+
+    for it in range(args.kmeans_iters):
+        print(f"[kmeans] iter {it + 1}/{args.kmeans_iters}")
+
+        sums = torch.zeros(K, D, device=device, dtype=torch.float32)
+        counts = torch.zeros(K, device=device, dtype=torch.long)
+
+        for start in tqdm(range(0, len(ctx), batch_size),
+                          desc="[kmeans assign/update]"):
+            xb = ctx[start:start + batch_size].to(device)
+
+            z = model.encode_context(xb).float()
+            z = F.normalize(z, dim=-1)
+
+            y = assign_blockwise(
+                z,
+                centers,
+                k_block=args.k_block,
+            )
+
+            sums.index_add_(0, y, z)
+            counts.index_add_(0, y,
+                              torch.ones_like(y, dtype=torch.long))
+
+        nonempty = counts > 0
+        new_centers = centers.clone()
+        new_centers[nonempty] = (
+            sums[nonempty] /
+            counts[nonempty].float().unsqueeze(1)
+        )
+        new_centers = F.normalize(new_centers, dim=-1)
+
+        shift = (
+            (new_centers - centers)
+            .pow(2)
+            .sum(dim=1)
+            .sqrt()
+            .mean()
+        )
+
+        centers = new_centers
+
+        used = int(nonempty.sum().item())
+        print(
+            f"[kmeans] used={used}/{K} "
+            f"shift={shift.item():.6f}"
+        )
+
+    return centers
+
+@torch.no_grad()
+def predict_kmeans_torch_streaming(
+    model,
+    centers,
+    ctx,
+    batch_size,
+    device,
+    args,
+):
+    model.eval()
+
+    ids = []
+
+    centers = centers.to(device)
+
+    print("[kmeans] predict torch blockwise")
+
+    for start in tqdm(range(0, len(ctx), batch_size),
+                      desc="[kmeans predict]"):
+        xb = ctx[start:start + batch_size].to(device)
+
+        z = model.encode_context(xb).float()
+
+        pred = assign_blockwise(
+            z,
+            centers,
+            k_block=args.k_block,
+        )
+
+        ids.append(pred.cpu())
+
+    return torch.cat(ids, dim=0)
 
 def soft_entropy_loss(z, centers, temperature=0.1):
     z = F.normalize(z.float(), dim=-1)
@@ -537,20 +634,18 @@ def main():
     else:
         print("[vq-opt] skipped")
 
-    centroids = fit_kmeans_partitioned_streaming(
+    centroids = fit_kmeans_torch_streaming(
         model=model,
         ctx=ctx,
-        tgt=tgt,
         batch_size=args.batch_size,
         device=device,
         args=args,
     )
 
-    vq_ids = predict_partitioned_streaming(
+    vq_ids = predict_kmeans_torch_streaming(
         model=model,
         centers=centroids,
         ctx=ctx,
-        tgt=tgt,
         batch_size=args.batch_size,
         device=device,
         args=args,
@@ -616,13 +711,11 @@ def main():
             "pad_token_id": pad_id,
             "unk_token_id": unk_id,
             "vocab_type": "word",
-            "partitioned": True,
-            "n_partitions": args.n_partitions,
-            "codes_per_partition": args.codebook_size // args.n_partitions,
-            "id_scheme": "partition_offset",
-            "partition_base": args.partition_base,
-            "global_id_min": args.partition_base,
-            "global_id_max": args.partition_base + args.codebook_size - 1,
+            "partitioned": False,
+            "vq_vocab_size": args.codebook_size,
+            "id_scheme": "flat_kmeans",
+            "global_id_min": 0,
+            "global_id_max": args.codebook_size - 1,
         },
         args.out,
     )
@@ -637,13 +730,11 @@ def main():
             "pad_token_id": pad_id,
             "unk_token_id": unk_id,
             "vocab_type": "word",
-            "partitioned": True,
-            "n_partitions": args.n_partitions,
-            "codes_per_partition": args.codebook_size // args.n_partitions,
-            "id_scheme": "partition_offset",
-            "partition_base": args.partition_base,
-            "global_id_min": args.partition_base,
-            "global_id_max": args.partition_base + args.codebook_size - 1,
+            "partitioned": False,
+            "vq_vocab_size": args.codebook_size,
+            "id_scheme": "flat_kmeans",
+            "global_id_min": 0,
+            "global_id_max": args.codebook_size - 1,
         },
         id_out,
     )
