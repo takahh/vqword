@@ -119,6 +119,7 @@ class ARVQWordLM(nn.Module):
 
         return h, tok_logits, vq_logits
 
+
 def candidate_token_ce_from_hidden(model, h, tok_y, vq_y, vq2word_ids, topk=32):
     B, T, D = h.shape
 
@@ -132,31 +133,46 @@ def candidate_token_ce_from_hidden(model, h, tok_y, vq_y, vq2word_ids, topk=32):
     flat_vq_y = flat_vq_y[valid]
 
     losses = []
+    total = 0
 
     W = model.tok_head.weight
     b = model.tok_head.bias
 
     for vq_id in flat_vq_y.unique().tolist():
+        base = vq2word_ids.get(int(vq_id), None)
+        if base is None or base.numel() == 0:
+            continue
+
+        cand_ids = base[:topk]
+
         idx = flat_vq_y.eq(vq_id).nonzero(as_tuple=True)[0]
         h_i = flat_h[idx]
         true_tok = flat_tok_y[idx]
 
-        base = vq2word_ids.get(int(vq_id), None)
-        if base is None:
-            cand_ids = true_tok.unique()
-        else:
-            cand_ids = torch.cat([base[:topk], true_tok]).unique()
+        # 辞書候補に正解がある位置だけ使う
+        hit = cand_ids[None, :].eq(true_tok[:, None])
+        keep = hit.any(dim=1)
 
-        W_c = W[cand_ids]          # [C, D]
-        b_c = b[cand_ids]          # [C]
+        if keep.sum().item() == 0:
+            continue
+
+        h_i = h_i[keep]
+        true_tok = true_tok[keep]
+        hit = hit[keep]
+
+        target = hit.float().argmax(dim=1).long()
+
+        W_c = W[cand_ids]
+        b_c = b[cand_ids]
         small_logits = h_i @ W_c.T + b_c
 
-        eq = cand_ids[None, :].eq(true_tok[:, None])
-        target = eq.float().argmax(dim=1).long()
-
         losses.append(F.cross_entropy(small_logits, target, reduction="sum"))
+        total += h_i.size(0)
 
-    return torch.stack(losses).sum() / flat_tok_y.numel()
+    if total == 0:
+        return torch.tensor(0.0, device=h.device, requires_grad=True)
+
+    return torch.stack(losses).sum() / total
 
 
 def load_vq_dictionary(path):
@@ -184,22 +200,28 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
         attn_mask = attn_mask.to(device)
 
         key_padding_mask = ~attn_mask
-        tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
+        h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
         if dict_loss and vq2word_ids is not None:
-            tok_loss = masked_token_ce_by_true_vq(
-                tok_logits=tok_logits,
+            tok_loss = candidate_token_ce_from_hidden(
+                model=model,
+                h=h,
                 tok_y=tok_y,
                 vq_y=vq_y,
                 vq2word_ids=vq2word_ids,
+                topk=32,
             ) * tok_y.ne(-100).sum()
         else:
+            if tok_logits is None:
+                tok_logits = model.tok_head(h)
+
             tok_loss = F.cross_entropy(
                 tok_logits.reshape(-1, tok_logits.size(-1)),
                 tok_y.reshape(-1),
                 ignore_index=-100,
                 reduction="sum",
             )
+
         vq_loss = F.cross_entropy(
             vq_logits.reshape(-1, vq_logits.size(-1)),
             vq_y.reshape(-1),
