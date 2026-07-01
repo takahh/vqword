@@ -576,20 +576,6 @@ def main():
 
                 commit_loss = F.mse_loss(z, q)
 
-                batch_ent_loss = entropy_loss_from_ids(
-                    ids.detach(),
-                    args.codebook_size,
-                    device,
-                )
-
-                with torch.no_grad():
-                    usage_ema = update_usage_ema(
-                        usage_ema,
-                        ids.detach(),
-                        args.codebook_size,
-                        decay=args.ema_decay,
-                    )
-
                 soft_ent_loss = soft_entropy_loss_partitioned(
                     z=z,
                     centers=centers,
@@ -604,8 +590,7 @@ def main():
                         args.codebook_size,
                         decay=args.ema_decay,
                     )
-
-                ema_ent_loss = entropy_loss_from_probs(usage_ema)
+                    ema_ent_loss = entropy_loss_from_probs(usage_ema)
 
                 ent_loss = soft_ent_loss
 
@@ -625,7 +610,8 @@ def main():
                 pbar.set_postfix(
                     loss=f"{total_loss / total_n:.4f}",
                     commit=f"{total_commit / total_n:.4f}",
-                    ent=f"{total_ent / total_n:.4f}",
+                    soft_ent=f"{total_ent / total_n:.4f}",
+                    ema_ent=f"{ema_ent_loss.item():.4f}",
                 )
 
             print(
