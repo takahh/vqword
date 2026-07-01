@@ -274,6 +274,19 @@ def predict_kmeans_torch_streaming(model, centers, ctx, batch_size, device, args
 
     return torch.cat(ids, dim=0)
 
+@torch.no_grad()
+def update_usage_ema(usage_ema, ids, K, decay=0.99):
+    batch_counts = torch.bincount(ids, minlength=K).float().to(usage_ema.device)
+    batch_probs = batch_counts / batch_counts.sum().clamp_min(1.0)
+    usage_ema.mul_(decay).add_(batch_probs, alpha=1.0 - decay)
+    usage_ema.div_(usage_ema.sum().clamp_min(1e-12))
+    return usage_ema
+
+def entropy_loss_from_probs(p):
+    p = p[p > 0]
+    entropy = -(p * torch.log(p + 1e-12)).sum()
+    return -entropy
+
 class AdjGNNLayer(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -369,6 +382,37 @@ def make_windows(token_ids, hop, pad_id):
 
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
 
+
+def soft_entropy_loss_partitioned(z, centers, part_ids, temperature=0.1):
+    """
+    z: [B, D]
+    centers: [P, Kp, D]
+    part_ids: [B]
+    returns differentiable entropy loss
+    """
+    z = F.normalize(z.float(), dim=-1)
+    centers = F.normalize(centers.float(), dim=-1)
+
+    ent_losses = []
+
+    for p in part_ids.unique():
+        mask = part_ids == p
+        zp = z[mask]          # [Bp, D]
+        cp = centers[p]       # [Kp, D]
+
+        sim = zp @ cp.T       # [Bp, Kp]
+        prob = F.softmax(sim / temperature, dim=-1)
+
+        # average code usage in this batch/partition
+        usage = prob.mean(dim=0)  # [Kp]
+
+        entropy = -(usage * torch.log(usage + 1e-12)).sum()
+
+        # minimize negative entropy => maximize entropy
+        ent_losses.append(-entropy)
+
+    return torch.stack(ent_losses).mean()
+
 def entropy_loss_from_ids(ids, K, device):
     counts = torch.bincount(ids, minlength=K).float().to(device)
     p = counts / counts.sum().clamp_min(1.0)
@@ -412,6 +456,8 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--n_partitions", type=int, default=256)
     ap.add_argument("--partition_base", type=int, default=0)
+    ap.add_argument("--entropy_temp", type=float, default=0.1)
+
     args = ap.parse_args()
     assert args.codebook_size % args.n_partitions == 0
     assert args.partition_base >= 0
@@ -453,6 +499,9 @@ def main():
     ctx = torch.cat(all_ctx, dim=0)
     tgt = torch.cat(all_tgt, dim=0)
 
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
     print(f"[data] windows={len(tgt):,} vocab={vocab_size}")
     model = VQWordGNN(
         vocab_size=vocab_size,
@@ -461,8 +510,11 @@ def main():
         n_layers=args.n_layers,
     ).to(device)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    usage_ema = torch.full(
+        (args.codebook_size,),
+        1.0 / args.codebook_size,
+        device=device,
+    )
 
     if args.epochs > 0:
         print(f"[vq-opt] epochs={args.epochs}")
@@ -524,11 +576,38 @@ def main():
 
                 commit_loss = F.mse_loss(z, q)
 
-                ent_loss = entropy_loss_from_ids(
+                batch_ent_loss = entropy_loss_from_ids(
                     ids.detach(),
                     args.codebook_size,
                     device,
                 )
+
+                with torch.no_grad():
+                    usage_ema = update_usage_ema(
+                        usage_ema,
+                        ids.detach(),
+                        args.codebook_size,
+                        decay=args.ema_decay,
+                    )
+
+                soft_ent_loss = soft_entropy_loss_partitioned(
+                    z=z,
+                    centers=centers,
+                    part_ids=part,
+                    temperature=args.entropy_temp,
+                )
+
+                with torch.no_grad():
+                    usage_ema = update_usage_ema(
+                        usage_ema,
+                        ids.detach(),
+                        args.codebook_size,
+                        decay=args.ema_decay,
+                    )
+
+                ema_ent_loss = entropy_loss_from_probs(usage_ema)
+
+                ent_loss = soft_ent_loss
 
                 loss = commit_loss + args.vq_beta * ent_loss
 
