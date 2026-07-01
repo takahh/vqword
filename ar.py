@@ -120,17 +120,24 @@ class ARVQWordLM(nn.Module):
         return h, tok_logits, vq_logits
 
 
-def candidate_token_ce_from_hidden(model, h, tok_y, vq_y, vq2word_ids, topk=32):
+def candidate_token_ce_from_hidden(
+    model,
+    h,
+    tok_y,
+    vq_logits,
+    vq2word_ids,
+    topk=32,
+):
     B, T, D = h.shape
-
+    pred_vq = vq_logits.argmax(dim=-1)
     flat_h = h.reshape(B * T, D)
     flat_tok_y = tok_y.reshape(B * T)
-    flat_vq_y = vq_y.reshape(B * T)
+    flat_vq = pred_vq.reshape(B * T)
 
     valid = flat_tok_y.ne(-100)
     flat_h = flat_h[valid]
     flat_tok_y = flat_tok_y[valid]
-    flat_vq_y = flat_vq_y[valid]
+    flat_vq = flat_vq[valid]
 
     losses = []
     total = 0
@@ -138,14 +145,14 @@ def candidate_token_ce_from_hidden(model, h, tok_y, vq_y, vq2word_ids, topk=32):
     W = model.tok_head.weight
     b = model.tok_head.bias
 
-    for vq_id in flat_vq_y.unique().tolist():
+    for vq_id in flat_vq.unique().tolist():
         base = vq2word_ids.get(int(vq_id), None)
         if base is None or base.numel() == 0:
             continue
 
         cand_ids = base[:topk]
 
-        idx = flat_vq_y.eq(vq_id).nonzero(as_tuple=True)[0]
+        idx = flat_vq.eq(vq_id).nonzero(as_tuple=True)[0]
         h_i = flat_h[idx]
         true_tok = flat_tok_y[idx]
 
@@ -586,7 +593,7 @@ def main():
                     model=model,
                     h=h,
                     tok_y=tok_y,
-                    vq_y=vq_y,
+                    vq_logits=vq_logits,
                     vq2word_ids=vq2word_ids,
                     topk=16,
                 )
@@ -658,7 +665,7 @@ def main():
             f"valid_tok_ppl={valid['tok_ppl']:.2f} valid_full_tok_ppl={valid['tok_full_ppl']:.2f} valid_vq_ppl={valid['vq_ppl']:.2f} "
             f"test_tok_ppl={test['tok_ppl']:.2f} test_full_tok_ppl={test['tok_full_ppl']:.2f} test_vq_ppl={test['vq_ppl']:.2f} "
         )
-        
+
         if pipe_valid is not None:
             print(
                 f"[pipe] ep={ep} "
