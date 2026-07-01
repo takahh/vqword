@@ -9,11 +9,16 @@ from transformers import AutoTokenizer
 
 
 class VQWordARDataset(Dataset):
-    def __init__(self, samples):
+    def __init__(self, samples, max_len=1024):
         self.samples = []
         for s in samples:
             tok = s["token_ids"].long()
             vq = s["vqword_ids"].long()
+
+            # tok_in = tok[:-1] なので、元系列は max_len+1 まで許可
+            if len(tok) > max_len + 1:
+                continue
+
             if len(tok) >= 4:
                 self.samples.append((tok, vq))
 
@@ -341,9 +346,9 @@ def main():
     valid_s = samples[n_train:n_train + n_valid]
     test_s = samples[n_train + n_valid:]
 
-    train_ds = VQWordARDataset(train_s)
-    valid_ds = VQWordARDataset(valid_s)
-    test_ds = VQWordARDataset(test_s)
+    train_ds = VQWordARDataset(train_s, max_len=1024)
+    valid_ds = VQWordARDataset(valid_s, max_len=1024)
+    test_ds = VQWordARDataset(test_s, max_len=1024)
 
     def make_loader(ds, shuffle):
         return DataLoader(
