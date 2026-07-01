@@ -301,8 +301,10 @@ def main():
     if args.dictionary is not None:
         raw_dict = torch.load(args.dictionary, map_location="cpu")
 
+        DICT_TOPK = 32
+
         vq2word_ids = {
-            int(vq_id): [int(wid) for wid, word, count in entries]
+            int(vq_id): [int(wid) for wid, word, count in entries[:DICT_TOPK]]
             for vq_id, entries in raw_dict.items()
         }
 
