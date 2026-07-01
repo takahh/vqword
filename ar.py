@@ -111,10 +111,14 @@ class ARVQWordLM(nn.Module):
         )
         h = self.norm(h)
         # forward内
-        tok_logits = self.tok_head(h)
+        tok_logits = None
         vq_logits = self.vq_head(h)
 
-        return tok_logits, vq_logits
+        if not self.use_vq_input or self.use_token_input:
+            tok_logits = self.tok_head(h)
+
+        return h, tok_logits, vq_logits
+
 
 def load_vq_dictionary(path):
     raw = torch.load(path, map_location="cpu")
