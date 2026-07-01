@@ -185,6 +185,73 @@ def load_vq_dictionary(path):
     return vq2word_ids
 
 @torch.no_grad()
+def evaluate_pred_vq_to_word(model, loader, device, vq2word_ids, topk=16):
+    model.eval()
+
+    total = 0
+    covered = 0
+    correct_vq = 0
+    correct_word = 0
+
+    W = model.tok_head.weight
+    b = model.tok_head.bias
+
+    for tok_in, vq_in, tok_y, vq_y, attn_mask in loader:
+        tok_in = tok_in.to(device)
+        vq_in = vq_in.to(device)
+        tok_y = tok_y.to(device)
+        vq_y = vq_y.to(device)
+        attn_mask = attn_mask.to(device)
+
+        key_padding_mask = ~attn_mask
+        h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
+
+        pred_vq = vq_logits.argmax(dim=-1)
+
+        flat_h = h.reshape(-1, h.size(-1))
+        flat_pred_vq = pred_vq.reshape(-1)
+        flat_true_vq = vq_y.reshape(-1)
+        flat_true_tok = tok_y.reshape(-1)
+
+        valid = flat_true_tok.ne(-100)
+
+        flat_h = flat_h[valid]
+        flat_pred_vq = flat_pred_vq[valid]
+        flat_true_vq = flat_true_vq[valid]
+        flat_true_tok = flat_true_tok[valid]
+
+        total += flat_true_tok.numel()
+        correct_vq += flat_pred_vq.eq(flat_true_vq).sum().item()
+
+        for vq_id in flat_pred_vq.unique().tolist():
+            cand = vq2word_ids.get(int(vq_id), None)
+            if cand is None or cand.numel() == 0:
+                continue
+
+            cand = cand[:topk]
+
+            idx = flat_pred_vq.eq(vq_id).nonzero(as_tuple=True)[0]
+            h_i = flat_h[idx]
+            true_tok_i = flat_true_tok[idx]
+
+            hit = cand[None, :].eq(true_tok_i[:, None])
+            covered += hit.any(dim=1).sum().item()
+
+            W_c = W[cand]
+            b_c = b[cand]
+            logits = h_i @ W_c.T + b_c
+
+            pred_word = cand[logits.argmax(dim=-1)]
+            correct_word += pred_word.eq(true_tok_i).sum().item()
+
+    return {
+        "vq_acc": correct_vq / max(total, 1),
+        "pred_dict_coverage": covered / max(total, 1),
+        "word_acc": correct_word / max(total, 1),
+    }
+
+
+@torch.no_grad()
 def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, dict_loss=False):
     model.eval()
     total_tok_loss = 0.0
@@ -573,6 +640,16 @@ def main():
             dict_loss=args.dict_loss,
         )
 
+        pipe_valid = None
+        pipe_test = None
+        if args.dict_loss and vq2word_ids is not None:
+            pipe_valid = evaluate_pred_vq_to_word(
+                model, valid_loader, device, vq2word_ids, topk=16
+            )
+            pipe_test = evaluate_pred_vq_to_word(
+                model, test_loader, device, vq2word_ids, topk=16
+            )
+
         valid_loss = valid["main_loss"]
         test_loss = test["main_loss"]
 
@@ -581,6 +658,17 @@ def main():
             f"valid_tok_ppl={valid['tok_ppl']:.2f} valid_full_tok_ppl={valid['tok_full_ppl']:.2f} valid_vq_ppl={valid['vq_ppl']:.2f} "
             f"test_tok_ppl={test['tok_ppl']:.2f} test_full_tok_ppl={test['tok_full_ppl']:.2f} test_vq_ppl={test['vq_ppl']:.2f} "
         )
+        
+        if pipe_valid is not None:
+            print(
+                f"[pipe] ep={ep} "
+                f"valid_vq_acc={pipe_valid['vq_acc']:.4f} "
+                f"valid_pred_dict_cov={pipe_valid['pred_dict_coverage']:.4f} "
+                f"valid_word_acc={pipe_valid['word_acc']:.4f} "
+                f"test_vq_acc={pipe_test['vq_acc']:.4f} "
+                f"test_pred_dict_cov={pipe_test['pred_dict_coverage']:.4f} "
+                f"test_word_acc={pipe_test['word_acc']:.4f}"
+            )
 
         history["epoch"].append(ep)
 
