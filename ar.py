@@ -257,15 +257,60 @@ def evaluate_pred_vq_to_word(model, loader, device, vq2word_ids, topk=16):
         "word_acc": correct_word / max(total, 1),
     }
 
+def build_vq2word_prob(raw_dict, device, alpha=1e-6):
+    vq2word_prob = {}
+
+    for vq_id, entries in raw_dict.items():
+
+        word_ids = []
+        counts = []
+
+        for wid, word, cnt in entries:
+            word_ids.append(int(wid))
+            counts.append(float(cnt))
+
+        word_ids = torch.tensor(
+            word_ids,
+            device=device,
+            dtype=torch.long,
+        )
+
+        counts = torch.tensor(
+            counts,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        probs = counts + alpha
+        probs /= probs.sum()
+
+        vq2word_prob[int(vq_id)] = (
+            word_ids,
+            probs,
+        )
+
+    return vq2word_prob
+
 
 @torch.no_grad()
-def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, dict_loss=False):
+def evaluate(
+    model,
+    loader,
+    device,
+    aux_lambda,
+    main_target,
+    vq2word_ids=None,
+    dict_loss=False,
+    vq2word_prob=None
+):
     model.eval()
     total_tok_loss = 0.0
     total_vq_loss = 0.0
     total_main_loss = 0.0
     total_tok = 0
     total_tok_full_loss = 0.0
+    total_dict_loss = 0
+    total_dict_tok = 0
 
     for tok_in, vq_in, tok_y, vq_y, attn_mask in loader:
         tok_in = tok_in.to(device)
@@ -277,6 +322,16 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
         key_padding_mask = ~attn_mask
         h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
         full_tok_logits = model.tok_head(h)
+
+        if vq2word_prob is not None:
+            dloss, n = dict_word_ce(
+                vq_logits,
+                tok_y,
+                vq2word_prob,
+            )
+
+            total_dict_loss += dloss.item()
+            total_dict_tok += n
 
         tok_full_loss = F.cross_entropy(
             full_tok_logits.reshape(-1, full_tok_logits.size(-1)),
@@ -333,6 +388,7 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
     tok_full_ce = total_tok_full_loss / max(total_tok, 1)
     vq_ce = total_vq_loss / max(total_tok, 1)
     main_ce = total_main_loss / max(total_tok, 1)
+    dict_ce = total_dict_loss / max(total_dict_tok, 1)
 
     return {
         "main_loss": main_ce,
@@ -343,7 +399,39 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
         "vq_ppl": math.exp(min(vq_ce, 20)),
         "tok_full_loss": tok_full_ce,
         "tok_full_ppl": math.exp(min(tok_full_ce, 20)),
+        "dict_word_loss": dict_ce,
+        "dict_word_ppl": math.exp(min(dict_ce, 20)),
     }
+
+@torch.no_grad()
+def dict_word_ce(vq_logits, tok_y, vq2word_prob):
+    vq_prob = torch.softmax(vq_logits, dim=-1)
+    B,T,V = vq_prob.shape
+    vq_prob = vq_prob.reshape(B*T,V)
+    tok_y = tok_y.reshape(B*T)
+    valid = tok_y != -100
+    vq_prob = vq_prob[valid]
+    tok_y = tok_y[valid]
+    p = torch.zeros(
+        tok_y.size(0),
+        device=vq_logits.device,
+    )
+
+    for vq_id,(word_ids,word_probs) in vq2word_prob.items():
+        hit = word_ids[None,:].eq(tok_y[:,None])
+        keep = hit.any(dim=1)
+        if keep.sum()==0:
+            continue
+        pos = hit[keep].float().argmax(dim=1)
+        p[keep] += (
+            vq_prob[keep,vq_id]
+            *
+            word_probs[pos]
+        )
+    p = p.clamp_min(1e-12)
+    loss = -torch.log(p).sum()
+
+    return loss, tok_y.numel()
 
 def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
     B, T, V = tok_logits.shape
@@ -444,8 +532,14 @@ def main():
     data = torch.load(args.data, map_location="cpu")
     samples = data["samples"]
 
+    vq_word_prob = None
+
     if args.dictionary is not None:
         raw_dict = torch.load(args.dictionary, map_location="cpu")
+        vq2word_prob = build_vq2word_prob(
+            raw_dict,
+            device,
+        )
 
         DICT_TOPK = 32
 
@@ -458,11 +552,10 @@ def main():
             for vq_id, entries in raw_dict.items()
         }
 
-        vq2cand = {}
-        for vq_id, ids in vq2word_ids.items():
-            vq2cand[int(vq_id)] = ids[:DICT_TOPK]
         print(f"[dictionary] loaded {len(vq2word_ids)} VQ entries")
+
     else:
+        raw_dict = None
         vq2word_ids = None
 
     tokenizer_name = args.tokenizer or data.get("tokenizer", None)
@@ -638,6 +731,7 @@ def main():
             args.aux_lambda, args.main_target,
             vq2word_ids=vq2word_ids,
             dict_loss=args.dict_loss,
+            vq2word_prob=vq2word_prob
         )
 
         test = evaluate(
@@ -645,6 +739,7 @@ def main():
             args.aux_lambda, args.main_target,
             vq2word_ids=vq2word_ids,
             dict_loss=args.dict_loss,
+            vq2word_prob=vq2word_prob
         )
 
         pipe_valid = None
@@ -675,6 +770,8 @@ def main():
                 f"test_vq_acc={pipe_test['vq_acc']:.4f} "
                 f"test_pred_dict_cov={pipe_test['pred_dict_coverage']:.4f} "
                 f"test_word_acc={pipe_test['word_acc']:.4f}"
+                f"valid_dict_word_ppl={valid['dict_word_ppl']:.2f} "
+                f"test_dict_word_ppl={test['dict_word_ppl']:.2f} "
             )
 
         history["epoch"].append(ep)
