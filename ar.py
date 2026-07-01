@@ -532,7 +532,7 @@ def main():
     data = torch.load(args.data, map_location="cpu")
     samples = data["samples"]
 
-    vq_word_prob = None
+    vq2word_prob = None
 
     if args.dictionary is not None:
         raw_dict = torch.load(args.dictionary, map_location="cpu")
@@ -773,7 +773,12 @@ def main():
                 f"valid_dict_word_ppl={valid['dict_word_ppl']:.2f} "
                 f"test_dict_word_ppl={test['dict_word_ppl']:.2f} "
             )
-
+        if vq2word_prob is not None:
+            print(
+                f"[dict] "
+                f"valid_word_ppl={valid['dict_word_ppl']:.2f} "
+                f"test_word_ppl={test['dict_word_ppl']:.2f}"
+            )
         history["epoch"].append(ep)
 
         history["valid_loss"].append(valid["main_loss"])
