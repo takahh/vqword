@@ -195,9 +195,11 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
 
 def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
     """
-    tok_logits: [B, T, vocab_size]
-    tok_y:      [B, T]
-    vq_y:       [B, T]
+    Candidate-only CE.
+
+    For each position:
+      candidates = dictionary[vq_id] ∪ {true_token}
+      loss = CE(tok_logits over candidates, index_of_true_token)
     """
 
     B, T, V = tok_logits.shape
@@ -205,35 +207,44 @@ def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
     flat_tok_y = tok_y.reshape(B * T)
     flat_vq_y = vq_y.reshape(B * T)
 
-    masked_logits = torch.full_like(flat_logits, -1e9)
+    losses = []
 
     for i in range(flat_logits.size(0)):
-        if flat_tok_y[i].item() == -100:
+        true_tok = int(flat_tok_y[i].item())
+        if true_tok == -100:
             continue
 
         vq_id = int(flat_vq_y[i].item())
 
-        if vq_id not in vq2word_ids:
-            masked_logits[i] = flat_logits[i]
-            continue
-
         cand_ids = set(vq2word_ids.get(vq_id, []))
-        cand_ids.add(int(flat_tok_y[i].item()))
+        cand_ids.add(true_tok)
+
         cand = torch.tensor(
             sorted(cand_ids),
             device=flat_logits.device,
             dtype=torch.long,
         )
 
-        masked_logits[i, cand] = flat_logits[i, cand]
+        small_logits = flat_logits[i, cand]  # [num_candidates]
 
-    loss = F.cross_entropy(
-        masked_logits,
-        flat_tok_y,
-        ignore_index=-100,
-    )
+        target_pos = (cand == true_tok).nonzero(as_tuple=True)[0].item()
+        target = torch.tensor(
+            [target_pos],
+            device=flat_logits.device,
+            dtype=torch.long,
+        )
 
-    return loss
+        loss_i = F.cross_entropy(
+            small_logits.unsqueeze(0),
+            target,
+        )
+
+        losses.append(loss_i)
+
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=tok_logits.device)
+
+    return torch.stack(losses).mean()
 
 def main():
     ap = argparse.ArgumentParser()
