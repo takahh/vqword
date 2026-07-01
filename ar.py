@@ -293,20 +293,29 @@ def main():
         vq2word_ids = None
 
     tokenizer_name = args.tokenizer or data.get("tokenizer", None)
-    if tokenizer_name is None:
-        raise ValueError("Tokenizer is not specified. Use --tokenizer or include data['tokenizer'].")
 
     print(f"[data] {args.data}")
     print(f"[tokenizer] {tokenizer_name}")
 
-    tok = AutoTokenizer.from_pretrained(tokenizer_name)
+    if tokenizer_name is not None:
+        tok = AutoTokenizer.from_pretrained(tokenizer_name)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        pad_token_id = tok.pad_token_id
+        token_vocab_size = args.token_vocab_size or len(tok)
+    else:
+        if args.token_vocab_size is not None:
+            token_vocab_size = args.token_vocab_size
+        elif "word2id" in data:
+            token_vocab_size = len(data["word2id"])
+        elif "token_ids_flat" in data:
+            token_vocab_size = int(data["token_ids_flat"].max().item()) + 1
+        else:
+            raise ValueError("Cannot infer token_vocab_size. Use --token_vocab_size.")
 
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+        pad_token_id = int(data.get("pad_token_id", 0))
 
-    pad_token_id = tok.pad_token_id
-
-    token_vocab_size = args.token_vocab_size or len(tok)
+    print(f"[pad_token_id] {pad_token_id}")
 
     if args.vq_vocab_size is not None:
         base_vq_vocab_size = args.vq_vocab_size
@@ -445,7 +454,7 @@ def main():
                 tok=f"{tok_loss.item():.3f}",
                 vq=f"{vq_loss.item():.3f}",
             )
-            
+
         valid = evaluate(
             model, valid_loader, device,
             args.aux_lambda, args.main_target,
@@ -504,7 +513,7 @@ def main():
         torch.save({
             "model": model.state_dict(),
             "args": vars(args),
-            "tokenizer": data["tokenizer"],
+            "tokenizer": tokenizer_name,
             "vq_vocab_size": vq_vocab_size,
             "vq_pad_id": vq_pad_id,
             "pad_token_id": pad_token_id,
