@@ -298,7 +298,11 @@ def main():
         DICT_TOPK = 32
 
         vq2word_ids = {
-            int(vq_id): [int(wid) for wid, word, count in entries[:DICT_TOPK]]
+            int(vq_id): torch.tensor(
+                [int(wid) for wid, word, count in entries[:DICT_TOPK]],
+                device=device,
+                dtype=torch.long,
+            )
             for vq_id, entries in raw_dict.items()
         }
 
