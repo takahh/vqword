@@ -181,52 +181,6 @@ def assign_partitioned(z, centers, part_ids, codes_per_part, partition_base=0, k
 
     return out
 
-
-@torch.no_grad()
-def fit_kmeans_torch_streaming(model, ctx, batch_size, device, args):
-    model.eval()
-
-    K = args.codebook_size
-    D = args.d_model
-
-    print("[kmeans] torch blockwise init")
-    centers = init_centers_random(
-        model=model,
-        ctx=ctx,
-        K=K,
-        batch_size=batch_size,
-        device=device,
-    )
-
-    for it in range(args.kmeans_iters):
-        print(f"[kmeans] iter {it + 1}/{args.kmeans_iters}")
-
-        sums = torch.zeros(K, D, device=device, dtype=torch.float32)
-        counts = torch.zeros(K, device=device, dtype=torch.long)
-
-        for start in tqdm(range(0, len(ctx), batch_size), desc="[kmeans assign/update]"):
-            xb = ctx[start:start + batch_size].to(device)
-            z = model.encode_context(xb).float()
-            z = F.normalize(z, dim=-1)
-
-            y = assign_blockwise(z, centers, k_block=args.k_block)
-
-            sums.index_add_(0, y, z)
-            counts.index_add_(0, y, torch.ones_like(y, dtype=torch.long))
-
-        nonempty = counts > 0
-        new_centers = centers.clone()
-        new_centers[nonempty] = sums[nonempty] / counts[nonempty].float().unsqueeze(1)
-        new_centers = F.normalize(new_centers, dim=-1)
-
-        shift = (new_centers - centers).pow(2).sum(dim=1).sqrt().mean()
-        centers = new_centers
-
-        used = int(nonempty.sum().item())
-        print(f"[kmeans] used={used}/{K} shift={shift.item():.6f}")
-
-    return centers
-
 def word_tokenize(text):
     return WORD_RE.findall(text)
 
@@ -258,21 +212,6 @@ def make_adj(seq_len, hop, device):
     adj = adj / deg
     return adj
 
-@torch.no_grad()
-def predict_kmeans_torch_streaming(model, centers, ctx, batch_size, device, args):
-    model.eval()
-    ids = []
-
-    centers = centers.to(device)
-
-    print("[kmeans] predict torch blockwise")
-    for start in tqdm(range(0, len(ctx), batch_size), desc="[kmeans predict]"):
-        xb = ctx[start:start + batch_size].to(device)
-        z = model.encode_context(xb).float()
-        pred = assign_blockwise(z, centers, k_block=args.k_block)
-        ids.append(pred.cpu())
-
-    return torch.cat(ids, dim=0)
 
 @torch.no_grad()
 def update_usage_ema(usage_ema, ids, K, decay=0.99):
