@@ -119,6 +119,45 @@ class ARVQWordLM(nn.Module):
 
         return h, tok_logits, vq_logits
 
+def candidate_token_ce_from_hidden(model, h, tok_y, vq_y, vq2word_ids, topk=32):
+    B, T, D = h.shape
+
+    flat_h = h.reshape(B * T, D)
+    flat_tok_y = tok_y.reshape(B * T)
+    flat_vq_y = vq_y.reshape(B * T)
+
+    valid = flat_tok_y.ne(-100)
+    flat_h = flat_h[valid]
+    flat_tok_y = flat_tok_y[valid]
+    flat_vq_y = flat_vq_y[valid]
+
+    losses = []
+
+    W = model.tok_head.weight
+    b = model.tok_head.bias
+
+    for vq_id in flat_vq_y.unique().tolist():
+        idx = flat_vq_y.eq(vq_id).nonzero(as_tuple=True)[0]
+        h_i = flat_h[idx]
+        true_tok = flat_tok_y[idx]
+
+        base = vq2word_ids.get(int(vq_id), None)
+        if base is None:
+            cand_ids = true_tok.unique()
+        else:
+            cand_ids = torch.cat([base[:topk], true_tok]).unique()
+
+        W_c = W[cand_ids]          # [C, D]
+        b_c = b[cand_ids]          # [C]
+        small_logits = h_i @ W_c.T + b_c
+
+        eq = cand_ids[None, :].eq(true_tok[:, None])
+        target = eq.float().argmax(dim=1).long()
+
+        losses.append(F.cross_entropy(small_logits, target, reduction="sum"))
+
+    return torch.stack(losses).sum() / flat_tok_y.numel()
+
 
 def load_vq_dictionary(path):
     raw = torch.load(path, map_location="cpu")
@@ -438,16 +477,21 @@ def main():
             attn_mask = attn_mask.to(device)
 
             key_padding_mask = ~attn_mask
-            tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
+            h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
             if args.dict_loss and vq2word_ids is not None:
-                tok_loss = masked_token_ce_by_true_vq(
-                    tok_logits=tok_logits,
+                tok_loss = candidate_token_ce_from_hidden(
+                    model=model,
+                    h=h,
                     tok_y=tok_y,
                     vq_y=vq_y,
                     vq2word_ids=vq2word_ids,
+                    topk=32,
                 )
             else:
+                if tok_logits is None:
+                    tok_logits = model.tok_head(h)
+
                 tok_loss = F.cross_entropy(
                     tok_logits.reshape(-1, tok_logits.size(-1)),
                     tok_y.reshape(-1),
