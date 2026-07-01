@@ -194,57 +194,51 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
     }
 
 def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
-    """
-    Candidate-only CE.
-
-    For each position:
-      candidates = dictionary[vq_id] ∪ {true_token}
-      loss = CE(tok_logits over candidates, index_of_true_token)
-    """
-
     B, T, V = tok_logits.shape
     flat_logits = tok_logits.reshape(B * T, V)
     flat_tok_y = tok_y.reshape(B * T)
     flat_vq_y = vq_y.reshape(B * T)
 
+    valid = flat_tok_y.ne(-100)
+    flat_logits = flat_logits[valid]
+    flat_tok_y = flat_tok_y[valid]
+    flat_vq_y = flat_vq_y[valid]
+
     losses = []
 
-    for i in range(flat_logits.size(0)):
-        true_tok = int(flat_tok_y[i].item())
-        if true_tok == -100:
-            continue
+    # 同じ vq_id ごとにまとめる
+    for vq_id in flat_vq_y.unique().tolist():
+        mask = flat_vq_y.eq(vq_id)
+        idx = mask.nonzero(as_tuple=True)[0]
 
-        vq_id = int(flat_vq_y[i].item())
+        true_tok = flat_tok_y[idx]  # [N]
 
-        cand_ids = set(vq2word_ids.get(vq_id, []))
-        cand_ids.add(true_tok)
+        cand_ids = list(vq2word_ids.get(int(vq_id), []))[:32]
+
+        # このbatch内の正解tokenをまとめて候補に追加
+        cand_ids = sorted(set(cand_ids) | set(true_tok.detach().cpu().tolist()))
 
         cand = torch.tensor(
-            sorted(cand_ids),
-            device=flat_logits.device,
+            cand_ids,
+            device=tok_logits.device,
             dtype=torch.long,
         )
 
-        small_logits = flat_logits[i, cand]  # [num_candidates]
+        small_logits = flat_logits[idx][:, cand]  # [N, C]
 
-        target_pos = (cand == true_tok).nonzero(as_tuple=True)[0].item()
+        # true_tok -> candidate index
+        pos = {int(w): j for j, w in enumerate(cand_ids)}
         target = torch.tensor(
-            [target_pos],
-            device=flat_logits.device,
+            [pos[int(t)] for t in true_tok.detach().cpu().tolist()],
+            device=tok_logits.device,
             dtype=torch.long,
         )
 
-        loss_i = F.cross_entropy(
-            small_logits.unsqueeze(0),
-            target,
+        losses.append(
+            F.cross_entropy(small_logits, target, reduction="sum")
         )
 
-        losses.append(loss_i)
-
-    if len(losses) == 0:
-        return torch.tensor(0.0, device=tok_logits.device)
-
-    return torch.stack(losses).mean()
+    return torch.stack(losses).sum() / flat_tok_y.numel()
 
 def main():
     ap = argparse.ArgumentParser()
@@ -308,6 +302,9 @@ def main():
             for vq_id, entries in raw_dict.items()
         }
 
+        vq2cand = {}
+        for vq_id, ids in vq2word_ids.items():
+            vq2cand[int(vq_id)] = ids[:DICT_TOPK]
         print(f"[dictionary] loaded {len(vq2word_ids)} VQ entries")
     else:
         vq2word_ids = None
