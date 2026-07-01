@@ -148,38 +148,44 @@ def init_centers_partitioned_random(model, ctx, tgt, P, Kp, batch_size, device):
 
     return centers
 
+@torch.no_grad()
+def init_centers_random(model, ctx, K, batch_size, device):
+    D = model.tok_emb.embedding_dim
+    N = len(ctx)
+
+    if N >= K:
+        sel = torch.randperm(N)[:K]
+    else:
+        sel = torch.randint(0, N, (K,))
+
+    zs = []
+    for s in tqdm(range(0, len(sel), batch_size), desc="[kmeans init]"):
+        xb = ctx[sel[s:s + batch_size]].to(device)
+        z = model.encode_context(xb).float()
+        zs.append(z.cpu())
+
+    centers = torch.cat(zs, dim=0)[:K].to(device)
+    return F.normalize(centers, dim=-1)
 
 @torch.no_grad()
-def assign_partitioned(z, centers, part_ids, codes_per_part, partition_base=0, k_block=4096):
-    """
-    z: [B, D]
-    centers: [P, Kp, D]
-    part_ids: [B]
-    returns global_ids [B]
-    """
+def assign_blockwise(z, centers, k_block=4096):
     z = F.normalize(z.float(), dim=-1)
     centers = F.normalize(centers.float(), dim=-1)
 
     B = z.size(0)
-    out = torch.empty(B, dtype=torch.long, device=z.device)
+    best_sim = torch.full((B,), -1e9, device=z.device)
+    best_id = torch.zeros(B, dtype=torch.long, device=z.device)
 
-    for p in part_ids.unique():
-        mask = part_ids == p
-        zp = z[mask]                       # [Bp, D]
-        cp = centers[p]                    # [Kp, D]
+    for s in range(0, centers.size(0), k_block):
+        c = centers[s:s + k_block]
+        sim = z @ c.T
+        val, idx = sim.max(dim=1)
 
-        sim = zp @ cp.T                    # [Bp, Kp]
-        local_id = sim.argmax(dim=1)       # [Bp]
+        m = val > best_sim
+        best_sim[m] = val[m]
+        best_id[m] = idx[m] + s
 
-        global_id = local_to_global(
-            part_ids=p,
-            local_ids=local_id,
-            codes_per_partition=codes_per_part,
-            partition_base=partition_base,
-        )
-        out[mask] = global_id
-
-    return out
+    return best_id
 
 def word_tokenize(text):
     return WORD_RE.findall(text)
@@ -322,35 +328,17 @@ def make_windows(token_ids, hop, pad_id):
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
 
 
-def soft_entropy_loss_partitioned(z, centers, part_ids, temperature=0.1):
-    """
-    z: [B, D]
-    centers: [P, Kp, D]
-    part_ids: [B]
-    returns differentiable entropy loss
-    """
+def soft_entropy_loss(z, centers, temperature=0.1):
     z = F.normalize(z.float(), dim=-1)
     centers = F.normalize(centers.float(), dim=-1)
 
-    ent_losses = []
+    sim = z @ centers.T
+    prob = F.softmax(sim / temperature, dim=-1)
 
-    for p in part_ids.unique():
-        mask = part_ids == p
-        zp = z[mask]          # [Bp, D]
-        cp = centers[p]       # [Kp, D]
+    usage = prob.mean(dim=0)
+    entropy = -(usage * torch.log(usage + 1e-12)).sum()
 
-        sim = zp @ cp.T       # [Bp, Kp]
-        prob = F.softmax(sim / temperature, dim=-1)
-
-        # average code usage in this batch/partition
-        usage = prob.mean(dim=0)  # [Kp]
-
-        entropy = -(usage * torch.log(usage + 1e-12)).sum()
-
-        # minimize negative entropy => maximize entropy
-        ent_losses.append(-entropy)
-
-    return torch.stack(ent_losses).mean()
+    return -entropy
 
 def entropy_loss_from_ids(ids, K, device):
     counts = torch.bincount(ids, minlength=K).float().to(device)
@@ -393,13 +381,9 @@ def main():
     ap.add_argument("--ema_decay", type=float, default=0.99)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--n_partitions", type=int, default=256)
-    ap.add_argument("--partition_base", type=int, default=0)
     ap.add_argument("--entropy_temp", type=float, default=0.1)
 
     args = ap.parse_args()
-    assert args.codebook_size % args.n_partitions == 0
-    assert args.partition_base >= 0
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -464,14 +448,13 @@ def main():
             weight_decay=0.01,
         )
 
-        P = args.n_partitions
-        Kp = args.codebook_size // P
-
-        centers = init_centers_partitioned_random(
-            model, ctx, tgt, P, Kp, args.batch_size, device
+        centers = init_centers_random(
+            model=model,
+            ctx=ctx,
+            K=args.codebook_size,
+            batch_size=args.batch_size,
+            device=device,
         ).detach()
-
-        part_all = get_partitions(tgt, P)
 
         for ep in range(1, args.epochs + 1):
             model.train()
@@ -491,34 +474,24 @@ def main():
                 idx = perm[start:start + args.batch_size]
 
                 xb = ctx[idx].to(device)
-                part = part_all[idx].to(device)
 
                 z = model.encode_context(xb).float()
                 z = F.normalize(z, dim=-1)
 
                 with torch.no_grad():
-                    ids = assign_partitioned(
+                    ids = assign_blockwise(
                         z,
                         centers,
-                        part,
-                        Kp,
-                        partition_base=args.partition_base,
+                        k_block=args.k_block,
                     )
 
-                    part_ids, local_ids = global_to_local(
-                        ids,
-                        codes_per_partition=Kp,
-                        partition_base=args.partition_base,
-                    )
-
-                    q = centers[part_ids, local_ids].detach()
+                    q = centers[ids].detach()
 
                 commit_loss = F.mse_loss(z, q)
 
-                soft_ent_loss = soft_entropy_loss_partitioned(
+                soft_ent_loss = soft_entropy_loss(
                     z=z,
                     centers=centers,
-                    part_ids=part,
                     temperature=args.entropy_temp,
                 )
 
