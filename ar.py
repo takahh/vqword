@@ -191,6 +191,7 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
     total_vq_loss = 0.0
     total_main_loss = 0.0
     total_tok = 0
+    total_tok_full_loss = 0.0
 
     for tok_in, vq_in, tok_y, vq_y, attn_mask in loader:
         tok_in = tok_in.to(device)
@@ -201,6 +202,14 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
 
         key_padding_mask = ~attn_mask
         h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
+        full_tok_logits = model.tok_head(h)
+
+        tok_full_loss = F.cross_entropy(
+            full_tok_logits.reshape(-1, full_tok_logits.size(-1)),
+            tok_y.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
 
         if dict_loss and vq2word_ids is not None:
             tok_loss = candidate_token_ce_from_hidden(
@@ -241,11 +250,13 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
             main_loss = tok_loss + aux_lambda * vq_loss
 
         total_tok_loss += tok_loss.item()
+        total_tok_full_loss += tok_full_loss.item()
         total_vq_loss += vq_loss.item()
         total_main_loss += main_loss.item()
         total_tok += n
 
     tok_ce = total_tok_loss / max(total_tok, 1)
+    tok_full_ce = total_tok_full_loss / max(total_tok, 1)
     vq_ce = total_vq_loss / max(total_tok, 1)
     main_ce = total_main_loss / max(total_tok, 1)
 
@@ -256,6 +267,8 @@ def evaluate(model, loader, device, aux_lambda, main_target, vq2word_ids=None, d
         "tok_ppl": math.exp(min(tok_ce, 20)),
         "vq_loss": vq_ce,
         "vq_ppl": math.exp(min(vq_ce, 20)),
+        "tok_full_loss": tok_full_ce,
+        "tok_full_ppl": math.exp(min(tok_full_ce, 20)),
     }
 
 def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
@@ -565,10 +578,8 @@ def main():
 
         print(
             f"[eval] ep={ep} "
-            f"valid_tok_ppl={valid['tok_ppl']:.2f} valid_vq_ppl={valid['vq_ppl']:.2f} "
-            f"valid_main_loss={valid['main_loss']:.4f} "
-            f"test_tok_ppl={test['tok_ppl']:.2f} test_vq_ppl={test['vq_ppl']:.2f} "
-            f"test_main_loss={test['main_loss']:.4f}"
+            f"valid_tok_ppl={valid['tok_ppl']:.2f} valid_full_tok_ppl={valid['tok_full_ppl']:.2f} valid_vq_ppl={valid['vq_ppl']:.2f} "
+            f"test_tok_ppl={test['tok_ppl']:.2f} test_full_tok_ppl={test['tok_full_ppl']:.2f} test_vq_ppl={test['vq_ppl']:.2f} "
         )
 
         history["epoch"].append(ep)
