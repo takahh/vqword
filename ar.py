@@ -217,8 +217,10 @@ def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
             masked_logits[i] = flat_logits[i]
             continue
 
+        cand_ids = set(vq2word_ids.get(vq_id, []))
+        cand_ids.add(int(flat_tok_y[i].item()))
         cand = torch.tensor(
-            vq2word_ids[vq_id],
+            sorted(cand_ids),
             device=flat_logits.device,
             dtype=torch.long,
         )
