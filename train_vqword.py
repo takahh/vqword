@@ -249,11 +249,11 @@ class AdjGNNLayer(nn.Module):
 
 
 class VQWordGNN(nn.Module):
-    def __init__(self, vocab_size, d_model=256, hop=3, n_layers=3, dropout=0.1):
+    def __init__(self, vocab_size, d_model=256, hop=3, n_layers=3, dropout=0.1, center_scale=1.0):
         super().__init__()
         self.hop = hop
         self.seq_len = 2 * hop + 1
-
+        self.center_scale = center_scale
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(self.seq_len, d_model)
 
@@ -269,7 +269,10 @@ class VQWordGNN(nn.Module):
         B, L = ctx_ids.shape
         pos = torch.arange(L, device=ctx_ids.device).unsqueeze(0).expand(B, L)
 
-        h = self.tok_emb(ctx_ids) + self.pos_emb(pos)
+        tok_h = self.tok_emb(ctx_ids)
+        tok_h[:, self.hop, :] = tok_h[:, self.hop, :] * self.center_scale
+
+        h = tok_h + self.pos_emb(pos)
         h = self.dropout(h)
 
         adj = make_adj(L, self.hop, ctx_ids.device)
@@ -460,6 +463,7 @@ def collect_embeddings(model, ctx, batch_size, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="roneneldan/TinyStories")
+    ap.add_argument("--center_scale", type=float, default=1.0)
     ap.add_argument("--text_col", default="text")
     ap.add_argument("--dataset_config", default=None)
     ap.add_argument("--min_freq", type=int, default=1)
@@ -528,6 +532,7 @@ def main():
         d_model=args.d_model,
         hop=args.hop,
         n_layers=args.n_layers,
+        center_scale=args.center_scale,
     ).to(device)
 
     usage_ema = torch.full(
