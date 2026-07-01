@@ -458,6 +458,48 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    if args.epochs > 0:
+        print(f"[pretrain] epochs={args.epochs}")
+
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=0.01,
+        )
+
+        for ep in range(1, args.epochs + 1):
+            model.train()
+            perm = torch.randperm(len(ctx))
+            total_loss = 0.0
+            total_n = 0
+
+            pbar = tqdm(
+                range(0, len(ctx), args.batch_size),
+                desc=f"[pretrain] epoch {ep}",
+            )
+
+            for start in pbar:
+                idx = perm[start:start + args.batch_size]
+                xb = ctx[idx].to(device)
+                yb = tgt[idx].to(device)
+
+                loss, logits, z = model(xb, yb)
+
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+                bs = xb.size(0)
+                total_loss += loss.item() * bs
+                total_n += bs
+
+                pbar.set_postfix(loss=f"{total_loss / total_n:.4f}")
+
+        print("[pretrain] done")
+    else:
+        print("[pretrain] skipped")
+
     centroids = fit_kmeans_partitioned_streaming(
         model=model,
         ctx=ctx,
