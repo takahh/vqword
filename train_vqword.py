@@ -369,6 +369,12 @@ def make_windows(token_ids, hop, pad_id):
 
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
 
+def entropy_loss_from_ids(ids, K, device):
+    counts = torch.bincount(ids, minlength=K).float().to(device)
+    p = counts / counts.sum().clamp_min(1.0)
+    p = p[p > 0]
+    entropy = -(p * torch.log(p + 1e-12)).sum()
+    return -entropy
 
 @torch.no_grad()
 def collect_embeddings(model, ctx, batch_size, device):
@@ -457,9 +463,8 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-
     if args.epochs > 0:
-        print(f"[pretrain] epochs={args.epochs}")
+        print(f"[vq-opt] epochs={args.epochs}")
 
         opt = torch.optim.AdamW(
             model.parameters(),
@@ -467,38 +472,111 @@ def main():
             weight_decay=0.01,
         )
 
-        for ep in range(1, args.epochs + 1):
-            model.train()
-            perm = torch.randperm(len(ctx))
-            total_loss = 0.0
-            total_n = 0
+        # initialize centers first
+        P = args.n_partitions
+        Kp = args.codebook_size // P
 
-            pbar = tqdm(
-                range(0, len(ctx), args.batch_size),
-                desc=f"[pretrain] epoch {ep}",
+        centers = init_centers_partitioned_random(
+            model, ctx, tgt, P, Kp, args.batch_size, device
+        ).detach()
+
+        part_all = get_partitions(tgt, P)
+
+        if args.epochs > 0:
+            print(f"[vq-opt] epochs={args.epochs}")
+
+            opt = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.lr,
+                weight_decay=0.01,
             )
 
-            for start in pbar:
-                idx = perm[start:start + args.batch_size]
-                xb = ctx[idx].to(device)
-                yb = tgt[idx].to(device)
+            P = args.n_partitions
+            Kp = args.codebook_size // P
 
-                loss, logits, z = model(xb, yb)
+            centers = init_centers_partitioned_random(
+                model, ctx, tgt, P, Kp, args.batch_size, device
+            ).detach()
 
-                opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+            part_all = get_partitions(tgt, P)
 
-                bs = xb.size(0)
-                total_loss += loss.item() * bs
-                total_n += bs
+            for ep in range(1, args.epochs + 1):
+                model.train()
+                perm = torch.randperm(len(ctx), device="cpu")
 
-                pbar.set_postfix(loss=f"{total_loss / total_n:.4f}")
+                total_loss = 0.0
+                total_commit = 0.0
+                total_ent = 0.0
+                total_n = 0
 
-        print("[pretrain] done")
-    else:
-        print("[pretrain] skipped")
+                pbar = tqdm(
+                    range(0, len(ctx), args.batch_size),
+                    desc=f"[vq-opt] epoch {ep}",
+                )
+
+                for start in pbar:
+                    idx = perm[start:start + args.batch_size]
+
+                    xb = ctx[idx].to(device)
+                    part = part_all[idx].to(device)
+
+                    z = model.encode_context(xb).float()
+                    z = F.normalize(z, dim=-1)
+
+                    with torch.no_grad():
+                        ids = assign_partitioned(
+                            z,
+                            centers,
+                            part,
+                            Kp,
+                            partition_base=args.partition_base,
+                        )
+
+                        part_ids, local_ids = global_to_local(
+                            ids,
+                            codes_per_partition=Kp,
+                            partition_base=args.partition_base,
+                        )
+
+                        q = centers[part_ids, local_ids].detach()
+
+                    commit_loss = F.mse_loss(z, q)
+
+                    ent_loss = entropy_loss_from_ids(
+                        ids.detach(),
+                        args.codebook_size,
+                        device,
+                    )
+
+                    loss = commit_loss + args.vq_beta * ent_loss
+
+                    opt.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
+
+                    bs = xb.size(0)
+                    total_loss += loss.item() * bs
+                    total_commit += commit_loss.item() * bs
+                    total_ent += ent_loss.item() * bs
+                    total_n += bs
+
+                    pbar.set_postfix(
+                        loss=f"{total_loss / total_n:.4f}",
+                        commit=f"{total_commit / total_n:.4f}",
+                        ent=f"{total_ent / total_n:.4f}",
+                    )
+
+                print(
+                    f"[vq-opt] ep={ep} "
+                    f"loss={total_loss / total_n:.4f} "
+                    f"commit={total_commit / total_n:.4f} "
+                    f"ent={total_ent / total_n:.4f}"
+                )
+
+            print("[vq-opt] done")
+        else:
+            print("[vq-opt] skipped")
 
     centroids = fit_kmeans_partitioned_streaming(
         model=model,
