@@ -404,6 +404,50 @@ def evaluate(
     }
 
 @torch.no_grad()
+def evaluate_vq_only(model, loader, device):
+    model.eval()
+
+    total_vq_loss = 0.0
+    total_tok = 0
+
+    for tok_in, vq_in, tok_y, vq_y, attn_mask in loader:
+        tok_in = tok_in.to(device)
+        vq_in = vq_in.to(device)
+        vq_y = vq_y.to(device)
+        attn_mask = attn_mask.to(device)
+
+        key_padding_mask = ~attn_mask
+        h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
+
+        vq_loss = F.cross_entropy(
+            vq_logits.reshape(-1, vq_logits.size(-1)),
+            vq_y.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+
+        n = vq_y.ne(-100).sum().item()
+        total_vq_loss += vq_loss.item()
+        total_tok += n
+
+    vq_ce = total_vq_loss / max(total_tok, 1)
+
+    return {
+        "main_loss": vq_ce,
+        "main_ppl": math.exp(min(vq_ce, 20)),
+        "vq_loss": vq_ce,
+        "vq_ppl": math.exp(min(vq_ce, 20)),
+
+        # history 保存で落ちないようにダミーも入れる
+        "tok_loss": 0.0,
+        "tok_ppl": 1.0,
+        "tok_full_loss": 0.0,
+        "tok_full_ppl": 1.0,
+        "dict_word_loss": 0.0,
+        "dict_word_ppl": 1.0,
+    }
+
+@torch.no_grad()
 def dict_word_ce(vq_logits, tok_y, vq2word_prob):
     vq_prob = torch.softmax(vq_logits, dim=-1)
     B,T,V = vq_prob.shape
@@ -504,6 +548,7 @@ def main():
     ap.add_argument("--reset_heads", action="store_true")
     ap.add_argument("--dictionary", default=None)
     ap.add_argument("--dict_loss", action="store_true")
+    ap.add_argument("--mode", choices=["pretrain", "finetune"], default="pretrain")
     args = ap.parse_args()
 
     history = {
@@ -681,39 +726,51 @@ def main():
             key_padding_mask = ~attn_mask
             h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
-            if args.dict_loss and vq2word_ids is not None:
-                tok_loss = candidate_token_ce_from_hidden(
-                    model=model,
-                    h=h,
-                    tok_y=tok_y,
-                    vq_logits=vq_logits,
-                    vq2word_ids=vq2word_ids,
-                    topk=16,
-                )
-            else:
-                if tok_logits is None:
-                    tok_logits = model.tok_head(h)
+            if args.mode == "pretrain":
+                tok_loss = torch.tensor(0.0, device=device)
 
-                tok_loss = F.cross_entropy(
-                    tok_logits.reshape(-1, tok_logits.size(-1)),
-                    tok_y.reshape(-1),
+                vq_loss = F.cross_entropy(
+                    vq_logits.reshape(-1, vq_logits.size(-1)),
+                    vq_y.reshape(-1),
                     ignore_index=-100,
                 )
 
-            vq_loss = F.cross_entropy(
-                vq_logits.reshape(-1, vq_logits.size(-1)),
-                vq_y.reshape(-1),
-                ignore_index=-100,
-            )
+                loss = vq_loss
 
-            if args.main_target == "tok":
-                loss = tok_loss + args.aux_lambda * vq_loss
+            elif args.mode == "finetune":
+                if args.dict_loss and vq2word_ids is not None:
+                    tok_loss = candidate_token_ce_from_hidden(
+                        model=model,
+                        h=h,
+                        tok_y=tok_y,
+                        vq_logits=vq_logits,
+                        vq2word_ids=vq2word_ids,
+                        topk=16,
+                    )
+                else:
+                    if tok_logits is None:
+                        tok_logits = model.tok_head(h)
 
-            elif args.main_target == "vq":
-                loss = vq_loss + args.aux_lambda * tok_loss
+                    tok_loss = F.cross_entropy(
+                        tok_logits.reshape(-1, tok_logits.size(-1)),
+                        tok_y.reshape(-1),
+                        ignore_index=-100,
+                    )
 
-            elif args.main_target == "both":
-                loss = tok_loss + args.aux_lambda * vq_loss
+                vq_loss = F.cross_entropy(
+                    vq_logits.reshape(-1, vq_logits.size(-1)),
+                    vq_y.reshape(-1),
+                    ignore_index=-100,
+                )
+
+                if args.main_target == "tok":
+                    loss = tok_loss + args.aux_lambda * vq_loss
+
+                elif args.main_target == "vq":
+                    loss = vq_loss + args.aux_lambda * tok_loss
+
+                elif args.main_target == "both":
+                    loss = tok_loss + args.aux_lambda * vq_loss
 
             opt.zero_grad()
             loss.backward()
@@ -726,25 +783,30 @@ def main():
                 vq=f"{vq_loss.item():.3f}",
             )
 
-        valid = evaluate(
-            model, valid_loader, device,
-            args.aux_lambda, args.main_target,
-            vq2word_ids=vq2word_ids,
-            dict_loss=args.dict_loss,
-            vq2word_prob=vq2word_prob
-        )
+        if args.mode == "pretrain":
+            valid = evaluate_vq_only(model, valid_loader, device)
+            test = evaluate_vq_only(model, test_loader, device)
+        else:
+            valid = evaluate(
+                model, valid_loader, device,
+                args.aux_lambda, args.main_target,
+                vq2word_ids=vq2word_ids,
+                dict_loss=args.dict_loss,
+                vq2word_prob=vq2word_prob
+            )
 
-        test = evaluate(
-            model, test_loader, device,
-            args.aux_lambda, args.main_target,
-            vq2word_ids=vq2word_ids,
-            dict_loss=args.dict_loss,
-            vq2word_prob=vq2word_prob
-        )
+            test = evaluate(
+                model, test_loader, device,
+                args.aux_lambda, args.main_target,
+                vq2word_ids=vq2word_ids,
+                dict_loss=args.dict_loss,
+                vq2word_prob=vq2word_prob
+            )
 
         pipe_valid = None
         pipe_test = None
-        if args.dict_loss and vq2word_ids is not None:
+
+        if args.mode == "finetune" and args.dict_loss and vq2word_ids is not None:
             pipe_valid = evaluate_pred_vq_to_word(
                 model, valid_loader, device, vq2word_ids, topk=16
             )
@@ -755,11 +817,22 @@ def main():
         valid_loss = valid["main_loss"]
         test_loss = test["main_loss"]
 
-        print(
-            f"[eval] ep={ep} "
-            f"valid_tok_ppl={valid['tok_ppl']:.2f} valid_full_tok_ppl={valid['tok_full_ppl']:.2f} valid_vq_ppl={valid['vq_ppl']:.2f} "
-            f"test_tok_ppl={test['tok_ppl']:.2f} test_full_tok_ppl={test['tok_full_ppl']:.2f} test_vq_ppl={test['vq_ppl']:.2f} "
-        )
+        if args.mode == "pretrain":
+            print(
+                f"[eval] ep={ep} "
+                f"valid_vq_ppl={valid['vq_ppl']:.2f} "
+                f"test_vq_ppl={test['vq_ppl']:.2f}"
+            )
+        else:
+            print(
+                f"[eval] ep={ep} "
+                f"valid_tok_ppl={valid['tok_ppl']:.2f} "
+                f"valid_full_tok_ppl={valid['tok_full_ppl']:.2f} "
+                f"valid_vq_ppl={valid['vq_ppl']:.2f} "
+                f"test_tok_ppl={test['tok_ppl']:.2f} "
+                f"test_full_tok_ppl={test['tok_full_ppl']:.2f} "
+                f"test_vq_ppl={test['vq_ppl']:.2f}"
+            )
 
         if pipe_valid is not None:
             print(
