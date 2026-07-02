@@ -203,7 +203,11 @@ def evaluate_pred_vq_to_word(model, loader, device, vq2word_ids, topk=16):
     W = model.tok_head.weight
     b = model.tok_head.bias
 
-    for tok_in, vq_in, tok_y, vq_y, attn_mask in loader:
+    for tok_in, vq_in, tok_y, vq_y, attn_mask in tqdm(
+            loader,
+            desc="[pipe]",
+            leave=False,
+    ):
         tok_in = tok_in.to(device)
         vq_in = vq_in.to(device)
         tok_y = tok_y.to(device)
@@ -312,7 +316,11 @@ def evaluate(
     total_dict_loss = 0
     total_dict_tok = 0
 
-    for tok_in, vq_in, tok_y, vq_y, attn_mask in loader:
+    for tok_in, vq_in, tok_y, vq_y, attn_mask in tqdm(
+            loader,
+            desc="[eval]",
+            leave=False,
+    ):
         tok_in = tok_in.to(device)
         vq_in = vq_in.to(device)
         tok_y = tok_y.to(device)
@@ -410,7 +418,11 @@ def evaluate_vq_only(model, loader, device):
     total_vq_loss = 0.0
     total_tok = 0
 
-    for tok_in, vq_in, tok_y, vq_y, attn_mask in loader:
+    for tok_in, vq_in, tok_y, vq_y, attn_mask in tqdm(
+            loader,
+            desc="[eval-vq]",
+            leave=False,
+    ):
         tok_in = tok_in.to(device)
         vq_in = vq_in.to(device)
         vq_y = vq_y.to(device)
