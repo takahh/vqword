@@ -181,6 +181,55 @@ def candidate_token_ce_from_hidden(
 
     return torch.stack(losses).sum() / total
 
+def candidate_token_ce_from_hidden_fast(
+    model,
+    h,
+    tok_y,
+    vq_logits,
+    cand_table,
+    cand_mask,
+):
+    B, T, D = h.shape
+
+    pred_vq = vq_logits.argmax(dim=-1)
+
+    flat_h = h.reshape(B * T, D)
+    flat_tok_y = tok_y.reshape(B * T)
+    flat_vq = pred_vq.reshape(B * T)
+
+    valid = flat_tok_y.ne(-100)
+
+    flat_h = flat_h[valid]
+    flat_tok_y = flat_tok_y[valid]
+    flat_vq = flat_vq[valid]
+
+    cand_ids = cand_table[flat_vq]      # [N, K]
+    mask = cand_mask[flat_vq]           # [N, K]
+
+    hit = cand_ids.eq(flat_tok_y[:, None]) & mask
+    keep = hit.any(dim=1)
+
+    if keep.sum().item() == 0:
+        return torch.tensor(0.0, device=h.device, requires_grad=True)
+
+    flat_h = flat_h[keep]
+    cand_ids = cand_ids[keep]
+    mask = mask[keep]
+    hit = hit[keep]
+
+    target = hit.float().argmax(dim=1).long()
+
+    W = model.tok_head.weight
+    b = model.tok_head.bias
+
+    W_c = W[cand_ids]          # [N, K, D]
+    b_c = b[cand_ids]          # [N, K]
+
+    logits = (W_c * flat_h[:, None, :]).sum(dim=-1) + b_c
+    logits = logits.masked_fill(~mask, -1e9)
+
+    return F.cross_entropy(logits, target, reduction="mean")
+
 
 def load_vq_dictionary(path):
     raw = torch.load(path, map_location="cpu")
@@ -261,6 +310,32 @@ def evaluate_pred_vq_to_word(model, loader, device, vq2word_ids, topk=16):
         "word_acc": correct_word / max(total, 1),
     }
 
+def build_vq_candidate_table(raw_dict, vq_vocab_size, topk, device, pad_value=0):
+    cand = torch.full(
+        (vq_vocab_size, topk),
+        pad_value,
+        device=device,
+        dtype=torch.long,
+    )
+    cand_mask = torch.zeros(
+        (vq_vocab_size, topk),
+        device=device,
+        dtype=torch.bool,
+    )
+
+    for vq_id, entries in raw_dict.items():
+        ids = [int(wid) for wid, word, count in entries[:topk]]
+        if len(ids) == 0:
+            continue
+
+        ids = torch.tensor(ids, device=device, dtype=torch.long)
+        n = min(len(ids), topk)
+
+        cand[int(vq_id), :n] = ids[:n]
+        cand_mask[int(vq_id), :n] = True
+
+    return cand, cand_mask
+
 def build_vq2word_prob(raw_dict, device, alpha=1e-6):
     vq2word_prob = {}
 
@@ -305,7 +380,9 @@ def evaluate(
     main_target,
     vq2word_ids=None,
     dict_loss=False,
-    vq2word_prob=None
+    vq2word_prob=None,
+    cand_table=None,
+    cand_mask=None,
 ):
     model.eval()
     total_tok_loss = 0.0
@@ -348,14 +425,14 @@ def evaluate(
             reduction="sum",
         )
 
-        if dict_loss and vq2word_ids is not None:
-            tok_loss = candidate_token_ce_from_hidden(
+        if dict_loss and cand_table is not None:
+            tok_loss = candidate_token_ce_from_hidden_fast(
                 model=model,
                 h=h,
                 tok_y=tok_y,
                 vq_logits=vq_logits,
-                vq2word_ids=vq2word_ids,
-                topk=16,
+                cand_table=cand_table,
+                cand_mask=cand_mask,
             ) * tok_y.ne(-100).sum()
         else:
             if tok_logits is None:
@@ -599,7 +676,6 @@ def main():
         )
 
         DICT_TOPK = 32
-
         vq2word_ids = {
             int(vq_id): torch.tensor(
                 [int(wid) for wid, word, count in entries[:DICT_TOPK]],
@@ -608,7 +684,6 @@ def main():
             )
             for vq_id, entries in raw_dict.items()
         }
-
         print(f"[dictionary] loaded {len(vq2word_ids)} VQ entries")
 
     else:
@@ -654,7 +729,18 @@ def main():
     print(f"[base_vq_vocab_size] {base_vq_vocab_size}")
     print(f"[vq_pad_id] {vq_pad_id}")
     print(f"[vq_vocab_size incl pad] {vq_vocab_size}")
+    cand_table = None
+    cand_mask = None
 
+    if raw_dict is not None:
+        cand_table, cand_mask = build_vq_candidate_table(
+            raw_dict=raw_dict,
+            vq_vocab_size=vq_vocab_size,
+            topk=16,
+            device=device,
+            pad_value=pad_token_id,
+        )
+        print(f"[candidate table] {cand_table.shape}")
     random.shuffle(samples)
     n = len(samples)
     n_train = int(n * 0.8)
@@ -751,13 +837,13 @@ def main():
 
             elif args.mode == "finetune":
                 if args.dict_loss and vq2word_ids is not None:
-                    tok_loss = candidate_token_ce_from_hidden(
+                    tok_loss = candidate_token_ce_from_hidden_fast(
                         model=model,
                         h=h,
                         tok_y=tok_y,
                         vq_logits=vq_logits,
-                        vq2word_ids=vq2word_ids,
-                        topk=16,
+                        cand_table=cand_table,
+                        cand_mask=cand_mask,
                     )
                 else:
                     if tok_logits is None:
@@ -800,11 +886,16 @@ def main():
             test = evaluate_vq_only(model, test_loader, device)
         else:
             valid = evaluate(
-                model, valid_loader, device,
-                args.aux_lambda, args.main_target,
+                model,
+                valid_loader,
+                device,
+                args.aux_lambda,
+                args.main_target,
                 vq2word_ids=vq2word_ids,
                 dict_loss=args.dict_loss,
-                vq2word_prob=vq2word_prob
+                vq2word_prob=vq2word_prob,
+                cand_table=cand_table,
+                cand_mask=cand_mask,
             )
 
             test = evaluate(
@@ -812,7 +903,9 @@ def main():
                 args.aux_lambda, args.main_target,
                 vq2word_ids=vq2word_ids,
                 dict_loss=args.dict_loss,
-                vq2word_prob=vq2word_prob
+                vq2word_prob=vq2word_prob,
+                cand_table=cand_table,
+                cand_mask=cand_mask,
             )
 
         pipe_valid = None
