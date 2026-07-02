@@ -792,12 +792,17 @@ def main():
             model.tok_head.reset_parameters()
             model.vq_head.reset_parameters()
 
-    if args.freeze_vq_backbone:
-        for p in model.parameters():
-            p.requires_grad = False
+        if args.freeze_vq_backbone:
+            for p in model.parameters():
+                p.requires_grad = False
 
-        for p in model.tok_head.parameters():
-            p.requires_grad = True
+            for p in model.tok_head.parameters():
+                p.requires_grad = True
+
+            for p in model.vq_head.parameters():
+                p.requires_grad = True
+
+            print("[freeze] train tok_head + vq_head")
 
         print("[freeze] train only tok_head")
 
