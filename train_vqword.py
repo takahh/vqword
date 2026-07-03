@@ -552,30 +552,25 @@ def main():
                 range(0, len(ctx), args.batch_size),
                 desc=f"[vq-opt] epoch {ep}",
             )
-
             for start in pbar:
                 idx = perm[start:start + args.batch_size]
 
                 xb = ctx[idx].to(device)
 
+                # 1. current GNN embedding
                 z = model.encode_context(xb).float()
                 z = F.normalize(z, dim=-1)
 
+                # 2. assign to current centers, but stop gradients to centers
                 with torch.no_grad():
                     ids = assign_blockwise(
                         z,
                         centers,
                         k_block=args.k_block,
                     )
-
                     q = centers[ids].detach()
-                with torch.no_grad():
-                    ema_update_codebook(
-                        centroids=centers,
-                        z=z.detach(),
-                        ids=ids.detach(),
-                        decay=args.ema_decay,
-                    )
+
+                # 3. update GNN
                 commit_loss = F.mse_loss(z, q)
 
                 soft_ent_loss = soft_entropy_loss(
@@ -584,23 +579,39 @@ def main():
                     temperature=args.entropy_temp,
                 )
 
-                with torch.no_grad():
-                    usage_ema = update_usage_ema(
-                        usage_ema,
-                        ids.detach(),
-                        args.codebook_size,
-                        decay=args.ema_decay,
-                    )
-                    ema_ent_loss = entropy_loss_from_probs(usage_ema)
-
                 ent_loss = soft_ent_loss
-
                 loss = commit_loss + args.vq_beta * ent_loss
 
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
+
+                # 4. update codebook EMA after GNN update
+                with torch.no_grad():
+                    z_new = model.encode_context(xb).float()
+                    z_new = F.normalize(z_new, dim=-1)
+
+                    ids_new = assign_blockwise(
+                        z_new,
+                        centers,
+                        k_block=args.k_block,
+                    )
+
+                    ema_update_codebook(
+                        centroids=centers,
+                        z=z_new,
+                        ids=ids_new,
+                        decay=args.ema_decay,
+                    )
+
+                    usage_ema = update_usage_ema(
+                        usage_ema,
+                        ids_new.detach(),
+                        args.codebook_size,
+                        decay=args.ema_decay,
+                    )
+                    ema_ent_loss = entropy_loss_from_probs(usage_ema)
 
                 bs = xb.size(0)
                 total_loss += loss.item() * bs
@@ -614,13 +625,6 @@ def main():
                     soft_ent=f"{total_ent / total_n:.4f}",
                     ema_ent=f"{ema_ent_loss.item():.4f}",
                 )
-
-            print(
-                f"[vq-opt] ep={ep} "
-                f"loss={total_loss / total_n:.4f} "
-                f"commit={total_commit / total_n:.4f} "
-                f"ent={total_ent / total_n:.4f}"
-            )
 
         print("[vq-opt] done")
     else:
