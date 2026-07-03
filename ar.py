@@ -668,8 +668,15 @@ def main():
 
     vq2word_prob = None
 
+    dict_vq_vocab_size = None
+
     if args.dictionary is not None:
         raw_dict = torch.load(args.dictionary, map_location="cpu")
+
+        if len(raw_dict) > 0:
+            dict_vq_vocab_size = max(int(k) for k in raw_dict.keys()) + 1
+            print(f"[dict_vq_vocab_size] {dict_vq_vocab_size}")
+
         vq2word_prob = build_vq2word_prob(
             raw_dict,
             device,
@@ -721,6 +728,9 @@ def main():
         base_vq_vocab_size = int(data["vq_vocab_size"])
     else:
         base_vq_vocab_size = int(data["vq_ids_flat"].max().item()) + 1
+
+    if dict_vq_vocab_size is not None:
+        base_vq_vocab_size = max(base_vq_vocab_size, dict_vq_vocab_size)
 
     vq_pad_id = base_vq_vocab_size
     vq_vocab_size = base_vq_vocab_size + 1
