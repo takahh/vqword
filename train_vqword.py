@@ -308,20 +308,24 @@ def make_windows(token_ids, hop, pad_id):
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
 
 @torch.no_grad()
-def fit_kmeans_torch_streaming(model, ctx, batch_size, device, args):
+def fit_kmeans_torch_streaming(model, ctx, batch_size, device, args, init_centers=None):
     model.eval()
 
     K = args.codebook_size
     D = args.d_model
 
-    print("[kmeans] torch blockwise init")
-    centers = init_centers_random(
-        model=model,
-        ctx=ctx,
-        K=K,
-        batch_size=batch_size,
-        device=device,
-    )
+    if init_centers is None:
+        print("[kmeans] torch blockwise random init")
+        centers = init_centers_random(
+            model=model,
+            ctx=ctx,
+            K=K,
+            batch_size=batch_size,
+            device=device,
+        )
+    else:
+        print("[kmeans] torch blockwise init from EMA codebook")
+        centers = F.normalize(init_centers.to(device).float(), dim=-1)
 
     for it in range(args.kmeans_iters):
         print(f"[kmeans] iter {it + 1}/{args.kmeans_iters}")
@@ -569,7 +573,13 @@ def main():
                     )
 
                     q = centers[ids].detach()
-
+                with torch.no_grad():
+                    ema_update_codebook(
+                        centroids=centers,
+                        z=z.detach(),
+                        ids=ids.detach(),
+                        decay=args.ema_decay,
+                    )
                 commit_loss = F.mse_loss(z, q)
 
                 soft_ent_loss = soft_entropy_loss(
@@ -626,6 +636,7 @@ def main():
         batch_size=args.batch_size,
         device=device,
         args=args,
+        init_centers=centers if args.epochs > 0 else None,
     )
 
     vq_ids = predict_kmeans_torch_streaming(
