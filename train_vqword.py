@@ -5,12 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
-import re
-from collections import Counter
-
-WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+|[^\w\s]")
-
 import numpy as np
+from transformers import AutoTokenizer
 
 @torch.no_grad()
 def compute_cluster_metrics(y, K_req, topk=5):
@@ -186,25 +182,6 @@ def assign_blockwise(z, centers, k_block=4096):
         best_id[m] = idx[m] + s
 
     return best_id
-
-def word_tokenize(text):
-    return WORD_RE.findall(text)
-
-def build_word_vocab(ds, text_col, max_samples, min_freq=1):
-    cnt = Counter()
-
-    for ex in tqdm(ds.select(range(min(max_samples, len(ds)))), desc="[vocab]"):
-        words = word_tokenize(ex[text_col])
-        cnt.update(words)
-
-    word2id = {"<pad>": 0, "<unk>": 1}
-    for w, c in cnt.most_common():
-        if c >= min_freq and w not in word2id:
-            word2id[w] = len(word2id)
-
-    id2word = {i: w for w, i in word2id.items()}
-    return word2id, id2word
-
 
 def make_adj(seq_len, hop, device):
     pos = torch.arange(seq_len, device=device)
@@ -464,9 +441,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="roneneldan/TinyStories")
     ap.add_argument("--center_scale", type=float, default=1.0)
+    ap.add_argument(
+        "--tokenizer",
+        default="gpt2"
+    )
     ap.add_argument("--text_col", default="text")
     ap.add_argument("--dataset_config", default=None)
-    ap.add_argument("--min_freq", type=int, default=1)
     ap.add_argument("--max_samples", type=int, default=20000)
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--hop", type=int, default=3)
@@ -488,31 +468,32 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    pad_id = 0
-    unk_id = 1
+    tok = AutoTokenizer.from_pretrained(args.tokenizer)
+
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    vocab_size = tok.vocab_size
+
+    pad_id = tok.pad_token_id
 
     if args.dataset_config is None:
         ds = load_dataset(args.dataset, split="train")
     else:
         ds = load_dataset(args.dataset, args.dataset_config, split="train")
 
-    word2id, id2word = build_word_vocab(
-        ds=ds,
-        text_col=args.text_col,
-        max_samples=args.max_samples,
-        min_freq=args.min_freq,
-    )
-
-    vocab_size = len(word2id)
-    print(f"[word_vocab_size] {vocab_size}")
+    vocab_size = tok.vocab_size
+    print(f"[tokenizer] {args.tokenizer}")
+    print(f"[vocab_size] {vocab_size}")
 
     all_ctx, all_tgt = [], []
 
     print("[data] tokenizing")
     for ex in tqdm(ds.select(range(min(args.max_samples, len(ds))))):
         text = ex[args.text_col]
-        words = word_tokenize(text)
-        ids = [word2id.get(w, unk_id) for w in words[:args.seq_len]]
+        ids = tok.encode(
+            text,
+            add_special_tokens=False
+        )[:args.seq_len]
         if len(ids) < 2 * args.hop + 2:
             continue
 
@@ -668,7 +649,7 @@ def main():
 
     cluster_dict = {
         cid: [
-            (wid, id2word[wid], count)
+            (wid, tok.decode([wid]), count)
             for wid, count in counter.most_common()
         ]
         for cid, counter in cluster_counter.items()
@@ -711,11 +692,10 @@ def main():
             "model": model.state_dict(),
             "centroids": centroids.cpu().float(),
             "args": vars(args),
-            "word2id": word2id,
-            "id2word": id2word,
+            "tokenizer_name": args.tokenizer,
             "pad_token_id": pad_id,
-            "unk_token_id": unk_id,
-            "vocab_type": "word",
+            "unk_token_id": None,
+            "vocab_type": "byte_bpe",
             "partitioned": False,
             "vq_vocab_size": args.codebook_size,
             "id_scheme": "flat_kmeans",
@@ -730,11 +710,10 @@ def main():
         {
             "vq_ids": vq_ids,
             "tgt": tgt,
-            "word2id": word2id,
-            "id2word": id2word,
+            "tokenizer_name": args.tokenizer,
             "pad_token_id": pad_id,
-            "unk_token_id": unk_id,
-            "vocab_type": "word",
+            "unk_token_id": None,
+            "vocab_type": "byte_bpe",
             "partitioned": False,
             "vq_vocab_size": args.codebook_size,
             "id_scheme": "flat_kmeans",
