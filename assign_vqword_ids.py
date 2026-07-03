@@ -4,14 +4,10 @@ import torch
 import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 from train_vqword import VQWordGNN, make_windows
-import re
 
-WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+|[^\w\s]")
-
-def word_tokenize(text):
-    return WORD_RE.findall(text)
 
 @torch.no_grad()
 def assign_ids(model, centroids, ctx, batch_size, device):
@@ -42,6 +38,10 @@ def main():
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--out", default="tiny_vqword_ids.pt")
+
+    # 追加
+    ap.add_argument("--tokenizer", default=None)
+
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -53,14 +53,26 @@ def main():
     pad_id = ckpt.get("pad_token_id", 0)
     unk_id = ckpt.get("unk_token_id", 1)
 
-    vocab_size = len(word2id)
     cargs = ckpt["args"]
+    vocab_size = len(word2id)
+
+    tokenizer_name = args.tokenizer or cargs.get("tokenizer", None)
+
+    if tokenizer_name is not None:
+        print(f"[tokenizer] using HF tokenizer: {tokenizer_name}")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        vocab_type = f"bpe:{tokenizer_name}"
+    else:
+        raise ValueError(
+            "This assign script is now for tokenizer-based/BPE VQWord. "
+            "Please pass --tokenizer gpt2."
+        )
 
     model = VQWordGNN(
         vocab_size=vocab_size,
-        d_model=ckpt["args"]["d_model"],
-        hop=ckpt["args"]["hop"],
-        n_layers=ckpt["args"]["n_layers"],
+        d_model=cargs["d_model"],
+        hop=cargs["hop"],
+        n_layers=cargs["n_layers"],
     ).to(device)
 
     model.load_state_dict(ckpt["model"])
@@ -80,11 +92,15 @@ def main():
 
     for i, ex in enumerate(tqdm(ds.select(range(min(args.max_samples, len(ds)))))):
         text = ex[args.text_col]
-        words = word_tokenize(text)
-        ids = [word2id.get(w, unk_id) for w in words]
+
+        # BPE token ids
+        ids = tokenizer.encode(text, add_special_tokens=False)
 
         if len(ids) < 2 * cargs["hop"] + 2:
             continue
+
+        # 念のためckpt vocab外はunkへ
+        ids = [x if x < vocab_size else unk_id for x in ids]
 
         ids = torch.tensor(ids, dtype=torch.long)
 
@@ -101,7 +117,7 @@ def main():
         all_tgt.append(tgt_i)
 
     if len(all_ctx) == 0:
-        raise ValueError("No windows created. Try checking text_col, word vocab, or make_windows.")
+        raise ValueError("No windows created. Try checking text_col/tokenizer/make_windows.")
 
     ctx = torch.cat(all_ctx, dim=0)
     tgt = torch.cat(all_tgt, dim=0)
@@ -110,7 +126,6 @@ def main():
 
     vq_ids = assign_ids(model, centroids, ctx, args.batch_size, device)
 
-    # sampleごとに戻す
     samples = []
     for sample_idx, start, end, n_tok in offsets:
         samples.append({
@@ -129,9 +144,10 @@ def main():
         "id2word": id2word,
         "pad_token_id": pad_id,
         "unk_token_id": unk_id,
-        "vocab_type": "word",
+        "vocab_type": vocab_type,
         "hop": cargs["hop"],
         "ckpt": args.ckpt,
+        "tokenizer": tokenizer_name,
     }, args.out)
 
     print(f"[save] {args.out}")

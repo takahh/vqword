@@ -3,7 +3,7 @@ import torch
 import argparse
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--dict", required=True)
+ap.add_argument("--dict", default="/Users/taka/Downloads/wikitext103_bpe_vqword_32k_bpe_self03_dictionary.pt")
 ap.add_argument("--top_words", type=int, default=20)
 ap.add_argument("--top_clusters", type=int, default=100)
 args = ap.parse_args()
