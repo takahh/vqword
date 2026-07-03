@@ -114,8 +114,7 @@ class ARVQWordLM(nn.Module):
         tok_logits = None
         vq_logits = self.vq_head(h)
 
-        if not self.use_vq_input or self.use_token_input:
-            tok_logits = self.tok_head(h)
+        tok_logits = self.tok_head(h)
 
         return h, tok_logits, vq_logits
 
@@ -809,8 +808,7 @@ def main():
             for p in model.tok_head.parameters():
                 p.requires_grad = True
 
-            for p in model.vq_head.parameters():
-                p.requires_grad = True
+            print("[freeze] train only tok_head")
 
             print("[freeze] train tok_head + vq_head")
 
