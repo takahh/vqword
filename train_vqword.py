@@ -308,24 +308,20 @@ def make_windows(token_ids, hop, pad_id):
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
 
 @torch.no_grad()
-def fit_kmeans_torch_streaming(model, ctx, batch_size, device, args, init_centers=None):
+def fit_kmeans_torch_streaming(model, ctx, batch_size, device, args):
     model.eval()
 
     K = args.codebook_size
     D = args.d_model
 
-    if init_centers is None:
-        print("[kmeans] torch blockwise random init")
-        centers = init_centers_random(
-            model=model,
-            ctx=ctx,
-            K=K,
-            batch_size=batch_size,
-            device=device,
-        )
-    else:
-        print("[kmeans] torch blockwise init from EMA codebook")
-        centers = F.normalize(init_centers.to(device).float(), dim=-1)
+    print("[kmeans] torch blockwise init")
+    centers = init_centers_random(
+        model=model,
+        ctx=ctx,
+        K=K,
+        batch_size=batch_size,
+        device=device,
+    )
 
     for it in range(args.kmeans_iters):
         print(f"[kmeans] iter {it + 1}/{args.kmeans_iters}")
@@ -636,7 +632,6 @@ def main():
         batch_size=args.batch_size,
         device=device,
         args=args,
-        init_centers=centers if args.epochs > 0 else None,
     )
 
     vq_ids = predict_kmeans_torch_streaming(
