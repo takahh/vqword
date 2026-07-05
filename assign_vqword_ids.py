@@ -86,14 +86,22 @@ def main():
     if args.dictionary is not None:
         dictionary = torch.load(args.dictionary, map_location="cpu")
         print("[dictionary] loaded:", args.dictionary)
-    word2id = ckpt["word2id"]
-    id2word = ckpt["id2word"]
+    word2id = ckpt.get("word2id", None)
+    id2word = ckpt.get("id2word", None)
+
+    tokenizer_name = args.tokenizer or ckpt["args"].get("tokenizer", "gpt2")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+    vocab_size = ckpt.get("vocab_size", None)
+    if vocab_size is None:
+        vocab_size = ckpt.get("token_vocab_size", None)
+    if vocab_size is None:
+        vocab_size = len(tokenizer)
 
     pad_id = ckpt.get("pad_token_id", 0)
     unk_id = ckpt.get("unk_token_id", 1)
 
     cargs = ckpt["args"]
-    vocab_size = len(word2id)
 
     tokenizer_name = args.tokenizer or cargs.get("tokenizer", None)
 
