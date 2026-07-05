@@ -460,8 +460,25 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
         sim = z @ centers.T
         y = sim.argmax(dim=1).cpu()
 
-        local_ids[idx] = y
-        centers_by_token[int(wid)] = centers.cpu()
+        # -----------------------------
+        # compress local cluster ids
+        # -----------------------------
+        used = torch.unique(y, sorted=True)
+
+        old2new = {
+            int(old): new
+            for new, old in enumerate(used.tolist())
+        }
+
+        y_compact = torch.tensor(
+            [old2new[int(v)] for v in y.tolist()],
+            dtype=torch.long,
+        )
+
+        centers_compact = centers[used.to(device)].cpu()
+
+        local_ids[idx] = y_compact
+        centers_by_token[int(wid)] = centers_compact
 
     return centers_by_token, local_ids
 
