@@ -14,19 +14,15 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
     model.eval()
 
     centers_by_token = dictionary["centers_by_token"]
-    global_ids_by_token = dictionary.get("global_ids_by_token", None)
+    pair_to_compact = dictionary.get("pair_to_compact", None)
 
-    # tokenごとのcentroidをGPUへ
+    if pair_to_compact is None:
+        raise ValueError("per-token ckpt requires pair_to_compact")
+
     centers_by_token = {
         int(k): F.normalize(v.to(device), dim=-1)
         for k, v in centers_by_token.items()
     }
-
-    if global_ids_by_token is not None:
-        global_ids_by_token = {
-            int(k): v.long().to(device)
-            for k, v in global_ids_by_token.items()
-        }
 
     all_ids = []
 
@@ -40,23 +36,23 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
         out = torch.empty(len(tb), dtype=torch.long, device=device)
 
         for tok in tb.unique().tolist():
+            tok = int(tok)
             mask = tb == tok
 
             if tok not in centers_by_token:
-                # 念のため。辞書にないtokenは0へ
                 out[mask] = 0
                 continue
 
-            c = centers_by_token[tok]          # [K_tok, D]
-            sim = z[mask] @ c.T               # [B_tok, K_tok]
-            local_id = sim.argmax(dim=1)       # [B_tok]
+            c = centers_by_token[tok]
+            sim = z[mask] @ c.T
+            local_id = sim.argmax(dim=1)
 
-            if global_ids_by_token is not None:
-                out[mask] = global_ids_by_token[tok][local_id]
-            else:
-                # dictionary側が global id を持ってない場合
-                # この場合は local id しか返せないので注意
-                out[mask] = local_id
+            ids = [
+                int(pair_to_compact[(tok, int(lid))])
+                for lid in local_id.detach().cpu().tolist()
+            ]
+
+            out[mask] = torch.tensor(ids, dtype=torch.long, device=device)
 
         all_ids.append(out.cpu())
 
@@ -171,18 +167,19 @@ def main():
 
     print(f"[data] windows={len(tgt):,}")
 
-    if dictionary is None or "centers_by_token" not in dictionary:
-        raise ValueError("per-token assign requires --dictionary with centers_by_token")
+    assign_source = ckpt
+
+    if "centers_by_token" not in assign_source:
+        raise ValueError("ckpt does not contain centers_by_token")
 
     vq_ids = assign_ids_per_token(
         model,
-        dictionary,
+        assign_source,
         ctx,
         tgt,
         args.batch_size,
         device,
     )
-
     samples = []
     for sample_idx, start, end, n_tok in offsets:
         samples.append({
