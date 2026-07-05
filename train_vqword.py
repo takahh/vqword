@@ -405,6 +405,97 @@ def predict_kmeans_torch_streaming(
 
     return torch.cat(ids, dim=0)
 
+@torch.no_grad()
+def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
+    model.eval()
+
+    print("[per-token kmeans] collect embeddings")
+    z_all = collect_embeddings(model, ctx, batch_size, device).float()
+    z_all = F.normalize(z_all, dim=-1)
+
+    tgt_cpu = tgt.cpu()
+
+    centers_by_token = {}
+    local_ids = torch.zeros(len(tgt), dtype=torch.long)
+
+    unique_tokens = torch.unique(tgt_cpu)
+    print(f"[per-token kmeans] tokens={len(unique_tokens):,} K/token={Ktok}")
+
+    for wid in tqdm(unique_tokens.tolist(), desc="[per-token kmeans]"):
+        idx = torch.where(tgt_cpu == wid)[0]
+        n = len(idx)
+
+        if n < args.min_token_count:
+            centers_by_token[int(wid)] = z_all[idx[:1]].clone()
+            local_ids[idx] = 0
+            continue
+
+        k = choose_k_by_freq(n, args)
+        k = min(k, n)
+        z = z_all[idx].to(device)
+
+        if n >= k:
+            sel = torch.randperm(n, device=device)[:k]
+        else:
+            sel = torch.randint(0, n, (k,), device=device)
+
+        centers = z[sel].clone()
+        centers = F.normalize(centers, dim=-1)
+
+        for _ in range(args.kmeans_iters):
+            sim = z @ centers.T
+            y = sim.argmax(dim=1)
+
+            sums = torch.zeros_like(centers)
+            counts = torch.zeros(k, device=device)
+
+            sums.index_add_(0, y, z)
+            counts.index_add_(0, y, torch.ones_like(y, dtype=torch.float))
+
+            nonempty = counts > 0
+            centers[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1)
+            centers = F.normalize(centers, dim=-1)
+
+        sim = z @ centers.T
+        y = sim.argmax(dim=1).cpu()
+
+        local_ids[idx] = y
+        centers_by_token[int(wid)] = centers.cpu()
+
+    return centers_by_token, local_ids
+
+def choose_k_by_freq(freq, args):
+    if freq < args.min_token_count:
+        return 1
+
+    k = int(freq ** args.cluster_freq_power)
+
+    k = max(1, k)
+    k = min(k, args.max_clusters_per_token)
+
+    return k
+
+def compact_per_token_ids(tgt, local_ids):
+    """
+    (original_token_id, local_cluster_id) を 0..K_eff-1 に詰める
+    """
+    pair_to_compact = {}
+    compact_ids = torch.empty_like(local_ids)
+
+    next_id = 0
+    for i, pair in enumerate(zip(tgt.cpu().tolist(), local_ids.cpu().tolist())):
+        key = (int(pair[0]), int(pair[1]))
+        if key not in pair_to_compact:
+            pair_to_compact[key] = next_id
+            next_id += 1
+        compact_ids[i] = pair_to_compact[key]
+
+    compact_to_pair = {
+        cid: pair for pair, cid in pair_to_compact.items()
+    }
+
+    return compact_ids.long(), pair_to_compact, compact_to_pair
+
 def soft_entropy_loss(z, centers, temperature=0.1):
     z = F.normalize(z.float(), dim=-1)
     centers = F.normalize(centers.float(), dim=-1)
@@ -463,7 +554,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--entropy_temp", type=float, default=0.1)
-
+    ap.add_argument("--max_clusters_per_token", type=int, default=8)
+    ap.add_argument("--cluster_freq_power", type=float, default=0.5)
+    ap.add_argument("--min_token_count", type=int, default=2)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -630,22 +723,22 @@ def main():
     else:
         print("[vq-opt] skipped")
 
-    centroids = fit_kmeans_torch_streaming(
+    centers_by_token, local_ids = fit_kmeans_per_token(
         model=model,
         ctx=ctx,
+        tgt=tgt,
         batch_size=args.batch_size,
         device=device,
         args=args,
     )
 
-    vq_ids = predict_kmeans_torch_streaming(
-        model=model,
-        centers=centroids,
-        ctx=ctx,
-        batch_size=args.batch_size,
-        device=device,
-        args=args,
+    vq_ids, pair_to_compact, compact_to_pair = compact_per_token_ids(
+        tgt=tgt,
+        local_ids=local_ids,
     )
+
+    args.codebook_size = int(vq_ids.max().item()) + 1
+    print(f"[per-token] compact vq_vocab_size={args.codebook_size}")
 
     from collections import defaultdict, Counter
 
@@ -700,15 +793,18 @@ def main():
     torch.save(
         {
             "model": model.state_dict(),
-            "centroids": centroids.cpu().float(),
+            "centers_by_token": centers_by_token,
+            "pair_to_compact": pair_to_compact,
+            "compact_to_pair": compact_to_pair,
             "args": vars(args),
             "tokenizer_name": args.tokenizer,
             "pad_token_id": pad_id,
             "unk_token_id": None,
             "vocab_type": "byte_bpe",
-            "partitioned": False,
+            "partitioned": True,
+            "partition_type": "per_original_token",
             "vq_vocab_size": args.codebook_size,
-            "id_scheme": "flat_kmeans",
+            "id_scheme": "compact_per_token_kmeans",
             "global_id_min": 0,
             "global_id_max": args.codebook_size - 1,
         },
@@ -720,13 +816,16 @@ def main():
         {
             "vq_ids": vq_ids,
             "tgt": tgt,
+            "local_ids": local_ids,
+            "compact_to_pair": compact_to_pair,
             "tokenizer_name": args.tokenizer,
             "pad_token_id": pad_id,
             "unk_token_id": None,
             "vocab_type": "byte_bpe",
-            "partitioned": False,
+            "partitioned": True,
+            "partition_type": "per_original_token",
             "vq_vocab_size": args.codebook_size,
-            "id_scheme": "flat_kmeans",
+            "id_scheme": "compact_per_token_kmeans",
             "global_id_min": 0,
             "global_id_max": args.codebook_size - 1,
         },

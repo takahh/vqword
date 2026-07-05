@@ -5,7 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 ckpt = torch.load(
-    "/Users/taka/Downloads/ar_bpe_vqw2vqw_pretrain_32k_bpe_self03_20260703_120308.pt",
+    "/Users/taka/Downloads/ar_bpe_vqw2bpe_finetune_32k_bpe_self03_20260703_185923.pt",
     map_location="cpu",
     weights_only=False,
 )
