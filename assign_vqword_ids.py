@@ -95,8 +95,9 @@ def main():
         vocab_size = len(tokenizer)
 
     pad_id = ckpt.get("pad_token_id", 0)
-    unk_id = ckpt.get("unk_token_id", 1)
-
+    unk_id = ckpt.get("unk_token_id", None)
+    if unk_id is None:
+        unk_id = pad_id
     cargs = ckpt["args"]
 
     tokenizer_name = args.tokenizer or cargs.get("tokenizer", None)
