@@ -419,8 +419,10 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
     local_ids = torch.zeros(len(tgt), dtype=torch.long)
 
     unique_tokens = torch.unique(tgt_cpu)
-    print(f"[per-token kmeans] tokens={len(unique_tokens):,} K/token={Ktok}")
-
+    print(
+        f"[per-token kmeans] tokens={len(unique_tokens):,} "
+        f"maxK={args.max_clusters_per_token}"
+    )
     for wid in tqdm(unique_tokens.tolist(), desc="[per-token kmeans]"):
         idx = torch.where(tgt_cpu == wid)[0]
         n = len(idx)
@@ -775,7 +777,6 @@ def main():
         f"singleton_ratio={metrics['singleton_ratio']:.4f}"
     )
 
-    centroids = centroids.cpu().float()
     vq_ids = vq_ids_kmeans.long()
 
     metrics = compute_cluster_metrics(vq_ids, K_req=args.codebook_size)
