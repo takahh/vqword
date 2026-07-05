@@ -10,23 +10,57 @@ from train_vqword import VQWordGNN, make_windows
 
 
 @torch.no_grad()
-def assign_ids(model, centroids, ctx, batch_size, device):
+def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
     model.eval()
-    centroids = F.normalize(centroids.to(device), dim=-1)
+
+    centers_by_token = dictionary["centers_by_token"]
+    global_ids_by_token = dictionary.get("global_ids_by_token", None)
+
+    # tokenごとのcentroidをGPUへ
+    centers_by_token = {
+        int(k): F.normalize(v.to(device), dim=-1)
+        for k, v in centers_by_token.items()
+    }
+
+    if global_ids_by_token is not None:
+        global_ids_by_token = {
+            int(k): v.long().to(device)
+            for k, v in global_ids_by_token.items()
+        }
 
     all_ids = []
-    for s in tqdm(range(0, len(ctx), batch_size), desc="[assign]"):
+
+    for s in tqdm(range(0, len(ctx), batch_size), desc="[assign-pertok]"):
         xb = ctx[s:s+batch_size].to(device)
+        tb = tgt[s:s+batch_size].to(device)
+
         z = model.encode_context(xb)
         z = F.normalize(z, dim=-1)
 
-        sim = z @ centroids.T
-        pred = sim.argmax(dim=1)
+        out = torch.empty(len(tb), dtype=torch.long, device=device)
 
-        all_ids.append(pred.cpu())
+        for tok in tb.unique().tolist():
+            mask = tb == tok
+
+            if tok not in centers_by_token:
+                # 念のため。辞書にないtokenは0へ
+                out[mask] = 0
+                continue
+
+            c = centers_by_token[tok]          # [K_tok, D]
+            sim = z[mask] @ c.T               # [B_tok, K_tok]
+            local_id = sim.argmax(dim=1)       # [B_tok]
+
+            if global_ids_by_token is not None:
+                out[mask] = global_ids_by_token[tok][local_id]
+            else:
+                # dictionary側が global id を持ってない場合
+                # この場合は local id しか返せないので注意
+                out[mask] = local_id
+
+        all_ids.append(out.cpu())
 
     return torch.cat(all_ids, dim=0)
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -38,6 +72,7 @@ def main():
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--out", default="tiny_vqword_ids.pt")
+    ap.add_argument("--dictionary", default=None)
 
     # 追加
     ap.add_argument("--tokenizer", default=None)
@@ -47,6 +82,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     ckpt = torch.load(args.ckpt, map_location="cpu")
+    dictionary = None
+    if args.dictionary is not None:
+        dictionary = torch.load(args.dictionary, map_location="cpu")
+        print("[dictionary] loaded:", args.dictionary)
     word2id = ckpt["word2id"]
     id2word = ckpt["id2word"]
 
@@ -76,12 +115,12 @@ def main():
     ).to(device)
 
     model.load_state_dict(ckpt["model"])
-    centroids = ckpt["centroids"]
+    centroids = ckpt.get("centroids", None)
 
-    if centroids.dim() == 3:
-        centroids = centroids.reshape(-1, centroids.size(-1))
-
-    print("[debug] centroids shape:", centroids.shape)
+    if centroids is not None:
+        if centroids.dim() == 3:
+            centroids = centroids.reshape(-1, centroids.size(-1))
+        print("[debug] centroids shape:", centroids.shape)
 
     ds = load_dataset(args.dataset, split=args.split)
     all_ctx = []
@@ -124,7 +163,17 @@ def main():
 
     print(f"[data] windows={len(tgt):,}")
 
-    vq_ids = assign_ids(model, centroids, ctx, args.batch_size, device)
+    if dictionary is None or "centers_by_token" not in dictionary:
+        raise ValueError("per-token assign requires --dictionary with centers_by_token")
+
+    vq_ids = assign_ids_per_token(
+        model,
+        dictionary,
+        ctx,
+        tgt,
+        args.batch_size,
+        device,
+    )
 
     samples = []
     for sample_idx, start, end, n_tok in offsets:
