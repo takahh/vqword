@@ -429,7 +429,6 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
             centers_by_token[int(wid)] = z_all[idx[:1]].clone()
             local_ids[idx] = 0
             continue
-
         k = choose_k_by_freq(n, args)
         k = min(k, n)
         z = z_all[idx].to(device)
