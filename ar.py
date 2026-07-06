@@ -744,10 +744,13 @@ def main():
 
     print("[CHECK] vq_ids min:", vq_min)
     print("[CHECK] vq_ids max:", vq_max)
-    if raw_dict is not None and "vq_vocab_size" in raw_dict:
-        vq_vocab_size = int(raw_dict["vq_vocab_size"])
-    elif raw_dict is not None and "compact_to_pair" in raw_dict:
-        vq_vocab_size = len(raw_dict["compact_to_pair"])
+
+    if raw_dict is not None and len(raw_dict) > 0:
+        dict_max = max(int(k) for k in raw_dict.keys())
+        print("[CHECK] dict vq_ids max:", dict_max)
+
+        # data側とdictionary側の大きい方に合わせる
+        vq_vocab_size = max(vq_max + 1, dict_max + 1)
     else:
         vq_vocab_size = vq_max + 1
 
@@ -758,14 +761,6 @@ def main():
     print("[vq_pad_id]", vq_pad_id)
     print("[vq_vocab_size incl pad]", vq_vocab_size_incl_pad)
 
-    if raw_dict is not None and "vq_vocab_size" in raw_dict:
-        print("[CHECK] dictionary vq_vocab_size:", raw_dict["vq_vocab_size"])
-
-    if raw_dict is not None and "compact_to_pair" in raw_dict:
-        print("[CHECK] len compact_to_pair:", len(raw_dict["compact_to_pair"]))
-
-    if raw_dict is not None and "pair_to_compact" in raw_dict:
-        print("[CHECK] len pair_to_compact:", len(raw_dict["pair_to_compact"]))
     cand_table = None
     cand_mask = None
 
