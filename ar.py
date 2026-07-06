@@ -813,7 +813,26 @@ def main():
     if args.init_from is not None:
         ckpt = torch.load(args.init_from, map_location="cpu")
         sd = ckpt["model"]
+        old_vq_size = sd["vq_emb.weight"].shape[0]
+        new_vq_size = model.vq_emb.weight.shape[0]
 
+        if old_vq_size != new_vq_size:
+            print(f"[resize ckpt vq] {old_vq_size} -> {new_vq_size}")
+
+            old_w = sd["vq_emb.weight"]
+            new_w = model.vq_emb.weight.detach().cpu().clone()
+            new_w[:old_vq_size] = old_w
+            sd["vq_emb.weight"] = new_w
+
+            old_w = sd["vq_head.weight"]
+            new_w = model.vq_head.weight.detach().cpu().clone()
+            new_w[:old_vq_size] = old_w
+            sd["vq_head.weight"] = new_w
+
+            old_b = sd["vq_head.bias"]
+            new_b = model.vq_head.bias.detach().cpu().clone()
+            new_b[:old_vq_size] = old_b
+            sd["vq_head.bias"] = new_b
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"[init_from] {args.init_from}")
         print(f"[init] missing={missing}")
