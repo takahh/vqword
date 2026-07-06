@@ -870,12 +870,17 @@ def main():
                 print("model.vq_emb.num_embeddings:", model.vq_emb.num_embeddings)
                 raise RuntimeError("vq_in out of range")
 
-            if vq_y.min() < 0 or vq_y.max() >= model.vq_head.out_features:
+            valid_vq_y = vq_y[vq_y.ne(-100)]
+
+            if valid_vq_y.numel() > 0 and (
+                    valid_vq_y.min() < 0 or valid_vq_y.max() >= model.vq_head.out_features
+            ):
                 print("[BAD vq_y]")
-                print("vq_y min:", int(vq_y.min()))
-                print("vq_y max:", int(vq_y.max()))
+                print("valid_vq_y min:", int(valid_vq_y.min()))
+                print("valid_vq_y max:", int(valid_vq_y.max()))
                 print("model.vq_head.out_features:", model.vq_head.out_features)
                 raise RuntimeError("vq_y out of range")
+            
             h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
             if args.mode == "pretrain":
