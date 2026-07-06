@@ -537,14 +537,23 @@ def entropy_loss_from_ids(ids, K, device):
 @torch.no_grad()
 def collect_embeddings(model, ctx, batch_size, device):
     model.eval()
-    zs = []
 
-    for start in tqdm(range(0, len(ctx), batch_size), desc="[embed]"):
-        xb = ctx[start:start + batch_size].to(device)
+    N = len(ctx)
+    D = model.tok_emb.embedding_dim
+
+    # 最初から保存先を1個だけ確保する
+    z_all = torch.empty((N, D), dtype=torch.float16, device="cpu")
+
+    for start in tqdm(range(0, N, batch_size), desc="[embed]"):
+        end = min(start + batch_size, N)
+
+        xb = ctx[start:end].to(device)
         z = model.encode_context(xb)
-        zs.append(z.cpu().half())
-    return torch.cat(zs, dim=0)
 
+        # catしない。直接書き込む
+        z_all[start:end] = z.detach().cpu().half()
+
+    return z_all
 
 def main():
     ap = argparse.ArgumentParser()
