@@ -757,13 +757,14 @@ def main():
     print("[vq_vocab_size]", vq_vocab_size)
     print("[vq_pad_id]", vq_pad_id)
     print("[vq_vocab_size incl pad]", vq_vocab_size_incl_pad)
-    if "vq_vocab_size" in raw_dict:
+
+    if raw_dict is not None and "vq_vocab_size" in raw_dict:
         print("[CHECK] dictionary vq_vocab_size:", raw_dict["vq_vocab_size"])
 
-    if "compact_to_pair" in raw_dict:
+    if raw_dict is not None and "compact_to_pair" in raw_dict:
         print("[CHECK] len compact_to_pair:", len(raw_dict["compact_to_pair"]))
 
-    if "pair_to_compact" in raw_dict:
+    if raw_dict is not None and "pair_to_compact" in raw_dict:
         print("[CHECK] len pair_to_compact:", len(raw_dict["pair_to_compact"]))
     cand_table = None
     cand_mask = None
