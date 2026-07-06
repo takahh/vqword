@@ -787,9 +787,9 @@ def main():
     valid_s = samples[n_train:n_train + n_valid]
     test_s = samples[n_train + n_valid:]
 
-    train_ds = VQWordARDataset(train_s, max_len=1024)
-    valid_ds = VQWordARDataset(valid_s, max_len=1024)
-    test_ds = VQWordARDataset(test_s, max_len=1024)
+    train_ds = VQWordARDataset(train_s, max_len=512)
+    valid_ds = VQWordARDataset(valid_s, max_len=512)
+    test_ds = VQWordARDataset(test_s, max_len=512)
 
     def make_loader(ds, shuffle):
         return DataLoader(
@@ -810,7 +810,7 @@ def main():
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         dropout=args.dropout,
-        max_len=1024,
+        max_len=512,
         use_token_input=use_token_input,
         use_vq_input=use_vq_input,
     ).to(device)
@@ -880,7 +880,7 @@ def main():
                 print("valid_vq_y max:", int(valid_vq_y.max()))
                 print("model.vq_head.out_features:", model.vq_head.out_features)
                 raise RuntimeError("vq_y out of range")
-            
+
             h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
             if args.mode == "pretrain":
