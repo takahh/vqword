@@ -739,16 +739,17 @@ def main():
     print(f"[vq_pad_id] {vq_pad_id}")
     print(f"[vq_vocab_size incl pad] {vq_vocab_size}")
     print("[CHECK] data keys:", data.keys())
-    print("[CHECK] dictionary keys:", raw_dict.keys())
+    vq_max = max(int(s["vqword_ids"].max()) for s in samples)
+    vq_min = min(int(s["vqword_ids"].min()) for s in samples)
 
-    print("[CHECK] vq_ids min:", int(data["vq_ids"].min()))
-    print("[CHECK] vq_ids max:", int(data["vq_ids"].max()))
-    if "vq_vocab_size" in raw_dict:
+    print("[CHECK] vq_ids min:", vq_min)
+    print("[CHECK] vq_ids max:", vq_max)
+    if raw_dict is not None and "vq_vocab_size" in raw_dict:
         vq_vocab_size = int(raw_dict["vq_vocab_size"])
-    elif "compact_to_pair" in raw_dict:
+    elif raw_dict is not None and "compact_to_pair" in raw_dict:
         vq_vocab_size = len(raw_dict["compact_to_pair"])
     else:
-        vq_vocab_size = int(data["vq_ids"].max().item()) + 1
+        vq_vocab_size = vq_max + 1
 
     vq_pad_id = vq_vocab_size
     vq_vocab_size_incl_pad = vq_vocab_size + 1
@@ -802,7 +803,7 @@ def main():
     test_loader = make_loader(test_ds, False)
 
     model = ARVQWordLM(
-        tok_vocab_size=tok_vocab_size,
+        vocab_size=token_vocab_size,
         vq_vocab_size=vq_vocab_size_incl_pad,
         d_model=args.d_model,
         n_layers=args.n_layers,
