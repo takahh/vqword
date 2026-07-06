@@ -743,7 +743,19 @@ def main():
 
     print("[CHECK] vq_ids min:", int(data["vq_ids"].min()))
     print("[CHECK] vq_ids max:", int(data["vq_ids"].max()))
+    if "vq_vocab_size" in raw_dict:
+        vq_vocab_size = int(raw_dict["vq_vocab_size"])
+    elif "compact_to_pair" in raw_dict:
+        vq_vocab_size = len(raw_dict["compact_to_pair"])
+    else:
+        vq_vocab_size = int(data["vq_ids"].max().item()) + 1
 
+    vq_pad_id = vq_vocab_size
+    vq_vocab_size_incl_pad = vq_vocab_size + 1
+
+    print("[vq_vocab_size]", vq_vocab_size)
+    print("[vq_pad_id]", vq_pad_id)
+    print("[vq_vocab_size incl pad]", vq_vocab_size_incl_pad)
     if "vq_vocab_size" in raw_dict:
         print("[CHECK] dictionary vq_vocab_size:", raw_dict["vq_vocab_size"])
 
@@ -790,8 +802,8 @@ def main():
     test_loader = make_loader(test_ds, False)
 
     model = ARVQWordLM(
-        vocab_size=token_vocab_size,
-        vq_vocab_size=vq_vocab_size,
+        tok_vocab_size=tok_vocab_size,
+        vq_vocab_size=vq_vocab_size_incl_pad,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -849,6 +861,19 @@ def main():
             attn_mask = attn_mask.to(device)
 
             key_padding_mask = ~attn_mask
+            if vq_in.min() < 0 or vq_in.max() >= model.vq_emb.num_embeddings:
+                print("[BAD vq_in]")
+                print("vq_in min:", int(vq_in.min()))
+                print("vq_in max:", int(vq_in.max()))
+                print("model.vq_emb.num_embeddings:", model.vq_emb.num_embeddings)
+                raise RuntimeError("vq_in out of range")
+
+            if vq_y.min() < 0 or vq_y.max() >= model.vq_head.out_features:
+                print("[BAD vq_y]")
+                print("vq_y min:", int(vq_y.min()))
+                print("vq_y max:", int(vq_y.max()))
+                print("model.vq_head.out_features:", model.vq_head.out_features)
+                raise RuntimeError("vq_y out of range")
             h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
 
             if args.mode == "pretrain":
