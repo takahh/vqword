@@ -916,7 +916,6 @@ def main():
             device,
             vq2word_prob,
         )
-
         test = evaluate_argmax_vq_dict_ppl(
             model,
             test_loader,
