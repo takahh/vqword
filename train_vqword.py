@@ -410,8 +410,8 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
     model.eval()
 
     print("[per-token kmeans] collect embeddings")
-    z_all = collect_embeddings(model, ctx, batch_size, device).float()
-    z_all = F.normalize(z_all, dim=-1)
+    z_all = collect_embeddings(model, ctx, batch_size, device)
+    # z_all = F.normalize(z_all, dim=-1)
 
     tgt_cpu = tgt.cpu()
 
@@ -433,7 +433,8 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
             continue
         k = choose_k_by_freq(n, args)
         k = min(k, n)
-        z = z_all[idx].to(device)
+        z = z_all[idx].to(device).float()
+        z = F.normalize(z, dim=-1)
 
         if n >= k:
             sel = torch.randperm(n, device=device)[:k]
@@ -541,8 +542,7 @@ def collect_embeddings(model, ctx, batch_size, device):
     for start in tqdm(range(0, len(ctx), batch_size), desc="[embed]"):
         xb = ctx[start:start + batch_size].to(device)
         z = model.encode_context(xb)
-        zs.append(z.cpu())
-
+        zs.append(z.cpu().half())
     return torch.cat(zs, dim=0)
 
 
