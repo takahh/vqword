@@ -20,7 +20,7 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
         raise ValueError("per-token ckpt requires pair_to_compact")
 
     centers_by_token = {
-        int(k): F.normalize(v.to(device), dim=-1)
+        int(k): F.normalize(v.to(device).float(), dim=-1)
         for k, v in centers_by_token.items()
     }
 
@@ -43,7 +43,7 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
                 out[mask] = 0
                 continue
 
-            c = centers_by_token[int(wid)].to(device).float()
+            c = centers_by_token[tok].float()
             zz = z[mask].float()
             sim = zz @ c.T
             local_id = sim.argmax(dim=1)
