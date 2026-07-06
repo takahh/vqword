@@ -935,39 +935,40 @@ def main():
     # 評価のみ
     # ===========================
     if args.eval_only:
-        cand_table_eval, cand_prob_eval, cand_mask_eval = build_vq_prob_table(
-            raw_dict=raw_dict,
-            vq_vocab_size=vq_vocab_size_incl_pad,
-            topk=32,
-            device=device,
-            pad_value=pad_token_id,
-        )
-
-        valid = evaluate_argmax_vq_dict_ppl_fast(
+        valid = evaluate(
             model,
             valid_loader,
             device,
-            cand_table_eval,
-            cand_prob_eval,
-            cand_mask_eval,
+            aux_lambda=0.0,
+            main_target="vq",
+            vq2word_ids=vq2word_ids,
+            dict_loss=False,
+            vq2word_prob=vq2word_prob,
+            cand_table=cand_table,
+            cand_mask=cand_mask,
         )
 
-        test = evaluate_argmax_vq_dict_ppl_fast(
+        test = evaluate(
             model,
             test_loader,
             device,
-            cand_table_eval,
-            cand_prob_eval,
-            cand_mask_eval,
+            aux_lambda=0.0,
+            main_target="vq",
+            vq2word_ids=vq2word_ids,
+            dict_loss=False,
+            vq2word_prob=vq2word_prob,
+            cand_table=cand_table,
+            cand_mask=cand_mask,
         )
 
         print(
-            f"[argmax-dict] "
-            f"valid_word_ppl={valid['argmax_dict_word_ppl']:.2f} "
-            f"valid_cov={valid['argmax_dict_coverage']:.4f} "
-            f"test_word_ppl={test['argmax_dict_word_ppl']:.2f} "
-            f"test_cov={test['argmax_dict_coverage']:.4f}"
+            f"[eval-only] "
+            f"valid_vq_ppl={valid['vq_ppl']:.2f} "
+            f"valid_dict_word_ppl={valid['dict_word_ppl']:.2f} "
+            f"test_vq_ppl={test['vq_ppl']:.2f} "
+            f"test_dict_word_ppl={test['dict_word_ppl']:.2f}"
         )
+
         return
 
     opt = torch.optim.AdamW(
