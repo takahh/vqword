@@ -536,6 +536,53 @@ def evaluate_vq_only(model, loader, device):
     }
 
 @torch.no_grad()
+def evaluate_argmax_vq_dict_ppl(model, loader, device, vq2word_prob):
+    model.eval()
+    total_loss = 0.0
+    total_tok = 0
+
+    for tok_in, vq_in, tok_y, vq_y, attn_mask in tqdm(loader, desc="[eval-argmax-dict]", leave=False):
+        tok_in = tok_in.to(device)
+        vq_in = vq_in.to(device)
+        tok_y = tok_y.to(device)
+        attn_mask = attn_mask.to(device)
+
+        h, tok_logits, vq_logits = model(tok_in, vq_in, ~attn_mask)
+
+        pred_vq = vq_logits.argmax(dim=-1).reshape(-1)
+        true_tok = tok_y.reshape(-1)
+
+        valid = true_tok.ne(-100)
+        pred_vq = pred_vq[valid]
+        true_tok = true_tok[valid]
+
+        p = torch.zeros(true_tok.size(0), device=device)
+
+        for vq_id, (word_ids, probs) in vq2word_prob.items():
+            idx = pred_vq.eq(vq_id)
+            if idx.sum() == 0:
+                continue
+
+            hit = word_ids[None, :].eq(true_tok[idx, None])
+            keep = hit.any(dim=1)
+
+            if keep.sum() == 0:
+                continue
+
+            pos = hit[keep].float().argmax(dim=1)
+            p[idx.nonzero(as_tuple=True)[0][keep]] = probs[pos]
+
+        p = p.clamp_min(1e-12)
+        total_loss += -torch.log(p).sum().item()
+        total_tok += true_tok.numel()
+
+    ce = total_loss / max(total_tok, 1)
+    return {
+        "argmax_dict_word_loss": ce,
+        "argmax_dict_word_ppl": math.exp(min(ce, 20)),
+    }
+
+@torch.no_grad()
 def dict_word_ce(vq_logits, tok_y, vq2word_prob):
     vq_prob = torch.softmax(vq_logits, dim=-1)
     B,T,V = vq_prob.shape
@@ -636,6 +683,7 @@ def main():
     ap.add_argument("--reset_heads", action="store_true")
     ap.add_argument("--dictionary", default=None)
     ap.add_argument("--dict_loss", action="store_true")
+    ap.add_argument("--eval_only", action="store_true")
     ap.add_argument("--mode", choices=["pretrain", "finetune"], default="pretrain")
     args = ap.parse_args()
 
@@ -857,6 +905,31 @@ def main():
         print("[freeze] train only tok_head")
 
         print("[freeze] train only vq_to_tok")
+
+    # ===========================
+    # 評価のみ
+    # ===========================
+    if args.eval_only:
+        valid = evaluate_argmax_vq_dict_ppl(
+            model,
+            valid_loader,
+            device,
+            vq2word_prob,
+        )
+
+        test = evaluate_argmax_vq_dict_ppl(
+            model,
+            test_loader,
+            device,
+            vq2word_prob,
+        )
+
+        print(
+            f"[argmax-dict] "
+            f"valid_word_ppl={valid['argmax_dict_word_ppl']:.2f} "
+            f"test_word_ppl={test['argmax_dict_word_ppl']:.2f}"
+        )
+        return
 
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
