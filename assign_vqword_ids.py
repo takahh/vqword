@@ -43,8 +43,9 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
                 out[mask] = 0
                 continue
 
-            c = centers_by_token[tok]
-            sim = z[mask] @ c.T
+            c = centers_by_token[int(wid)].to(device).float()
+            zz = z[mask].float()
+            sim = zz @ c.T
             local_id = sim.argmax(dim=1)
 
             ids = [
