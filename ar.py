@@ -535,13 +535,37 @@ def evaluate_vq_only(model, loader, device):
         "dict_word_ppl": 1.0,
     }
 
+def build_vq_prob_table(raw_dict, vq_vocab_size, topk, device, pad_value=0, alpha=1e-6):
+    cand = torch.full((vq_vocab_size, topk), pad_value, device=device, dtype=torch.long)
+    prob = torch.zeros((vq_vocab_size, topk), device=device, dtype=torch.float32)
+    mask = torch.zeros((vq_vocab_size, topk), device=device, dtype=torch.bool)
+
+    for vq_id, entries in raw_dict.items():
+        ids = [int(wid) for wid, word, count in entries[:topk]]
+        counts = torch.tensor([float(count) for wid, word, count in entries[:topk]], device=device)
+
+        if len(ids) == 0:
+            continue
+
+        p = counts + alpha
+        p = p / p.sum()
+
+        n = min(len(ids), topk)
+        cand[int(vq_id), :n] = torch.tensor(ids[:n], device=device)
+        prob[int(vq_id), :n] = p[:n]
+        mask[int(vq_id), :n] = True
+
+    return cand, prob, mask
+
+
 @torch.no_grad()
-def evaluate_argmax_vq_dict_ppl(model, loader, device, vq2word_prob):
+def evaluate_argmax_vq_dict_ppl_fast(model, loader, device, cand_table, cand_prob, cand_mask):
     model.eval()
     total_loss = 0.0
     total_tok = 0
+    covered = 0
 
-    for tok_in, vq_in, tok_y, vq_y, attn_mask in tqdm(loader, desc="[eval-argmax-dict]", leave=False):
+    for tok_in, vq_in, tok_y, vq_y, attn_mask in tqdm(loader, desc="[eval-argmax-dict-fast]", leave=False):
         tok_in = tok_in.to(device)
         vq_in = vq_in.to(device)
         tok_y = tok_y.to(device)
@@ -556,30 +580,31 @@ def evaluate_argmax_vq_dict_ppl(model, loader, device, vq2word_prob):
         pred_vq = pred_vq[valid]
         true_tok = true_tok[valid]
 
+        cand_ids = cand_table[pred_vq]
+        probs = cand_prob[pred_vq]
+        mask = cand_mask[pred_vq]
+
+        hit = cand_ids.eq(true_tok[:, None]) & mask
+
         p = torch.zeros(true_tok.size(0), device=device)
+        keep = hit.any(dim=1)
 
-        for vq_id, (word_ids, probs) in vq2word_prob.items():
-            idx = pred_vq.eq(vq_id)
-            if idx.sum() == 0:
-                continue
-
-            hit = word_ids[None, :].eq(true_tok[idx, None])
-            keep = hit.any(dim=1)
-
-            if keep.sum() == 0:
-                continue
-
+        if keep.any():
             pos = hit[keep].float().argmax(dim=1)
-            p[idx.nonzero(as_tuple=True)[0][keep]] = probs[pos]
+            p[keep] = probs[keep, pos]
+            covered += keep.sum().item()
 
         p = p.clamp_min(1e-12)
+
         total_loss += -torch.log(p).sum().item()
         total_tok += true_tok.numel()
 
     ce = total_loss / max(total_tok, 1)
+
     return {
         "argmax_dict_word_loss": ce,
         "argmax_dict_word_ppl": math.exp(min(ce, 20)),
+        "argmax_dict_coverage": covered / max(total_tok, 1),
     }
 
 @torch.no_grad()
@@ -910,23 +935,38 @@ def main():
     # 評価のみ
     # ===========================
     if args.eval_only:
-        valid = evaluate_argmax_vq_dict_ppl(
+        cand_table_eval, cand_prob_eval, cand_mask_eval = build_vq_prob_table(
+            raw_dict=raw_dict,
+            vq_vocab_size=vq_vocab_size_incl_pad,
+            topk=32,
+            device=device,
+            pad_value=pad_token_id,
+        )
+
+        valid = evaluate_argmax_vq_dict_ppl_fast(
             model,
             valid_loader,
             device,
-            vq2word_prob,
+            cand_table_eval,
+            cand_prob_eval,
+            cand_mask_eval,
         )
-        test = evaluate_argmax_vq_dict_ppl(
+
+        test = evaluate_argmax_vq_dict_ppl_fast(
             model,
             test_loader,
             device,
-            vq2word_prob,
+            cand_table_eval,
+            cand_prob_eval,
+            cand_mask_eval,
         )
 
         print(
             f"[argmax-dict] "
             f"valid_word_ppl={valid['argmax_dict_word_ppl']:.2f} "
-            f"test_word_ppl={test['argmax_dict_word_ppl']:.2f}"
+            f"valid_cov={valid['argmax_dict_coverage']:.4f} "
+            f"test_word_ppl={test['argmax_dict_word_ppl']:.2f} "
+            f"test_cov={test['argmax_dict_coverage']:.4f}"
         )
         return
 
