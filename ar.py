@@ -738,6 +738,20 @@ def main():
     print(f"[base_vq_vocab_size] {base_vq_vocab_size}")
     print(f"[vq_pad_id] {vq_pad_id}")
     print(f"[vq_vocab_size incl pad] {vq_vocab_size}")
+    print("[CHECK] data keys:", data.keys())
+    print("[CHECK] dictionary keys:", raw_dict.keys())
+
+    print("[CHECK] vq_ids min:", int(data["vq_ids"].min()))
+    print("[CHECK] vq_ids max:", int(data["vq_ids"].max()))
+
+    if "vq_vocab_size" in raw_dict:
+        print("[CHECK] dictionary vq_vocab_size:", raw_dict["vq_vocab_size"])
+
+    if "compact_to_pair" in raw_dict:
+        print("[CHECK] len compact_to_pair:", len(raw_dict["compact_to_pair"]))
+
+    if "pair_to_compact" in raw_dict:
+        print("[CHECK] len pair_to_compact:", len(raw_dict["pair_to_compact"]))
     cand_table = None
     cand_mask = None
 
