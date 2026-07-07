@@ -41,6 +41,52 @@ class VQWordARDataset(Dataset):
             "vq_y": vq[1:],
         }
 
+@torch.no_grad()
+def debug_token_prob_sum(model, loader, device, word2vq_prob, max_print=20):
+    model.eval()
+    printed = 0
+
+    for tok_in, vq_in, tok_y, vq_y, attn_mask in loader:
+        tok_in = tok_in.to(device)
+        vq_in = vq_in.to(device)
+        tok_y = tok_y.to(device)
+        vq_y = vq_y.to(device)
+        attn_mask = attn_mask.to(device)
+
+        h, tok_logits, vq_logits = model(tok_in, vq_in, ~attn_mask)
+
+        log_vq_prob = F.log_softmax(vq_logits, dim=-1)
+        flat_log_vq = log_vq_prob.reshape(-1, log_vq_prob.size(-1))
+        flat_tok = tok_y.reshape(-1)
+        flat_vq = vq_y.reshape(-1)
+
+        valid = flat_tok.ne(-100)
+        flat_log_vq = flat_log_vq[valid]
+        flat_tok = flat_tok[valid]
+        flat_vq = flat_vq[valid]
+
+        for i in range(min(flat_tok.size(0), max_print)):
+            wid = int(flat_tok[i])
+            true_vq = int(flat_vq[i])
+
+            vqs = word2vq_prob.get(wid, None)
+            if vqs is None:
+                continue
+
+            p_true_vq = flat_log_vq[i, true_vq].exp().item()
+            p_token = torch.logsumexp(flat_log_vq[i, vqs], dim=0).exp().item()
+
+            print(
+                "wid", wid,
+                "n_vq", vqs.numel(),
+                "p_true_vq", p_true_vq,
+                "p_token_sum", p_token,
+                "ratio", p_token / max(p_true_vq, 1e-12),
+            )
+
+            printed += 1
+            if printed >= max_print:
+                return
 
 def collate(batch, pad_token_id, vq_pad_id):
     maxlen = max(len(x["tok_in"]) for x in batch)
@@ -997,7 +1043,13 @@ def main():
             word2vq_prob=word2vq_prob,
             vq_to_tok=vq_to_tok,
         )
-
+        debug_token_prob_sum(
+            model,
+            valid_loader,
+            device,
+            word2vq_prob,
+            max_print=30,
+        )
         print(
             f"[eval-only] "
             f"valid_vq_ppl={valid['vq_ppl']:.2f} "

@@ -1,36 +1,26 @@
-#!/usr/bin/env python3
 import torch
-import argparse
-from collections import Counter
+from collections import defaultdict, Counter
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--dict", default="/Users/taka/Downloads/tinystories_from_wikitext103_bpe_vqword_bpe_self03_pertok_f03_dictionary.pt")
-args = ap.parse_args()
+raw = torch.load("/Users/taka/tinystories_from_wikitext103_bpe_vqword_bpe_self03_pertok_f03_dictionary.pt", map_location="cpu")
 
-d = torch.load(args.dict, map_location="cpu")
+dict_entries = {
+    int(k): v
+    for k, v in raw.items()
+    if isinstance(k, int) or (isinstance(k, str) and k.isdigit())
+}
 
-sizes = [len(words) for words in d.values()]
+tok_to_vqs = defaultdict(list)
 
-print("===== Dictionary Statistics =====")
-print("VQ entries         :", len(sizes))
-print("Average candidates :", sum(sizes) / len(sizes))
-print("Max candidates     :", max(sizes))
+for vq_id, entries in dict_entries.items():
+    wid, word, cnt = entries[0]
+    tok_to_vqs[int(wid)].append(int(vq_id))
 
-cnt = Counter(sizes)
+sizes = [len(v) for v in tok_to_vqs.values()]
 
-print("\nDistribution")
-for k in sorted(cnt):
-    print(f"{k:3d} candidates : {cnt[k]}")
+print("num token covered:", len(tok_to_vqs))
+print("avg VQ per token:", sum(sizes) / len(sizes))
+print("max VQ per token:", max(sizes))
+print("size hist top:", Counter(sizes).most_common(20))
 
-print("\nTop ambiguous clusters")
-
-items = sorted(
-    d.items(),
-    key=lambda kv: len(kv[1]),
-    reverse=True,
-)
-
-for cid, words in items[:20]:
-    print(f"\nCluster {cid} ({len(words)} candidates)")
-    for wid, word, count in words[:10]:
-        print(f"  {count:6d}  {word}")
+for wid, vqs in sorted(tok_to_vqs.items(), key=lambda x: len(x[1]), reverse=True)[:20]:
+    print(wid, len(vqs), vqs[:10])
