@@ -16,13 +16,15 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
     centers_by_token = dictionary["centers_by_token"]
     pair_to_compact = dictionary.get("pair_to_compact", None)
 
+    centers_keys = set(int(k) for k in centers_by_token.keys())
+    missing = sorted(set(int(x) for x in tgt.unique().tolist()) - centers_keys)
+    print("[missing tokens]", len(missing), missing[:20])
+
+    if 7454 in missing:
+        print("[7454 is missing from centers_by_token]")
+
     if pair_to_compact is None:
         raise ValueError("per-token ckpt requires pair_to_compact")
-
-    centers_by_token = {
-        int(k): F.normalize(v.to(device).float(), dim=-1)
-        for k, v in centers_by_token.items()
-    }
 
     all_ids = []
 
@@ -40,8 +42,7 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
             mask = tb == tok
 
             if tok not in centers_by_token:
-                out[mask] = 0
-                continue
+                raise ValueError(f"token {tok} not in centers_by_token")
 
             c = centers_by_token[tok].float()
             zz = z[mask].float()
