@@ -182,11 +182,27 @@ def main():
     base = max(int(v) for v in assign_source["pair_to_compact"].values()) + 1
 
     centers_keys = set(int(k) for k in assign_source["centers_by_token"].keys())
-    missing_tokens = sorted(set(int(x) for x in tgt.tolist()) - centers_keys)
+    base = max(int(v) for v in assign_source["pair_to_compact"].values()) + 1
+
+    centers_keys = set(int(k) for k in assign_source["centers_by_token"].keys())
+
+    fallback_tokens = sorted(
+        tok for tok in range(vocab_size)
+        if tok not in centers_keys
+    )
+
     fallback_tok_to_vq = {
         tok: base + i
-        for i, tok in enumerate(missing_tokens)
+        for i, tok in enumerate(fallback_tokens)
     }
+
+    base_vq_vocab_size = base + len(fallback_tok_to_vq)
+    vq_pad_id = base_vq_vocab_size
+
+    print("[semantic_vq_size]", base)
+    print("[fallback_tokens]", len(fallback_tok_to_vq))
+    print("[base_vq_vocab_size]", base_vq_vocab_size)
+    print("[vq_pad_id]", vq_pad_id)
     print("[fallback tokens]", len(fallback_tok_to_vq))
 
     vq_ids = assign_ids_per_token(
@@ -214,9 +230,13 @@ def main():
                 (
                     int(tok),
                     tokenizer.decode([int(tok)]),
-                    int((tgt == tok).sum().item()),
+                    1,
                 )
             ]
+
+        raw_dict["vq_vocab_size"] = base_vq_vocab_size
+        raw_dict["vq_pad_id"] = vq_pad_id
+        raw_dict["fallback_tok_to_vq"] = fallback_tok_to_vq
 
         dict_out = args.out.replace("_ids.pt", "_dictionary.pt")
         torch.save(raw_dict, dict_out)
@@ -236,7 +256,8 @@ def main():
         "ckpt": args.ckpt,
         "tokenizer": tokenizer_name,
         "fallback_tok_to_vq": fallback_tok_to_vq,
-        "vq_vocab_size": int(vq_ids.max().item()) + 1,
+        "vq_vocab_size": base_vq_vocab_size,
+        "vq_pad_id": vq_pad_id,
     }, args.out)
 
     print(f"[save] {args.out}")
