@@ -335,39 +335,30 @@ def build_vq_candidate_table(raw_dict, vq_vocab_size, topk, device, pad_value=0)
 
     return cand, cand_mask
 
-def build_vq2word_prob(raw_dict, device, alpha=1e-6):
-    vq2word_prob = {}
+
+def build_word2vq_prob(raw_dict, token_vocab_size, device, alpha=1e-6):
+    word2vq = {}
 
     for vq_id, entries in raw_dict.items():
-
-        word_ids = []
-        counts = []
-
-        for wid, word, cnt in entries:
-            word_ids.append(int(wid))
-            counts.append(float(cnt))
-
-        word_ids = torch.tensor(
-            word_ids,
-            device=device,
-            dtype=torch.long,
-        )
-
         counts = torch.tensor(
-            counts,
+            [float(cnt) for wid, word, cnt in entries],
             device=device,
             dtype=torch.float32,
         )
-
         probs = counts + alpha
-        probs /= probs.sum()
+        probs = probs / probs.sum()
 
-        vq2word_prob[int(vq_id)] = (
-            word_ids,
-            probs,
+        for j, (wid, word, cnt) in enumerate(entries):
+            wid = int(wid)
+            word2vq.setdefault(wid, []).append((int(vq_id), probs[j].item()))
+
+    return {
+        wid: (
+            torch.tensor([x[0] for x in pairs], device=device, dtype=torch.long),
+            torch.tensor([x[1] for x in pairs], device=device, dtype=torch.float32),
         )
-
-    return vq2word_prob
+        for wid, pairs in word2vq.items()
+    }
 
 
 @torch.no_grad()
@@ -382,6 +373,7 @@ def evaluate(
     vq2word_prob=None,
     cand_table=None,
     cand_mask=None,
+    word2vq_prob=None
 ):
     model.eval()
     total_tok_loss = 0.0
@@ -407,11 +399,11 @@ def evaluate(
         h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
         full_tok_logits = model.tok_head(h)
 
-        if vq2word_prob is not None:
-            dloss, n = dict_word_ce(
+        if word2vq_prob is not None:
+            dloss, n = dict_word_ce_fast(
                 vq_logits,
                 tok_y,
-                vq2word_prob,
+                word2vq_prob,
             )
 
             total_dict_loss += dloss.item()
@@ -608,34 +600,33 @@ def evaluate_argmax_vq_dict_ppl_fast(model, loader, device, cand_table, cand_pro
     }
 
 @torch.no_grad()
-def dict_word_ce(vq_logits, tok_y, vq2word_prob):
-    vq_prob = torch.softmax(vq_logits, dim=-1)
-    B,T,V = vq_prob.shape
-    vq_prob = vq_prob.reshape(B*T,V)
-    tok_y = tok_y.reshape(B*T)
-    valid = tok_y != -100
-    vq_prob = vq_prob[valid]
-    tok_y = tok_y[valid]
-    p = torch.zeros(
-        tok_y.size(0),
-        device=vq_logits.device,
-    )
+def dict_word_ce_fast(vq_logits, tok_y, word2vq_prob):
+    log_vq_prob = F.log_softmax(vq_logits, dim=-1)
 
-    for vq_id,(word_ids,word_probs) in vq2word_prob.items():
-        hit = word_ids[None,:].eq(tok_y[:,None])
-        keep = hit.any(dim=1)
-        if keep.sum()==0:
+    flat_log_vq = log_vq_prob.reshape(-1, log_vq_prob.size(-1))
+    flat_tok_y = tok_y.reshape(-1)
+
+    valid = flat_tok_y.ne(-100)
+    flat_log_vq = flat_log_vq[valid]
+    flat_tok_y = flat_tok_y[valid]
+
+    total_loss = 0.0
+    total_tok = flat_tok_y.numel()
+
+    for wid in flat_tok_y.unique().tolist():
+        vq_ids, probs = word2vq_prob.get(int(wid), (None, None))
+        if vq_ids is None:
+            idx = flat_tok_y.eq(wid)
+            total_loss += -math.log(1e-12) * idx.sum().item()
             continue
-        pos = hit[keep].float().argmax(dim=1)
-        p[keep] += (
-            vq_prob[keep,vq_id]
-            *
-            word_probs[pos]
-        )
-    p = p.clamp_min(1e-12)
-    loss = -torch.log(p).sum()
 
-    return loss, tok_y.numel()
+        idx = flat_tok_y.eq(wid)
+        lp = flat_log_vq[idx][:, vq_ids] + torch.log(probs)[None, :]
+        logp = torch.logsumexp(lp, dim=1)
+        total_loss += (-logp).sum().item()
+
+    return torch.tensor(total_loss, device=vq_logits.device), total_tok
+
 
 def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
     B, T, V = tok_logits.shape
@@ -749,10 +740,28 @@ def main():
             dict_vq_vocab_size = max(int(k) for k in raw_dict.keys()) + 1
             print(f"[dict_vq_vocab_size] {dict_vq_vocab_size}")
 
-        vq2word_prob = build_vq2word_prob(
-            raw_dict,
-            device,
-        )
+        if args.dictionary is not None:
+            raw_dict = torch.load(args.dictionary, map_location="cpu")
+
+            if len(raw_dict) > 0:
+                dict_vq_vocab_size = max(int(k) for k in raw_dict.keys()) + 1
+                print(f"[dict_vq_vocab_size] {dict_vq_vocab_size}")
+
+            DICT_TOPK = 32
+            vq2word_ids = {
+                int(vq_id): torch.tensor(
+                    [int(wid) for wid, word, count in entries[:DICT_TOPK]],
+                    device=device,
+                    dtype=torch.long,
+                )
+                for vq_id, entries in raw_dict.items()
+            }
+
+            print(f"[dictionary] loaded {len(vq2word_ids)} VQ entries")
+
+        else:
+            raw_dict = None
+            vq2word_ids = None
 
         DICT_TOPK = 32
         vq2word_ids = {
@@ -793,7 +802,16 @@ def main():
         pad_token_id = int(data.get("pad_token_id", 0))
 
     print(f"[pad_token_id] {pad_token_id}")
+    word2vq_prob = None
 
+    if raw_dict is not None:
+        word2vq_prob = build_word2vq_prob(
+            raw_dict,
+            token_vocab_size,
+            device,
+        )
+
+        print(f"[word2vq_prob] loaded {len(word2vq_prob)} token entries")
     if args.vq_vocab_size is not None:
         base_vq_vocab_size = args.vq_vocab_size
     elif "vq_vocab_size" in data:
@@ -946,6 +964,7 @@ def main():
             vq2word_prob=vq2word_prob,
             cand_table=cand_table,
             cand_mask=cand_mask,
+            word2vq_prob=word2vq_prob,
         )
 
         test = evaluate(
@@ -959,6 +978,7 @@ def main():
             vq2word_prob=vq2word_prob,
             cand_table=cand_table,
             cand_mask=cand_mask,
+            word2vq_prob=word2vq_prob,
         )
 
         print(
