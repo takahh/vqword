@@ -188,12 +188,13 @@ def main():
     print(f"[data] windows={len(tgt):,}")
 
     assign_source = ckpt
-
+    print(ckpt.keys())
     if "centers_by_token" not in assign_source:
         raise ValueError("ckpt does not contain centers_by_token")
 
-    base = max(int(v) for v in dictionary["pair_to_compact"].values()) + 1
-    centers_keys = set(int(k) for k in dictionary["centers_by_token"].keys())
+    base = max(int(v) for v in assign_source["pair_to_compact"].values()) + 1
+
+    centers_keys = set(int(k) for k in assign_source["centers_by_token"].keys())
     missing_tokens = sorted(set(int(x) for x in tgt.tolist()) - centers_keys)
     fallback_tok_to_vq = {
         tok: base + i
