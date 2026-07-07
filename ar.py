@@ -447,13 +447,11 @@ def evaluate(
             main_loss = tok_loss + aux_lambda * vq_loss
 
         total_tok_loss += tok_loss.item()
-        total_tok_full_loss += tok_full_loss.item()
         total_vq_loss += vq_loss.item()
         total_main_loss += main_loss.item()
         total_tok += n
 
     tok_ce = total_tok_loss / max(total_tok, 1)
-    tok_full_ce = total_tok_full_loss / max(total_tok, 1)
     vq_ce = total_vq_loss / max(total_tok, 1)
     main_ce = total_main_loss / max(total_tok, 1)
     dict_ce = total_dict_loss / max(total_dict_tok, 1)
@@ -465,8 +463,6 @@ def evaluate(
         "tok_ppl": math.exp(min(tok_ce, 20)),
         "vq_loss": vq_ce,
         "vq_ppl": math.exp(min(vq_ce, 20)),
-        "tok_full_loss": tok_full_ce,
-        "tok_full_ppl": math.exp(min(tok_full_ce, 20)),
         "dict_word_loss": dict_ce,
         "dict_word_ppl": math.exp(min(dict_ce, 20)),
     }
