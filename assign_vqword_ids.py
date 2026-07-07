@@ -10,7 +10,7 @@ from train_vqword import VQWordGNN, make_windows
 
 
 @torch.no_grad()
-def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
+def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device, fallback_tok_to_vq):
     model.eval()
 
     centers_by_token = dictionary["centers_by_token"]
@@ -41,8 +41,25 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device):
             tok = int(tok)
             mask = tb == tok
 
-            if tok not in centers_by_token:
-                raise ValueError(f"token {tok} not in centers_by_token")
+            for tok in tb.unique().tolist():
+                tok = int(tok)
+                mask = tb == tok
+
+                if tok not in centers_by_token:
+                    out[mask] = fallback_tok_to_vq[tok]
+                    continue
+
+                c = centers_by_token[tok].float()
+                zz = z[mask].float()
+                sim = zz @ c.T
+                local_id = sim.argmax(dim=1)
+
+                ids = [
+                    int(pair_to_compact[(tok, int(lid))])
+                    for lid in local_id.detach().cpu().tolist()
+                ]
+
+                out[mask] = torch.tensor(ids, dtype=torch.long, device=device)
 
             c = centers_by_token[tok].float()
             zz = z[mask].float()
@@ -175,6 +192,15 @@ def main():
     if "centers_by_token" not in assign_source:
         raise ValueError("ckpt does not contain centers_by_token")
 
+    base = max(int(v) for v in dictionary["pair_to_compact"].values()) + 1
+    centers_keys = set(int(k) for k in dictionary["centers_by_token"].keys())
+    missing_tokens = sorted(set(int(x) for x in tgt.tolist()) - centers_keys)
+    fallback_tok_to_vq = {
+        tok: base + i
+        for i, tok in enumerate(missing_tokens)
+    }
+    print("[fallback tokens]", len(fallback_tok_to_vq))
+
     vq_ids = assign_ids_per_token(
         model,
         assign_source,
@@ -182,6 +208,7 @@ def main():
         tgt,
         args.batch_size,
         device,
+        fallback_tok_to_vq,
     )
     samples = []
     for sample_idx, start, end, n_tok in offsets:
