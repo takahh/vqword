@@ -602,19 +602,31 @@ def dict_word_ce_fast(vq_logits, tok_y, word2vq_prob):
     total_tok = flat_tok_y.numel()
 
     for wid in flat_tok_y.unique().tolist():
-        vq_ids, probs = word2vq_prob.get(int(wid), (None, None))
-        if vq_ids is None:
-            idx = flat_tok_y.eq(wid)
+        vq_ids = word2vq_prob.get(int(wid), None)
+
+        idx = flat_tok_y.eq(wid)
+
+        if vq_ids is None or vq_ids.numel() == 0:
             total_loss += -math.log(1e-12) * idx.sum().item()
             continue
 
-        idx = flat_tok_y.eq(wid)
-        lp = flat_log_vq[idx][:, vq_ids] + torch.log(probs)[None, :]
-        logp = torch.logsumexp(lp, dim=1)
+        logp = torch.logsumexp(flat_log_vq[idx][:, vq_ids], dim=1)
         total_loss += (-logp).sum().item()
 
     return torch.tensor(total_loss, device=vq_logits.device), total_tok
 
+def build_word2vq_unique(raw_dict, device):
+    word2vq = {}
+
+    for vq_id, entries in raw_dict.items():
+        wid, word, cnt = entries[0]  # VQ -> BPE は一意
+        wid = int(wid)
+        word2vq.setdefault(wid, []).append(int(vq_id))
+
+    return {
+        wid: torch.tensor(vqs, device=device, dtype=torch.long)
+        for wid, vqs in word2vq.items()
+    }
 
 def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
     B, T, V = tok_logits.shape
@@ -769,9 +781,8 @@ def main():
     word2vq_prob = None
 
     if raw_dict is not None:
-        word2vq_prob = build_word2vq_prob(
+        word2vq_prob = build_word2vq_unique(
             raw_dict,
-            token_vocab_size,
             device,
         )
 
