@@ -373,7 +373,8 @@ def evaluate(
     vq2word_prob=None,
     cand_table=None,
     cand_mask=None,
-    word2vq_prob=None
+    word2vq_prob=None,
+    vq_to_tok=None,
 ):
     model.eval()
     total_tok_loss = 0.0
@@ -394,6 +395,34 @@ def evaluate(
         tok_y = tok_y.to(device)
         vq_y = vq_y.to(device)
         attn_mask = attn_mask.to(device)
+        if word2vq_prob is not None:
+            flat_tok = tok_y.reshape(-1)
+            flat_vq = vq_y.reshape(-1)
+            valid_align = flat_tok.ne(-100) & flat_vq.ne(-100)
+
+            flat_tok = flat_tok[valid_align]
+            flat_vq = flat_vq[valid_align]
+
+            mapped_tok = vq_to_tok[flat_vq]
+            ok = mapped_tok.eq(flat_tok)
+
+            print(
+                "[ALIGN]",
+                ok.float().mean().item(),
+                "bad",
+                (~ok).sum().item(),
+                "total",
+                ok.numel(),
+            )
+            print(
+                "examples",
+                list(zip(
+                    flat_vq[~ok][:10].tolist(),
+                    mapped_tok[~ok][:10].tolist(),
+                    flat_tok[~ok][:10].tolist(),
+                ))
+            )
+            return
 
         key_padding_mask = ~attn_mask
         h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
@@ -628,6 +657,20 @@ def build_word2vq_unique(raw_dict, device):
         for wid, vqs in word2vq.items()
     }
 
+def build_vq_to_tok(raw_dict, vq_vocab_size, device):
+    vq_to_tok = torch.full(
+        (vq_vocab_size,),
+        -1,
+        device=device,
+        dtype=torch.long,
+    )
+
+    for vq_id, entries in raw_dict.items():
+        wid, word, cnt = entries[0]
+        vq_to_tok[int(vq_id)] = int(wid)
+
+    return vq_to_tok
+
 def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
     B, T, V = tok_logits.shape
     flat_logits = tok_logits.reshape(B * T, V)
@@ -839,6 +882,15 @@ def main():
             pad_value=pad_token_id,
         )
         print(f"[candidate table] {cand_table.shape}")
+
+    vq_to_tok = None
+    if raw_dict is not None:
+        vq_to_tok = build_vq_to_tok(
+            raw_dict,
+            vq_vocab_size_incl_pad,
+            device,
+        )
+
     random.shuffle(samples)
     n = len(samples)
     n_train = int(n * 0.8)
@@ -939,6 +991,7 @@ def main():
             cand_table=cand_table,
             cand_mask=cand_mask,
             word2vq_prob=word2vq_prob,
+            vq_to_tok=vq_to_tok,
         )
 
         test = evaluate(
@@ -952,6 +1005,7 @@ def main():
             cand_table=cand_table,
             cand_mask=cand_mask,
             word2vq_prob=word2vq_prob,
+            vq_to_tok=vq_to_tok,
         )
 
         print(
@@ -981,6 +1035,20 @@ def main():
             tok_y = tok_y.to(device)
             vq_y = vq_y.to(device)
             attn_mask = attn_mask.to(device)
+            # tok_y, vq_y を device に送った後
+            flat_tok = tok_y.reshape(-1)
+            flat_vq = vq_y.reshape(-1)
+            valid = flat_tok.ne(-100) & flat_vq.ne(-100)
+
+            flat_tok = flat_tok[valid]
+            flat_vq = flat_vq[valid]
+
+            mapped_tok = vq_to_tok[flat_vq]
+            ok = mapped_tok.eq(flat_tok)
+
+            print("[ALIGN]", ok.float().mean().item(), "bad", (~ok).sum().item(), "total", ok.numel())
+            print("examples",
+                  list(zip(flat_vq[~ok][:10].tolist(), mapped_tok[~ok][:10].tolist(), flat_tok[~ok][:10].tolist())))
 
             key_padding_mask = ~attn_mask
             if vq_in.min() < 0 or vq_in.max() >= model.vq_emb.num_embeddings:
