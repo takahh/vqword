@@ -1100,10 +1100,8 @@ def main():
             print(
                 f"[eval] ep={ep} "
                 f"valid_tok_ppl={valid['tok_ppl']:.2f} "
-                f"valid_full_tok_ppl={valid['tok_full_ppl']:.2f} "
                 f"valid_vq_ppl={valid['vq_ppl']:.2f} "
                 f"test_tok_ppl={test['tok_ppl']:.2f} "
-                f"test_full_tok_ppl={test['tok_full_ppl']:.2f} "
                 f"test_vq_ppl={test['vq_ppl']:.2f}"
             )
 
