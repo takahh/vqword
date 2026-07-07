@@ -422,7 +422,7 @@ def evaluate(
                     flat_tok[~ok][:10].tolist(),
                 ))
             )
-            return
+            raise SystemExit
 
         key_padding_mask = ~attn_mask
         h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
