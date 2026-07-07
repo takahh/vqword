@@ -397,7 +397,6 @@ def evaluate(
 
         key_padding_mask = ~attn_mask
         h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
-        full_tok_logits = model.tok_head(h)
 
         if word2vq_prob is not None:
             dloss, n = dict_word_ce_fast(
@@ -408,13 +407,6 @@ def evaluate(
 
             total_dict_loss += dloss.item()
             total_dict_tok += n
-
-        tok_full_loss = F.cross_entropy(
-            full_tok_logits.reshape(-1, full_tok_logits.size(-1)),
-            tok_y.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
 
         if dict_loss and cand_table is not None:
             tok_loss = candidate_token_ce_from_hidden_fast(
@@ -1131,7 +1123,7 @@ def main():
                 f"valid_dict_word_ppl={valid['dict_word_ppl']:.2f} "
                 f"test_dict_word_ppl={test['dict_word_ppl']:.2f} "
             )
-        if vq2word_prob is not None:
+        if word2vq_prob is not None:
             print(
                 f"[dict] "
                 f"valid_word_ppl={valid['dict_word_ppl']:.2f} "
