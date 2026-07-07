@@ -770,11 +770,22 @@ def main():
 
     if args.dictionary is not None:
         raw_dict = torch.load(args.dictionary, map_location="cpu")
-        print(raw_dict[0][:10])
+    else:
+        raw_dict = None
 
-        if len(raw_dict) > 0:
-            dict_vq_vocab_size = max(int(k) for k in raw_dict.keys()) + 1
-            print(f"[dict_vq_vocab_size] {dict_vq_vocab_size}")
+    dict_entries = {
+        int(k): v
+        for k, v in raw_dict.items()
+        if isinstance(k, int) or (isinstance(k, str) and k.isdigit())
+    }
+
+    print(dict_entries[0][:10])
+
+    if len(dict_entries) > 0:
+        dict_vq_vocab_size = int(
+            raw_dict.get("vq_vocab_size", max(dict_entries.keys()) + 1)
+        )
+        print(f"[dict_vq_vocab_size] {dict_vq_vocab_size}")
 
         DICT_TOPK = 32
         vq2word_ids = {
@@ -783,7 +794,7 @@ def main():
                 device=device,
                 dtype=torch.long,
             )
-            for vq_id, entries in raw_dict.items()
+            for vq_id, entries in dict_entries.items()
         }
 
         print(f"[dictionary] loaded {len(vq2word_ids)} VQ entries")
@@ -819,10 +830,7 @@ def main():
     word2vq_prob = None
 
     if raw_dict is not None:
-        word2vq_prob = build_word2vq_unique(
-            raw_dict,
-            device,
-        )
+        word2vq_prob = build_word2vq_unique(dict_entries, device)
 
         print(f"[word2vq_prob] loaded {len(word2vq_prob)} token entries")
     if args.vq_vocab_size is not None:
@@ -836,12 +844,12 @@ def main():
         base_vq_vocab_size = max(base_vq_vocab_size, dict_vq_vocab_size)
 
     vq_pad_id = base_vq_vocab_size
-    vq_vocab_size = base_vq_vocab_size + 1
+    vq_vocab_size_incl_pad = vq_pad_id + 1
 
     print(f"[token_vocab_size] {token_vocab_size}")
     print(f"[base_vq_vocab_size] {base_vq_vocab_size}")
+    print(f"[vq_vocab_size incl pad] {vq_vocab_size_incl_pad}")
     print(f"[vq_pad_id] {vq_pad_id}")
-    print(f"[vq_vocab_size incl pad] {vq_vocab_size}")
     print("[CHECK] data keys:", data.keys())
     vq_max = max(int(s["vqword_ids"].max()) for s in samples)
     vq_min = min(int(s["vqword_ids"].min()) for s in samples)
@@ -849,29 +857,15 @@ def main():
     print("[CHECK] vq_ids min:", vq_min)
     print("[CHECK] vq_ids max:", vq_max)
 
-    if raw_dict is not None and len(raw_dict) > 0:
-        dict_max = max(int(k) for k in raw_dict.keys())
-        print("[CHECK] dict vq_ids max:", dict_max)
-
-        # data側とdictionary側の大きい方に合わせる
-        vq_vocab_size = max(vq_max + 1, dict_max + 1)
-    else:
-        vq_vocab_size = vq_max + 1
-
-    vq_pad_id = vq_vocab_size
-    vq_vocab_size_incl_pad = vq_vocab_size + 1
-
-    print("[vq_vocab_size]", vq_vocab_size)
     print("[vq_pad_id]", vq_pad_id)
-    print("[vq_vocab_size incl pad]", vq_vocab_size_incl_pad)
 
     cand_table = None
     cand_mask = None
 
     if raw_dict is not None:
         cand_table, cand_mask = build_vq_candidate_table(
-            raw_dict=raw_dict,
-            vq_vocab_size=vq_vocab_size,
+            raw_dict=dict_entries,
+            vq_vocab_size=base_vq_vocab_size,
             topk=16,
             device=device,
             pad_value=pad_token_id,
@@ -881,7 +875,7 @@ def main():
     vq_to_tok = None
     if raw_dict is not None:
         vq_to_tok = build_vq_to_tok(
-            raw_dict,
+            dict_entries,
             vq_vocab_size_incl_pad,
             device,
         )
@@ -1031,7 +1025,7 @@ def main():
             tok_y = tok_y.to(device)
             vq_y = vq_y.to(device)
             attn_mask = attn_mask.to(device)
-            
+
             key_padding_mask = ~attn_mask
             if vq_in.min() < 0 or vq_in.max() >= model.vq_emb.num_embeddings:
                 print("[BAD vq_in]")
@@ -1205,7 +1199,7 @@ def main():
                 "tokenizer": tokenizer_name,
                 "token_vocab_size": token_vocab_size,
                 "base_vq_vocab_size": base_vq_vocab_size,
-                "vq_vocab_size": vq_vocab_size,
+                "vq_vocab_size": base_vq_vocab_size,
                 "vq_pad_id": vq_pad_id,
                 "pad_token_id": pad_token_id,
                 "valid_loss": valid_loss,
@@ -1218,7 +1212,7 @@ def main():
             "model": model.state_dict(),
             "args": vars(args),
             "tokenizer": tokenizer_name,
-            "vq_vocab_size": vq_vocab_size,
+            "vq_vocab_size": base_vq_vocab_size,
             "vq_pad_id": vq_pad_id,
             "pad_token_id": pad_token_id,
             "valid_loss": valid_loss,
