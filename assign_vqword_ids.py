@@ -60,18 +60,6 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device, fallba
 
             out[mask] = torch.tensor(ids, dtype=torch.long, device=device)
 
-            c = centers_by_token[tok].float()
-            zz = z[mask].float()
-            sim = zz @ c.T
-            local_id = sim.argmax(dim=1)
-
-            ids = [
-                int(pair_to_compact[(tok, int(lid))])
-                for lid in local_id.detach().cpu().tolist()
-            ]
-
-            out[mask] = torch.tensor(ids, dtype=torch.long, device=device)
-
         all_ids.append(out.cpu())
 
     return torch.cat(all_ids, dim=0)
