@@ -15,7 +15,10 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device, fallba
 
     centers_by_token = dictionary["centers_by_token"]
     pair_to_compact = dictionary.get("pair_to_compact", None)
-
+    centers_by_token = {
+        int(k): F.normalize(v.to(device).float(), dim=-1)
+        for k, v in centers_by_token.items()
+    }
     centers_keys = set(int(k) for k in centers_by_token.keys())
     missing = sorted(set(int(x) for x in tgt.unique().tolist()) - centers_keys)
     print("[missing tokens]", len(missing), missing[:20])
