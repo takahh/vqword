@@ -21,6 +21,12 @@ class VQWordARDataset(Dataset):
 
             if len(tok) >= 4:
                 self.samples.append((tok, vq))
+        # VQWordARDataset.__init__ の中
+        if len(tok) != len(vq):
+            print("[LEN MISMATCH]", len(tok), len(vq))
+            print(tok[:20])
+            print(vq[:20])
+            raise SystemExit
 
     def __len__(self):
         return len(self.samples)
@@ -771,6 +777,13 @@ def main():
 
     data = torch.load(args.data, map_location="cpu")
     samples = data["samples"]
+    for s in samples[:5]:
+        tok = s["token_ids"].long()
+        vq = s["vqword_ids"].long()
+        print("len", len(tok), len(vq))
+        print("tok[:20]", tok[:20].tolist())
+        print("vq [:20]", vq[:20].tolist())
+        print()
 
     dict_vq_vocab_size = None
 
