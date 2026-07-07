@@ -44,25 +44,21 @@ def assign_ids_per_token(model, dictionary, ctx, tgt, batch_size, device, fallba
             tok = int(tok)
             mask = tb == tok
 
-            for tok in tb.unique().tolist():
-                tok = int(tok)
-                mask = tb == tok
+            if tok not in centers_by_token:
+                out[mask] = fallback_tok_to_vq[tok]
+                continue
 
-                if tok not in centers_by_token:
-                    out[mask] = fallback_tok_to_vq[tok]
-                    continue
+            c = centers_by_token[tok].float()
+            zz = z[mask].float()
+            sim = zz @ c.T
+            local_id = sim.argmax(dim=1)
 
-                c = centers_by_token[tok].float()
-                zz = z[mask].float()
-                sim = zz @ c.T
-                local_id = sim.argmax(dim=1)
+            ids = [
+                int(pair_to_compact[(tok, int(lid))])
+                for lid in local_id.detach().cpu().tolist()
+            ]
 
-                ids = [
-                    int(pair_to_compact[(tok, int(lid))])
-                    for lid in local_id.detach().cpu().tolist()
-                ]
-
-                out[mask] = torch.tensor(ids, dtype=torch.long, device=device)
+            out[mask] = torch.tensor(ids, dtype=torch.long, device=device)
 
             c = centers_by_token[tok].float()
             zz = z[mask].float()
@@ -222,6 +218,21 @@ def main():
             "vqword_ids": vq_ids[start:end].cpu(),
             "length": n_tok,
         })
+    if args.dictionary is not None:
+        raw_dict = torch.load(args.dictionary, map_location="cpu")
+
+        for tok, vq_id in fallback_tok_to_vq.items():
+            raw_dict[int(vq_id)] = [
+                (
+                    int(tok),
+                    tokenizer.decode([int(tok)]),
+                    int((tgt == tok).sum().item()),
+                )
+            ]
+
+        dict_out = args.out.replace("_ids.pt", "_dictionary.pt")
+        torch.save(raw_dict, dict_out)
+        print("[save dictionary with fallback]", dict_out)
 
     torch.save({
         "samples": samples,
