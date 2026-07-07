@@ -624,6 +624,9 @@ def main():
     ctx = torch.cat(all_ctx, dim=0)
     tgt = torch.cat(all_tgt, dim=0)
 
+    print("7454 in tgt?", 7454 in torch.unique(tgt).tolist())
+    print("unique tokens in tgt =", len(torch.unique(tgt)))
+    
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
