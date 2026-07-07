@@ -235,6 +235,8 @@ def main():
         "hop": cargs["hop"],
         "ckpt": args.ckpt,
         "tokenizer": tokenizer_name,
+        "fallback_tok_to_vq": fallback_tok_to_vq,
+        "vq_vocab_size": int(vq_ids.max().item()) + 1,
     }, args.out)
 
     print(f"[save] {args.out}")
