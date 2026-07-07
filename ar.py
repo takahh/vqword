@@ -729,8 +729,6 @@ def main():
     data = torch.load(args.data, map_location="cpu")
     samples = data["samples"]
 
-    vq2word_prob = None
-
     dict_vq_vocab_size = None
 
     if args.dictionary is not None:
@@ -739,29 +737,6 @@ def main():
         if len(raw_dict) > 0:
             dict_vq_vocab_size = max(int(k) for k in raw_dict.keys()) + 1
             print(f"[dict_vq_vocab_size] {dict_vq_vocab_size}")
-
-        if args.dictionary is not None:
-            raw_dict = torch.load(args.dictionary, map_location="cpu")
-
-            if len(raw_dict) > 0:
-                dict_vq_vocab_size = max(int(k) for k in raw_dict.keys()) + 1
-                print(f"[dict_vq_vocab_size] {dict_vq_vocab_size}")
-
-            DICT_TOPK = 32
-            vq2word_ids = {
-                int(vq_id): torch.tensor(
-                    [int(wid) for wid, word, count in entries[:DICT_TOPK]],
-                    device=device,
-                    dtype=torch.long,
-                )
-                for vq_id, entries in raw_dict.items()
-            }
-
-            print(f"[dictionary] loaded {len(vq2word_ids)} VQ entries")
-
-        else:
-            raw_dict = None
-            vq2word_ids = None
 
         DICT_TOPK = 32
         vq2word_ids = {
@@ -772,6 +747,7 @@ def main():
             )
             for vq_id, entries in raw_dict.items()
         }
+
         print(f"[dictionary] loaded {len(vq2word_ids)} VQ entries")
 
     else:
@@ -961,7 +937,6 @@ def main():
             main_target="vq",
             vq2word_ids=vq2word_ids,
             dict_loss=False,
-            vq2word_prob=vq2word_prob,
             cand_table=cand_table,
             cand_mask=cand_mask,
             word2vq_prob=word2vq_prob,
@@ -975,7 +950,6 @@ def main():
             main_target="vq",
             vq2word_ids=vq2word_ids,
             dict_loss=False,
-            vq2word_prob=vq2word_prob,
             cand_table=cand_table,
             cand_mask=cand_mask,
             word2vq_prob=word2vq_prob,
@@ -1099,7 +1073,7 @@ def main():
                 args.main_target,
                 vq2word_ids=vq2word_ids,
                 dict_loss=args.dict_loss,
-                vq2word_prob=vq2word_prob,
+                word2vq_prob=word2vq_prob,
                 cand_table=cand_table,
                 cand_mask=cand_mask,
             )
@@ -1109,7 +1083,7 @@ def main():
                 args.aux_lambda, args.main_target,
                 vq2word_ids=vq2word_ids,
                 dict_loss=args.dict_loss,
-                vq2word_prob=vq2word_prob,
+                word2vq_prob=word2vq_prob,
                 cand_table=cand_table,
                 cand_mask=cand_mask,
             )
