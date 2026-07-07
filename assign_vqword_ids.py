@@ -173,15 +173,15 @@ def main():
     tgt = torch.cat(all_tgt, dim=0)
 
     print(f"[data] windows={len(tgt):,}")
-
     assign_source = ckpt
     print(ckpt.keys())
+
     if "centers_by_token" not in assign_source:
         raise ValueError("ckpt does not contain centers_by_token")
 
-    base = max(int(v) for v in assign_source["pair_to_compact"].values()) + 1
+    if "pair_to_compact" not in assign_source:
+        raise ValueError("ckpt does not contain pair_to_compact")
 
-    centers_keys = set(int(k) for k in assign_source["centers_by_token"].keys())
     base = max(int(v) for v in assign_source["pair_to_compact"].values()) + 1
 
     centers_keys = set(int(k) for k in assign_source["centers_by_token"].keys())
@@ -203,7 +203,6 @@ def main():
     print("[fallback_tokens]", len(fallback_tok_to_vq))
     print("[base_vq_vocab_size]", base_vq_vocab_size)
     print("[vq_pad_id]", vq_pad_id)
-    print("[fallback tokens]", len(fallback_tok_to_vq))
 
     vq_ids = assign_ids_per_token(
         model,
