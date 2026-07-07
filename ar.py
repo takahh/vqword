@@ -15,18 +15,19 @@ class VQWordARDataset(Dataset):
             tok = s["token_ids"].long()
             vq = s["vqword_ids"].long()
 
+            # VQWordARDataset.__init__ の中
+            if len(tok) != len(vq):
+                print("[LEN MISMATCH]", len(tok), len(vq))
+                print(tok[:20])
+                print(vq[:20])
+                raise SystemExit
+
             # tok_in = tok[:-1] なので、元系列は max_len+1 まで許可
             if len(tok) > max_len + 1:
                 continue
 
             if len(tok) >= 4:
                 self.samples.append((tok, vq))
-        # VQWordARDataset.__init__ の中
-        if len(tok) != len(vq):
-            print("[LEN MISMATCH]", len(tok), len(vq))
-            print(tok[:20])
-            print(vq[:20])
-            raise SystemExit
 
     def __len__(self):
         return len(self.samples)
