@@ -776,6 +776,7 @@ def main():
 
     if args.dictionary is not None:
         raw_dict = torch.load(args.dictionary, map_location="cpu")
+        print(raw_dict[0][:10])
 
         if len(raw_dict) > 0:
             dict_vq_vocab_size = max(int(k) for k in raw_dict.keys()) + 1
