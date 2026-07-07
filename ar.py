@@ -382,6 +382,7 @@ def evaluate(
     cand_mask=None,
     word2vq_prob=None,
     vq_to_tok=None,
+    check_align=False
 ):
     model.eval()
     total_tok_loss = 0.0
@@ -409,27 +410,6 @@ def evaluate(
 
             flat_tok = flat_tok[valid_align]
             flat_vq = flat_vq[valid_align]
-
-            mapped_tok = vq_to_tok[flat_vq]
-            ok = mapped_tok.eq(flat_tok)
-
-            print(
-                "[ALIGN]",
-                ok.float().mean().item(),
-                "bad",
-                (~ok).sum().item(),
-                "total",
-                ok.numel(),
-            )
-            print(
-                "examples",
-                list(zip(
-                    flat_vq[~ok][:10].tolist(),
-                    mapped_tok[~ok][:10].tolist(),
-                    flat_tok[~ok][:10].tolist(),
-                ))
-            )
-            raise SystemExit
 
         key_padding_mask = ~attn_mask
         h, tok_logits, vq_logits = model(tok_in, vq_in, key_padding_mask)
@@ -1007,6 +987,7 @@ def main():
             cand_mask=cand_mask,
             word2vq_prob=word2vq_prob,
             vq_to_tok=vq_to_tok,
+            check_align=True
         )
 
         test = evaluate(
@@ -1050,21 +1031,7 @@ def main():
             tok_y = tok_y.to(device)
             vq_y = vq_y.to(device)
             attn_mask = attn_mask.to(device)
-            # tok_y, vq_y を device に送った後
-            flat_tok = tok_y.reshape(-1)
-            flat_vq = vq_y.reshape(-1)
-            valid = flat_tok.ne(-100) & flat_vq.ne(-100)
-
-            flat_tok = flat_tok[valid]
-            flat_vq = flat_vq[valid]
-
-            mapped_tok = vq_to_tok[flat_vq]
-            ok = mapped_tok.eq(flat_tok)
-
-            print("[ALIGN]", ok.float().mean().item(), "bad", (~ok).sum().item(), "total", ok.numel())
-            print("examples",
-                  list(zip(flat_vq[~ok][:10].tolist(), mapped_tok[~ok][:10].tolist(), flat_tok[~ok][:10].tolist())))
-
+            
             key_padding_mask = ~attn_mask
             if vq_in.min() < 0 or vq_in.max() >= model.vq_emb.num_embeddings:
                 print("[BAD vq_in]")
