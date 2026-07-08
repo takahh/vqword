@@ -551,7 +551,7 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
 
             sums = torch.zeros_like(centers)
             counts = torch.zeros(k, device=device)
-
+            y = y.to(sums.device)
             sums.index_add_(0, y, z)
             counts.index_add_(0, y, torch.ones_like(y, dtype=torch.float))
 
