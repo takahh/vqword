@@ -816,14 +816,18 @@ def main():
 
     if args.dictionary is not None:
         raw_dict = torch.load(args.dictionary, map_location="cpu")
+
+        dict_entries = {
+            int(k): v
+            for k, v in raw_dict.items()
+            if isinstance(k, int) or (isinstance(k, str) and k.isdigit())
+        }
+
+        print(dict_entries[0][:10])
+
     else:
         raw_dict = None
-
-    dict_entries = {
-        int(k): v
-        for k, v in raw_dict.items()
-        if isinstance(k, int) or (isinstance(k, str) and k.isdigit())
-    }
+        dict_entries = {}
 
     print(dict_entries[0][:10])
 
