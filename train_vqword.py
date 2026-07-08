@@ -447,6 +447,22 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
         for _ in range(args.kmeans_iters):
             sim = z @ centers.T
             y = sim.argmax(dim=1)
+            # -----------------------------
+            # save visualization data
+            # -----------------------------
+            if int(wid) == int(args.vis_token):
+                torch.save(
+                    {
+                        "wid": int(wid),
+                        "z": z.detach().cpu(),
+                        "centers": centers.detach().cpu(),
+                        "cluster": y.detach().cpu(),
+                        "idx": idx.detach().cpu(),
+                        "token_text": None,
+                    },
+                    args.vis_out,
+                )
+                print(f"[vis] saved token={wid} n={n} k={k} -> {args.vis_out}")
 
             sums = torch.zeros_like(centers)
             counts = torch.zeros(k, device=device)
@@ -563,6 +579,8 @@ def main():
         "--tokenizer",
         default="gpt2"
     )
+    ap.add_argument("--vis_token", type=int, default=-1)
+    ap.add_argument("--vis_out", default="vis_token.pt")
     ap.add_argument("--text_col", default="text")
     ap.add_argument("--dataset_config", default=None)
     ap.add_argument("--max_samples", type=int, default=20000)
