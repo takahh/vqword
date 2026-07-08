@@ -8,6 +8,52 @@ from tqdm import tqdm
 import numpy as np
 from transformers import AutoTokenizer
 
+
+@torch.no_grad()
+def init_centers_kmeanspp(z, k, k_block=4096):
+    """
+    z: [N, D], normalized
+    returns centers: [k, D]
+    cosine distance版 kmeans++
+    """
+    z = F.normalize(z.float(), dim=-1)
+    N, D = z.shape
+
+    centers = torch.empty((k, D), device=z.device, dtype=z.dtype)
+
+    # 1個目はランダム
+    first = torch.randint(0, N, (1,), device=z.device).item()
+    centers[0] = z[first]
+
+    # 各点の最近中心までの距離^2
+    # normalized cosine: dist^2 ≒ 2 - 2*cos
+    closest_dist = torch.full((N,), float("inf"), device=z.device)
+
+    for c in range(1, k):
+        new_center = centers[c - 1:c]
+
+        for s in range(0, N, k_block):
+            zz = z[s:s + k_block]
+            sim = (zz @ new_center.T).squeeze(1)
+            dist = (2.0 - 2.0 * sim).clamp_min(0.0)
+            closest_dist[s:s + k_block] = torch.minimum(
+                closest_dist[s:s + k_block],
+                dist,
+            )
+
+        total = closest_dist.sum()
+
+        if not torch.isfinite(total) or total <= 1e-12:
+            idx = torch.randint(0, N, (1,), device=z.device).item()
+        else:
+            probs = closest_dist / total
+            idx = torch.multinomial(probs, 1).item()
+
+        centers[c] = z[idx]
+
+    return F.normalize(centers, dim=-1)
+
+
 @torch.no_grad()
 def compute_cluster_metrics(y, K_req, topk=5):
     y = y.long().view(-1)
@@ -436,13 +482,11 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
         z = z_all[idx].to(device).float()
         z = F.normalize(z, dim=-1)
 
-        if n >= k:
-            sel = torch.randperm(n, device=device)[:k]
-        else:
-            sel = torch.randint(0, n, (k,), device=device)
-
-        centers = z[sel].clone()
-        centers = F.normalize(centers, dim=-1)
+        centers = init_centers_kmeanspp(
+            z=z,
+            k=k,
+            k_block=args.k_block,
+        )
 
         for _ in range(args.kmeans_iters):
             sim = z @ centers.T

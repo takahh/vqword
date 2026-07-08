@@ -7,7 +7,7 @@ from sklearn.decomposition import PCA
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True)
+    ap.add_argument("--input", default="/Users/taka/Documents/vis_token_284.pt")
     ap.add_argument("--out", default="vis_token.png")
     args = ap.parse_args()
 
