@@ -492,6 +492,47 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
             sim = z @ centers.T
             y = sim.argmax(dim=1)
             # -----------------------------
+            # prune near-duplicate centers
+            # -----------------------------
+            if k >= 2:
+                sim_cc = centers @ centers.T
+                dist_cc = (2.0 - 2.0 * sim_cc).clamp_min(0.0)
+
+                # 自分自身は除外
+                dist_cc.fill_diagonal_(float("inf"))
+
+                finite_dist = dist_cc[torch.isfinite(dist_cc)]
+                max_dist = finite_dist.max().item() if finite_dist.numel() else 0.0
+                scale = torch.quantile(finite_dist, 0.95).item()
+                thresh = scale * args.center_prune_frac
+
+                if max_dist > 0 and thresh > 0:
+                    counts = torch.bincount(y.to(device), minlength=k)
+
+                    keep = torch.ones(k, dtype=torch.bool, device=device)
+
+                    pairs = torch.nonzero(dist_cc < thresh, as_tuple=False)
+
+                    for a, b in pairs.tolist():
+                        if a >= b:
+                            continue
+                        if not keep[a] or not keep[b]:
+                            continue
+
+                        # 割当数が少ない方を消す
+                        if counts[a] <= counts[b]:
+                            keep[a] = False
+                        else:
+                            keep[b] = False
+
+                    if keep.sum().item() < k:
+                        centers = centers[keep]
+                        k = centers.size(0)
+
+                        sim = z @ centers.T
+                        y = sim.argmax(dim=1).cpu()
+
+            # -----------------------------
             # save visualization data
             # -----------------------------
             if int(wid) == int(args.vis_token):
@@ -646,6 +687,7 @@ def main():
     ap.add_argument("--max_clusters_per_token", type=int, default=8)
     ap.add_argument("--cluster_freq_power", type=float, default=0.5)
     ap.add_argument("--min_token_count", type=int, default=2)
+    ap.add_argument("--center_prune_frac", type=float, default=0.05)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
