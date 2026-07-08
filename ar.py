@@ -829,8 +829,6 @@ def main():
         raw_dict = None
         dict_entries = {}
 
-    print(dict_entries[0][:10])
-
     if len(dict_entries) > 0:
         dict_vq_vocab_size = int(
             raw_dict.get("vq_vocab_size", max(dict_entries.keys()) + 1)
