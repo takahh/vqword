@@ -4,7 +4,7 @@ import os
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer, GPT2TokenizerFast
+from tokenizers import ByteLevelBPETokenizer
 
 
 def main():
@@ -20,27 +20,22 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.tokenizer_out, exist_ok=True)
-    from tokenizers import ByteLevelBPETokenizer
 
-    tok = ByteLevelBPETokenizer(
+    tokenizer = ByteLevelBPETokenizer(
         args.vocab_file,
         args.merges_file,
     )
 
-    print("[test encode]", tok.encode("Once upon a time").ids[:20])
-    print("[vocab_size]", tok.get_vocab_size())
+    pad_id = tokenizer.token_to_id("<pad>")
+    unk_id = tokenizer.token_to_id("<unk>")
+    vocab_size = tokenizer.get_vocab_size()
 
-    tokenizer = tok
-    pad_id = tok.token_to_id("<pad>")
-    unk_id = tok.token_to_id("<unk>")
-    vocab_size = tok.get_vocab_size()
-
-    tok.save_pretrained(args.tokenizer_out)
-
-    print("[tokenizer]", args.tokenizer_out)
+    print("[test encode]", tokenizer.encode("Once upon a time").ids[:20])
     print("[vocab_size]", vocab_size)
     print("[pad_token_id]", pad_id)
     print("[unk_token_id]", unk_id)
+
+    tokenizer.save_model(args.tokenizer_out)
 
     ds = load_dataset(args.dataset, split=args.split)
 
@@ -50,6 +45,7 @@ def main():
 
     for i, ex in enumerate(tqdm(ds.select(range(min(args.max_samples, len(ds)))))):
         ids = tokenizer.encode(ex[args.text_col]).ids
+
         if len(ids) < 4:
             continue
 
@@ -68,6 +64,9 @@ def main():
         token_ids_flat.append(ids)
         offsets.append((i, start, end, len(ids)))
 
+    if len(token_ids_flat) == 0:
+        raise ValueError("No tokenized samples. tokenizer.encode() returned empty ids.")
+
     token_ids_flat = torch.cat(token_ids_flat, dim=0)
 
     torch.save({
@@ -79,7 +78,7 @@ def main():
         "id2word": None,
         "pad_token_id": pad_id,
         "unk_token_id": unk_id,
-        "vocab_type": f"bpe:{args.tokenizer_out}",
+        "vocab_type": f"bytelevel_bpe:{args.tokenizer_out}",
         "hop": None,
         "ckpt": None,
         "tokenizer": args.tokenizer_out,
