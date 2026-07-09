@@ -557,7 +557,8 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
         # -----------------------------
         # save visualization data
         # -----------------------------
-        if int(wid) == int(args.vis_token):
+        if int(wid) in args.vis_token_set:
+            vis_out = f"{args.vis_dir}/vis_token_{int(wid)}.pt"
             torch.save(
                 {
                     "wid": int(wid),
@@ -567,9 +568,9 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
                     "idx": idx.detach().cpu(),
                     "token_text": None,
                 },
-                args.vis_out,
+                vis_out,
             )
-            print(f"[vis] saved token={wid} n={n} k={k} -> {args.vis_out}")
+            print(f"[vis] saved token={wid} n={n} k={k} -> {vis_out}")
 
         # -----------------------------
         # compress local cluster ids
@@ -706,8 +707,14 @@ def main():
     ap.add_argument("--cluster_freq_power", type=float, default=0.5)
     ap.add_argument("--min_token_count", type=int, default=2)
     ap.add_argument("--center_prune_frac", type=float, default=0.05)
+    ap.add_argument("--vis_tokens", default="")
+    ap.add_argument("--vis_dir", default=".")
     args = ap.parse_args()
-
+    args.vis_token_set = set()
+    if args.vis_tokens:
+        args.vis_token_set = set(int(x) for x in args.vis_tokens.split(",") if x.strip())
+    elif args.vis_token >= 0:
+        args.vis_token_set = {int(args.vis_token)}
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
