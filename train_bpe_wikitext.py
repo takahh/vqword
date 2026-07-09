@@ -22,4 +22,4 @@ tokenizer.train(
     special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"],
 )
 
-tokenizer.save_model("bpe_wikitext103_32k")
+tokenizer.save_model("bpe_wikitext103_50k")
