@@ -29,9 +29,12 @@ def main():
         bos_token="<bos>",
         eos_token="<eos>",
     )
+    print("[tok vocab before save]", len(tok), tok.vocab_size)
+    print("[test encode]", tok.encode("Once upon a time", add_special_tokens=False))
+
     tok.save_pretrained(args.tokenizer_out)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_out)
+    tokenizer = tok
 
     pad_id = tokenizer.pad_token_id
     unk_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else pad_id
