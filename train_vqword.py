@@ -74,6 +74,65 @@ def compute_cluster_metrics(y, K_req, topk=5):
     }
 
 @torch.no_grad()
+def prune_centers_iterative(z, centers, prune_frac, kmeans_iters=2):
+    centers = F.normalize(centers.float(), dim=-1)
+
+    while centers.size(0) >= 3 and prune_frac > 0:
+        k = centers.size(0)
+
+        sim = z @ centers.T
+        y = sim.argmax(dim=1)
+        counts = torch.bincount(y, minlength=k)
+
+        sim_cc = centers @ centers.T
+        dist_cc = (2.0 - 2.0 * sim_cc).clamp_min(0.0)
+        dist_cc.fill_diagonal_(float("inf"))
+
+        finite_dist = dist_cc[torch.isfinite(dist_cc)]
+        if finite_dist.numel() == 0:
+            break
+
+        scale = torch.quantile(finite_dist, 0.95).item()
+        thresh = scale * prune_frac
+        if thresh <= 0:
+            break
+
+        pairs = torch.nonzero(dist_cc < thresh, as_tuple=False)
+        pairs = pairs[pairs[:, 0] < pairs[:, 1]]
+
+        if pairs.numel() == 0:
+            break
+
+        # 一番近いペアだけ削除対象にする
+        pair_dist = dist_cc[pairs[:, 0], pairs[:, 1]]
+        best = pair_dist.argmin()
+        a, b = pairs[best].tolist()
+
+        drop = a if counts[a] <= counts[b] else b
+        keep = torch.ones(k, dtype=torch.bool, device=centers.device)
+        keep[drop] = False
+
+        centers = centers[keep]
+        centers = F.normalize(centers, dim=-1)
+
+        # 削除後に少しだけ再収束
+        for _ in range(kmeans_iters):
+            sim = z @ centers.T
+            y = sim.argmax(dim=1)
+
+            sums = torch.zeros_like(centers)
+            counts = torch.zeros(centers.size(0), device=z.device)
+
+            sums.index_add_(0, y, z)
+            counts.index_add_(0, y, torch.ones_like(y, dtype=torch.float))
+
+            nonempty = counts > 0
+            centers[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1)
+            centers = F.normalize(centers, dim=-1)
+
+    return centers
+
+@torch.no_grad()
 def fit_kmeans_partitioned_streaming(model, ctx, tgt, batch_size, device, args):
     model.eval()
 
@@ -286,6 +345,65 @@ class VQWordGNN(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
         self.decoder = nn.Linear(d_model, vocab_size)
+
+    @torch.no_grad()
+    def prune_centers_iterative(z, centers, prune_frac, kmeans_iters=2):
+        centers = F.normalize(centers.float(), dim=-1)
+
+        while centers.size(0) >= 3 and prune_frac > 0:
+            k = centers.size(0)
+
+            sim = z @ centers.T
+            y = sim.argmax(dim=1)
+            counts = torch.bincount(y, minlength=k)
+
+            sim_cc = centers @ centers.T
+            dist_cc = (2.0 - 2.0 * sim_cc).clamp_min(0.0)
+            dist_cc.fill_diagonal_(float("inf"))
+
+            finite_dist = dist_cc[torch.isfinite(dist_cc)]
+            if finite_dist.numel() == 0:
+                break
+
+            scale = torch.quantile(finite_dist, 0.95).item()
+            thresh = scale * prune_frac
+            if thresh <= 0:
+                break
+
+            pairs = torch.nonzero(dist_cc < thresh, as_tuple=False)
+            pairs = pairs[pairs[:, 0] < pairs[:, 1]]
+
+            if pairs.numel() == 0:
+                break
+
+            # 一番近いペアだけ削除対象にする
+            pair_dist = dist_cc[pairs[:, 0], pairs[:, 1]]
+            best = pair_dist.argmin()
+            a, b = pairs[best].tolist()
+
+            drop = a if counts[a] <= counts[b] else b
+            keep = torch.ones(k, dtype=torch.bool, device=centers.device)
+            keep[drop] = False
+
+            centers = centers[keep]
+            centers = F.normalize(centers, dim=-1)
+
+            # 削除後に少しだけ再収束
+            for _ in range(kmeans_iters):
+                sim = z @ centers.T
+                y = sim.argmax(dim=1)
+
+                sums = torch.zeros_like(centers)
+                counts = torch.zeros(centers.size(0), device=z.device)
+
+                sums.index_add_(0, y, z)
+                counts.index_add_(0, y, torch.ones_like(y, dtype=torch.float))
+
+                nonempty = counts > 0
+                centers[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1)
+                centers = F.normalize(centers, dim=-1)
+
+        return centers
 
     def encode_context(self, ctx_ids):
         # ctx_ids: [B, 2hop+1]
@@ -511,42 +629,17 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
         # -----------------------------
         # prune near-duplicate centers only once after convergence
         # -----------------------------
+        # -----------------------------
+        # iterative prune
+        # -----------------------------
         if k >= 3 and args.center_prune_frac > 0:
-            sim = z @ centers.T
-            y = sim.argmax(dim=1)
-
-            sim_cc = centers @ centers.T
-            dist_cc = (2.0 - 2.0 * sim_cc).clamp_min(0.0)
-            dist_cc.fill_diagonal_(float("inf"))
-
-            finite_dist = dist_cc[torch.isfinite(dist_cc)]
-
-            if finite_dist.numel() > 0:
-                max_dist = finite_dist.max().item()
-                scale = torch.quantile(finite_dist, 0.95).item()
-                thresh = scale * args.center_prune_frac
-
-                if max_dist > 0 and thresh > 0:
-                    counts = torch.bincount(y.to(device), minlength=k)
-                    keep = torch.ones(k, dtype=torch.bool, device=device)
-
-                    pairs = torch.nonzero(dist_cc < thresh, as_tuple=False)
-
-                    for a, b in pairs.tolist():
-                        if a >= b:
-                            continue
-                        if not keep[a] or not keep[b]:
-                            continue
-
-                        if counts[a] <= counts[b]:
-                            keep[a] = False
-                        else:
-                            keep[b] = False
-
-                    if keep.sum().item() < k:
-                        centers = centers[keep]
-                        centers = F.normalize(centers, dim=-1)
-                        k = centers.size(0)
+            centers = prune_centers_iterative(
+                z=z,
+                centers=centers,
+                prune_frac=args.center_prune_frac,
+                kmeans_iters=2,
+            )
+            k = centers.size(0)
 
         # -----------------------------
         # final assignment
