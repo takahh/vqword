@@ -35,9 +35,6 @@ def main():
     unk_id = tok.token_to_id("<unk>")
     vocab_size = tok.get_vocab_size()
 
-    print("[tok vocab before save]", len(tok), tok.vocab_size)
-    print("[test encode]", tok.encode("Once upon a time", add_special_tokens=False))
-
     tok.save_pretrained(args.tokenizer_out)
 
     print("[tokenizer]", args.tokenizer_out)
