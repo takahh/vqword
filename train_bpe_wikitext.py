@@ -17,7 +17,7 @@ tokenizer = ByteLevelBPETokenizer()
 
 tokenizer.train(
     files=["wikitext103_train.txt"],
-    vocab_size=32768,
+    vocab_size=50257,
     min_frequency=2,
     special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"],
 )
