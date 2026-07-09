@@ -457,7 +457,6 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
 
     print("[per-token kmeans] collect embeddings")
     z_all = collect_embeddings(model, ctx, batch_size, device)
-    # z_all = F.normalize(z_all, dim=-1)
 
     tgt_cpu = tgt.cpu()
 
@@ -469,6 +468,7 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
         f"[per-token kmeans] tokens={len(unique_tokens):,} "
         f"maxK={args.max_clusters_per_token}"
     )
+
     for wid in tqdm(unique_tokens.tolist(), desc="[per-token kmeans]"):
         idx = torch.where(tgt_cpu == wid)[0]
         n = len(idx)
@@ -477,8 +477,10 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
             centers_by_token[int(wid)] = z_all[idx[:1]].clone()
             local_ids[idx] = 0
             continue
+
         k = choose_k_by_freq(n, args)
         k = min(k, n)
+
         z = z_all[idx].to(device).float()
         z = F.normalize(z, dim=-1)
 
@@ -488,27 +490,44 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
             k_block=args.k_block,
         )
 
+        # -----------------------------
+        # normal kmeans iterations
+        # -----------------------------
         for _ in range(args.kmeans_iters):
             sim = z @ centers.T
             y = sim.argmax(dim=1)
-            # -----------------------------
-            # prune near-duplicate centers
-            # -----------------------------
-            if k >= 2:
-                sim_cc = centers @ centers.T
-                dist_cc = (2.0 - 2.0 * sim_cc).clamp_min(0.0)
 
-                # 自分自身は除外
-                dist_cc.fill_diagonal_(float("inf"))
+            sums = torch.zeros_like(centers)
+            counts = torch.zeros(k, device=device)
 
-                finite_dist = dist_cc[torch.isfinite(dist_cc)]
-                max_dist = finite_dist.max().item() if finite_dist.numel() else 0.0
+            y_dev = y.to(device)
+            sums.index_add_(0, y_dev, z)
+            counts.index_add_(0, y_dev, torch.ones_like(y_dev, dtype=torch.float))
+
+            nonempty = counts > 0
+            centers[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1)
+            centers = F.normalize(centers, dim=-1)
+
+        # -----------------------------
+        # prune near-duplicate centers only once after convergence
+        # -----------------------------
+        if k >= 3 and args.center_prune_frac > 0:
+            sim = z @ centers.T
+            y = sim.argmax(dim=1)
+
+            sim_cc = centers @ centers.T
+            dist_cc = (2.0 - 2.0 * sim_cc).clamp_min(0.0)
+            dist_cc.fill_diagonal_(float("inf"))
+
+            finite_dist = dist_cc[torch.isfinite(dist_cc)]
+
+            if finite_dist.numel() > 0:
+                max_dist = finite_dist.max().item()
                 scale = torch.quantile(finite_dist, 0.95).item()
                 thresh = scale * args.center_prune_frac
 
                 if max_dist > 0 and thresh > 0:
                     counts = torch.bincount(y.to(device), minlength=k)
-
                     keep = torch.ones(k, dtype=torch.bool, device=device)
 
                     pairs = torch.nonzero(dist_cc < thresh, as_tuple=False)
@@ -519,7 +538,6 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
                         if not keep[a] or not keep[b]:
                             continue
 
-                        # 割当数が少ない方を消す
                         if counts[a] <= counts[b]:
                             keep[a] = False
                         else:
@@ -527,40 +545,31 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
 
                     if keep.sum().item() < k:
                         centers = centers[keep]
+                        centers = F.normalize(centers, dim=-1)
                         k = centers.size(0)
 
-                        sim = z @ centers.T
-                        y = sim.argmax(dim=1).cpu()
-
-            # -----------------------------
-            # save visualization data
-            # -----------------------------
-            if int(wid) == int(args.vis_token):
-                torch.save(
-                    {
-                        "wid": int(wid),
-                        "z": z.detach().cpu(),
-                        "centers": centers.detach().cpu(),
-                        "cluster": y.detach().cpu(),
-                        "idx": idx.detach().cpu(),
-                        "token_text": None,
-                    },
-                    args.vis_out,
-                )
-                print(f"[vis] saved token={wid} n={n} k={k} -> {args.vis_out}")
-
-            sums = torch.zeros_like(centers)
-            counts = torch.zeros(k, device=device)
-            y = y.to(sums.device)
-            sums.index_add_(0, y, z)
-            counts.index_add_(0, y, torch.ones_like(y, dtype=torch.float))
-
-            nonempty = counts > 0
-            centers[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1)
-            centers = F.normalize(centers, dim=-1)
-
+        # -----------------------------
+        # final assignment
+        # -----------------------------
         sim = z @ centers.T
         y = sim.argmax(dim=1).cpu()
+
+        # -----------------------------
+        # save visualization data
+        # -----------------------------
+        if int(wid) == int(args.vis_token):
+            torch.save(
+                {
+                    "wid": int(wid),
+                    "z": z.detach().cpu(),
+                    "centers": centers.detach().cpu(),
+                    "cluster": y.detach().cpu(),
+                    "idx": idx.detach().cpu(),
+                    "token_text": None,
+                },
+                args.vis_out,
+            )
+            print(f"[vis] saved token={wid} n={n} k={k} -> {args.vis_out}")
 
         # -----------------------------
         # compress local cluster ids
@@ -584,7 +593,6 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
 
     from collections import Counter
 
-    # K (= クラスタ数) の分布
     hist = Counter(len(v) for v in centers_by_token.values())
 
     print("\n[cluster count distribution]")
@@ -592,6 +600,7 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
         print(f"K={k}: {hist[k]:6d} tokens ({hist[k] / len(centers_by_token):6.2%})")
 
     return centers_by_token, local_ids
+
 
 def choose_k_by_freq(freq, args):
     if freq < args.min_token_count:
