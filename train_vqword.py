@@ -582,6 +582,15 @@ def fit_kmeans_per_token(model, ctx, tgt, batch_size, device, args):
         local_ids[idx] = y_compact
         centers_by_token[int(wid)] = centers_compact
 
+    from collections import Counter
+
+    # K (= クラスタ数) の分布
+    hist = Counter(len(v) for v in centers_by_token.values())
+
+    print("\n[cluster count distribution]")
+    for k in sorted(hist):
+        print(f"K={k}: {hist[k]:6d} tokens ({hist[k] / len(centers_by_token):6.2%})")
+
     return centers_by_token, local_ids
 
 def choose_k_by_freq(freq, args):
