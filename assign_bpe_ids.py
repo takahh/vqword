@@ -20,25 +20,25 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.tokenizer_out, exist_ok=True)
+    from tokenizers import ByteLevelBPETokenizer
 
-    tok = GPT2TokenizerFast(
-        vocab_file=args.vocab_file,
-        merges_file=args.merges_file,
-        pad_token="<pad>",
-        unk_token="<unk>",
-        bos_token="<bos>",
-        eos_token="<eos>",
+    tok = ByteLevelBPETokenizer(
+        args.vocab_file,
+        args.merges_file,
     )
+
+    print("[test encode]", tok.encode("Once upon a time").ids[:20])
+    print("[vocab_size]", tok.get_vocab_size())
+
+    tokenizer = tok
+    pad_id = tok.token_to_id("<pad>")
+    unk_id = tok.token_to_id("<unk>")
+    vocab_size = tok.get_vocab_size()
+
     print("[tok vocab before save]", len(tok), tok.vocab_size)
     print("[test encode]", tok.encode("Once upon a time", add_special_tokens=False))
 
     tok.save_pretrained(args.tokenizer_out)
-
-    tokenizer = tok
-
-    pad_id = tokenizer.pad_token_id
-    unk_id = tokenizer.unk_token_id if tokenizer.unk_token_id is not None else pad_id
-    vocab_size = len(tokenizer)
 
     print("[tokenizer]", args.tokenizer_out)
     print("[vocab_size]", vocab_size)
@@ -52,7 +52,7 @@ def main():
     offsets = []
 
     for i, ex in enumerate(tqdm(ds.select(range(min(args.max_samples, len(ds)))))):
-        ids = tokenizer.encode(ex[args.text_col], add_special_tokens=False)
+        ids = tokenizer.encode(ex[args.text_col]).ids
         if len(ids) < 4:
             continue
 
