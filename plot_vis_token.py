@@ -5,10 +5,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import umap
 
+ID=284
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="/Users/taka/Documents/vis_token_284.pt")
-    ap.add_argument("--out", default="/Users/taka/Documents/vis_token_umap.png")
+    ap.add_argument("--input", default=f"/Users/taka/Documents/vis_token_{ID}.pt")
+    ap.add_argument("--out", default=f"/Users/taka/Documents/vis_token_{ID}_umap.png")
     ap.add_argument("--n_neighbors", type=int, default=50)
     ap.add_argument("--min_dist", type=float, default=0.05)
     ap.add_argument("--metric", default="cosine")

@@ -288,18 +288,25 @@ def assign_blockwise(z, centers, k_block=4096):
 
     return best_id
 
-def make_adj(seq_len, hop, device):
+def make_adj_left(seq_len, hop, device):
+    """
+    adj[i, j] = 1 のとき、位置 i が位置 j から情報を受け取る。
+    自分自身および左側hop以内だけを見る。
+    """
     pos = torch.arange(seq_len, device=device)
-    dist = (pos[:, None] - pos[None, :]).abs()
+    receiver = pos[:, None]
+    sender = pos[None, :]
+    distance = receiver - sender
+    adj = (
+        (distance >= 0) &
+        (distance <= hop)
+    ).float()
+    deg = adj.sum(
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(1.0)
 
-    adj = (dist <= hop).float()
-    adj.fill_diagonal_(1.0)
-
-    # degree normalize
-    deg = adj.sum(dim=-1, keepdim=True).clamp_min(1.0)
-    adj = adj / deg
-    return adj
-
+    return adj / deg
 
 @torch.no_grad()
 def update_usage_ema(usage_ema, ids, K, decay=0.99):
@@ -334,7 +341,8 @@ class VQWordGNN(nn.Module):
     def __init__(self, vocab_size, d_model=256, hop=3, n_layers=3, dropout=0.1, center_scale=1.0):
         super().__init__()
         self.hop = hop
-        self.seq_len = 2 * hop + 1
+        self.seq_len = hop + 1
+        self.center_idx = hop
         self.center_scale = center_scale
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(self.seq_len, d_model)
@@ -411,17 +419,17 @@ class VQWordGNN(nn.Module):
         pos = torch.arange(L, device=ctx_ids.device).unsqueeze(0).expand(B, L)
 
         tok_h = self.tok_emb(ctx_ids)
-        tok_h[:, self.hop, :] = tok_h[:, self.hop, :] * self.center_scale
+        tok_h[:, self.center_idx, :] *= self.center_scale
 
         h = tok_h + self.pos_emb(pos)
         h = self.dropout(h)
 
-        adj = make_adj(L, self.hop, ctx_ids.device)
+        adj = make_adj_left(L, self.hop, ctx_ids.device)
 
         for layer in self.layers:
             h = layer(h, adj)
 
-        z = h[:, self.hop]
+        z = h[:, self.center_idx]
         return F.normalize(z, dim=-1)
 
     def forward(self, ctx_ids, target_ids):
@@ -461,12 +469,26 @@ def global_to_local(global_ids, codes_per_partition, partition_base=0):
     return part_ids, local_ids
 
 def make_windows(token_ids, hop, pad_id):
-    ids = torch.tensor(token_ids, dtype=torch.long)
-    padded = F.pad(ids, (hop, hop), value=pad_id)
+    """
+    各ターゲット位置 i に対して、
 
-    ctx, tgt = [], []
+        [i-hop, ..., i-1, i]
+
+    の左文脈 hop 個＋中心トークン自身を返す。
+
+    ctx length = hop + 1
+    center index = hop
+    """
+    ids = torch.tensor(token_ids, dtype=torch.long)
+
+    # 左側だけpadする
+    padded = F.pad(ids, (hop, 0), value=pad_id)
+
+    ctx = []
+    tgt = []
+
     for i in range(len(ids)):
-        ctx.append(padded[i:i + 2 * hop + 1])
+        ctx.append(padded[i:i + hop + 1])
         tgt.append(ids[i])
 
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
@@ -836,7 +858,7 @@ def main():
             text,
             add_special_tokens=False
         )[:args.seq_len]
-        if len(ids) < 2 * args.hop + 2:
+        if len(ids) < 2:
             continue
 
         ctx, tgt = make_windows(ids, args.hop, pad_id)
