@@ -9,37 +9,62 @@ from transformers import AutoTokenizer
 
 
 class VQWordARDataset(Dataset):
-    def __init__(self, samples, max_len=1024):
+    def __init__(
+        self,
+        samples,
+        token_ids_flat,
+        vq_ids_flat,
+        max_len=1024,
+    ):
         self.samples = []
+
+        # 保存ファイルではint32だが、ここでは元Tensorをそのまま保持する
+        self.token_ids_flat = token_ids_flat
+        self.vq_ids_flat = vq_ids_flat
+
         for s in samples:
-            tok = s["token_ids"].long()
-            vq = s["vqword_ids"].long()
+            start = int(s["start"])
+            end = int(s["end"])
 
-            # VQWordARDataset.__init__ の中
-            if len(tok) != len(vq):
-                print("[LEN MISMATCH]", len(tok), len(vq))
-                print(tok[:20])
-                print(vq[:20])
-                raise SystemExit
+            length = end - start
 
-            # tok_in = tok[:-1] なので、元系列は max_len+1 まで許可
-            if len(tok) > max_len + 1:
+            if length > max_len + 1:
                 continue
 
-            if len(tok) >= 4:
-                self.samples.append((tok, vq))
+            if length >= 4:
+                self.samples.append({
+                    "sample_idx": int(s["sample_idx"]),
+                    "start": start,
+                    "end": end,
+                    "length": int(s["length"]),
+                })
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, i):
-        tok, vq = self.samples[i]
+        s = self.samples[i]
+
+        start = s["start"]
+        end = s["end"]
+
+        # バッチとして使うサンプルだけlongへ変換する
+        tok = self.token_ids_flat[start:end].long()
+        vq = self.vq_ids_flat[start:end].long()
+
+        if len(tok) != len(vq):
+            raise RuntimeError(
+                f"Length mismatch: tok={len(tok)}, vq={len(vq)}, "
+                f"start={start}, end={end}"
+            )
+
         return {
             "tok_in": tok[:-1],
             "vq_in": vq[:-1],
             "tok_y": tok[1:],
             "vq_y": vq[1:],
         }
+
 
 @torch.no_grad()
 def debug_token_prob_sum(model, loader, device, word2vq_prob, max_print=20):
@@ -803,10 +828,21 @@ def main():
     use_vq_input = not args.token_only
 
     data = torch.load(args.data, map_location="cpu")
+
     samples = data["samples"]
+    token_ids_flat = data["token_ids_flat"]
+    vq_ids_flat = data["vq_ids_flat"]
+
+    print("[token_ids_flat]", token_ids_flat.dtype, token_ids_flat.shape)
+    print("[vq_ids_flat]", vq_ids_flat.dtype, vq_ids_flat.shape)
+
     for s in samples[:5]:
-        tok = s["token_ids"].long()
-        vq = s["vqword_ids"].long()
+        start = int(s["start"])
+        end = int(s["end"])
+
+        tok = token_ids_flat[start:end]
+        vq = vq_ids_flat[start:end]
+
         print("len", len(tok), len(vq))
         print("tok[:20]", tok[:20].tolist())
         print("vq [:20]", vq[:20].tolist())
@@ -899,8 +935,8 @@ def main():
     print(f"[vq_vocab_size incl pad] {vq_vocab_size_incl_pad}")
     print(f"[vq_pad_id] {vq_pad_id}")
     print("[CHECK] data keys:", data.keys())
-    vq_max = max(int(s["vqword_ids"].max()) for s in samples)
-    vq_min = min(int(s["vqword_ids"].min()) for s in samples)
+    vq_max = int(vq_ids_flat.max().item())
+    vq_min = int(vq_ids_flat.min().item())
 
     print("[CHECK] vq_ids min:", vq_min)
     print("[CHECK] vq_ids max:", vq_max)
@@ -937,9 +973,26 @@ def main():
     valid_s = samples[n_train:n_train + n_valid]
     test_s = samples[n_train + n_valid:]
 
-    train_ds = VQWordARDataset(train_s, max_len=512)
-    valid_ds = VQWordARDataset(valid_s, max_len=512)
-    test_ds = VQWordARDataset(test_s, max_len=512)
+    train_ds = VQWordARDataset(
+        train_s,
+        token_ids_flat=token_ids_flat,
+        vq_ids_flat=vq_ids_flat,
+        max_len=512,
+    )
+
+    valid_ds = VQWordARDataset(
+        valid_s,
+        token_ids_flat=token_ids_flat,
+        vq_ids_flat=vq_ids_flat,
+        max_len=512,
+    )
+
+    test_ds = VQWordARDataset(
+        test_s,
+        token_ids_flat=token_ids_flat,
+        vq_ids_flat=vq_ids_flat,
+        max_len=512,
+    )
 
     def make_loader(ds, shuffle):
         return DataLoader(

@@ -123,7 +123,10 @@ def main():
         d_model=cargs["d_model"],
         hop=cargs["hop"],
         n_layers=cargs["n_layers"],
+        center_scale=cargs.get("center_scale", 1.0),
     ).to(device)
+
+    print("[center_scale]", cargs.get("center_scale", 1.0))
 
     model.load_state_dict(ckpt["model"])
     centroids = ckpt.get("centroids", None)
@@ -214,12 +217,13 @@ def main():
         fallback_tok_to_vq,
     )
     samples = []
+
     for sample_idx, start, end, n_tok in offsets:
         samples.append({
-            "sample_idx": sample_idx,
-            "token_ids": tgt[start:end].cpu(),
-            "vqword_ids": vq_ids[start:end].cpu(),
-            "length": n_tok,
+            "sample_idx": int(sample_idx),
+            "start": int(start),
+            "end": int(end),
+            "length": int(n_tok),
         })
     if args.dictionary is not None:
         raw_dict = torch.load(args.dictionary, map_location="cpu")
@@ -241,23 +245,33 @@ def main():
         torch.save(raw_dict, dict_out)
         print("[save dictionary with fallback]", dict_out)
 
-    torch.save({
-        "samples": samples,
-        "vq_ids_flat": vq_ids,
-        "token_ids_flat": tgt,
-        "offsets": offsets,
-        "word2id": word2id,
-        "id2word": id2word,
-        "pad_token_id": pad_id,
-        "unk_token_id": unk_id,
-        "vocab_type": vocab_type,
-        "hop": cargs["hop"],
-        "ckpt": args.ckpt,
-        "tokenizer": tokenizer_name,
-        "fallback_tok_to_vq": fallback_tok_to_vq,
-        "vq_vocab_size": base_vq_vocab_size,
-        "vq_pad_id": vq_pad_id,
-    }, args.out)
+    # 保存時だけ小さいdtypeにする
+    vq_ids_save = vq_ids.to(torch.int32)
+    token_ids_save = tgt.to(torch.int32)
+
+    torch.save(
+        {
+            "samples": samples,
+
+            # ID本体はflat配列として一度だけ保存
+            "vq_ids_flat": vq_ids_save,
+            "token_ids_flat": token_ids_save,
+
+            "offsets": offsets,
+            "word2id": word2id,
+            "id2word": id2word,
+            "pad_token_id": pad_id,
+            "unk_token_id": unk_id,
+            "vocab_type": vocab_type,
+            "hop": cargs["hop"],
+            "ckpt": args.ckpt,
+            "tokenizer": tokenizer_name,
+            "fallback_tok_to_vq": fallback_tok_to_vq,
+            "vq_vocab_size": base_vq_vocab_size,
+            "vq_pad_id": vq_pad_id,
+        },
+        args.out,
+    )
 
     print(f"[save] {args.out}")
 
