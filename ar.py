@@ -833,6 +833,22 @@ def main():
     token_ids_flat = data["token_ids_flat"]
     vq_ids_flat = data["vq_ids_flat"]
 
+    if len(token_ids_flat) != len(vq_ids_flat):
+        raise ValueError(
+            f"Flat length mismatch: "
+            f"token_ids={len(token_ids_flat):,}, "
+            f"vq_ids={len(vq_ids_flat):,}"
+        )
+    for s in samples:
+        start = int(s["start"])
+        end = int(s["end"])
+
+        if not (0 <= start <= end <= len(token_ids_flat)):
+            raise ValueError(
+                f"Invalid sample range: start={start}, end={end}, "
+                f"flat_len={len(token_ids_flat)}"
+            )
+
     print("[token_ids_flat]", token_ids_flat.dtype, token_ids_flat.shape)
     print("[vq_ids_flat]", vq_ids_flat.dtype, vq_ids_flat.shape)
 
