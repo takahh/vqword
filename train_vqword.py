@@ -1082,11 +1082,14 @@ def main():
     )
 
     id_out = args.out.replace(".pt", "_ids.pt")
+
     torch.save(
         {
-            "vq_ids": vq_ids,
-            "tgt": tgt,
-            "local_ids": local_ids,
+            # 保存時だけ圧縮
+            "vq_ids": vq_ids.to(torch.int32),
+            "tgt": tgt.to(torch.int32),
+            "local_ids": local_ids.to(torch.int16),
+
             "compact_to_pair": compact_to_pair,
             "tokenizer_name": args.tokenizer,
             "pad_token_id": pad_id,
