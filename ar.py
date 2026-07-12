@@ -908,10 +908,10 @@ def main():
     print(f"[data] {args.data}")
 
     # VQ-only事前学習ではTokenizerをロードしない
-    vq_only_pretrain = args.mode == "pretrain" and args.vq_only
+    skip_tokenizer = args.vq_only
 
-    if vq_only_pretrain:
-        print("[tokenizer] skipped for VQ-only pretrain")
+    if skip_tokenizer:
+        print("[tokenizer] skipped for VQ-only run")
 
         if args.token_vocab_size is not None:
             token_vocab_size = args.token_vocab_size
