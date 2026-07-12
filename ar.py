@@ -906,25 +906,51 @@ def main():
     tokenizer_name = args.tokenizer or data.get("tokenizer", None)
 
     print(f"[data] {args.data}")
-    print(f"[tokenizer] {tokenizer_name}")
 
-    if tokenizer_name is not None:
-        tok = AutoTokenizer.from_pretrained(tokenizer_name)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
-        pad_token_id = tok.pad_token_id
-        token_vocab_size = args.token_vocab_size or len(tok)
-    else:
+    # VQ-only事前学習ではTokenizerをロードしない
+    vq_only_pretrain = args.mode == "pretrain" and args.vq_only
+
+    if vq_only_pretrain:
+        print("[tokenizer] skipped for VQ-only pretrain")
+
         if args.token_vocab_size is not None:
             token_vocab_size = args.token_vocab_size
-        elif "word2id" in data:
-            token_vocab_size = len(data["word2id"])
         elif "token_ids_flat" in data:
             token_vocab_size = int(data["token_ids_flat"].max().item()) + 1
+        elif "word2id" in data and data["word2id"] is not None:
+            token_vocab_size = len(data["word2id"])
         else:
-            raise ValueError("Cannot infer token_vocab_size. Use --token_vocab_size.")
+            # tok_embは使わないが、tok_head構築用に最低1が必要
+            token_vocab_size = 1
 
         pad_token_id = int(data.get("pad_token_id", 0))
+
+    else:
+        print(f"[tokenizer] {tokenizer_name}")
+
+        if tokenizer_name is not None:
+            tok = AutoTokenizer.from_pretrained(tokenizer_name)
+
+            if tok.pad_token is None:
+                tok.pad_token = tok.eos_token
+
+            pad_token_id = tok.pad_token_id
+            token_vocab_size = args.token_vocab_size or len(tok)
+
+        else:
+            if args.token_vocab_size is not None:
+                token_vocab_size = args.token_vocab_size
+            elif "word2id" in data and data["word2id"] is not None:
+                token_vocab_size = len(data["word2id"])
+            elif "token_ids_flat" in data:
+                token_vocab_size = int(data["token_ids_flat"].max().item()) + 1
+            else:
+                raise ValueError(
+                    "Cannot infer token_vocab_size. "
+                    "Use --token_vocab_size or --tokenizer."
+                )
+
+            pad_token_id = int(data.get("pad_token_id", 0))
 
     print(f"[pad_token_id] {pad_token_id}")
     word2vq_prob = None
