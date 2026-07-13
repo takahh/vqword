@@ -589,20 +589,109 @@ def main():
     global_vq_vocab_size = int(global_centers.size(0))
     print(f"[global] vq_vocab_size={global_vq_vocab_size:,}")
 
-    cluster_counter = defaultdict(Counter)
-    for word_id, cluster_id in zip(tgt.tolist(), vq_ids.tolist()):
-        cluster_counter[int(cluster_id)][int(word_id)] += 1
+    # ---------------------------------------------------------
+    # Dictionary: VQW ID -> associated BPE ID candidates
+    # ---------------------------------------------------------
+    top_k = 32
 
-    cluster_dict = {
-        cluster_id: [
-            (word_id, tok.decode([word_id]), count)
-            for word_id, count in counter.most_common()
+    cluster_counter = defaultdict(Counter)
+
+    for bpe_id, vqw_id in zip(tgt.tolist(), vq_ids.tolist()):
+        cluster_counter[int(vqw_id)][int(bpe_id)] += 1
+
+    # 固定長tensor。
+    # AR側で候補集合を高速に引くために使う。
+    candidate_token_ids = torch.full(
+        (global_vq_vocab_size, top_k),
+        -1,
+        dtype=torch.int32,
+    )
+    candidate_token_counts = torch.zeros(
+        (global_vq_vocab_size, top_k),
+        dtype=torch.int64,
+    )
+
+    # 各VQW IDの全出現数
+    vq_total_counts = torch.zeros(
+        global_vq_vocab_size,
+        dtype=torch.int64,
+    )
+
+    # 各VQW IDに対応するBPE ID数
+    vq_candidate_sizes = torch.zeros(
+        global_vq_vocab_size,
+        dtype=torch.int32,
+    )
+
+    # 可変長の完全版。
+    # VQW ID -> [(bpe_id, count), ...]
+    vq_to_bpe_ids = {}
+
+    for vqw_id in range(global_vq_vocab_size):
+        counter = cluster_counter.get(vqw_id)
+
+        if counter is None:
+            vq_to_bpe_ids[vqw_id] = []
+            continue
+
+        ranked = counter.most_common()
+        total_count = sum(count for _, count in ranked)
+
+        vq_total_counts[vqw_id] = total_count
+        vq_candidate_sizes[vqw_id] = len(ranked)
+
+        # 完全な対応一覧
+        vq_to_bpe_ids[vqw_id] = [
+            (int(bpe_id), int(count))
+            for bpe_id, count in ranked
         ]
-        for cluster_id, counter in cluster_counter.items()
+
+        # 上位top_k候補をtensorにも保存
+        for rank, (bpe_id, count) in enumerate(ranked[:top_k]):
+            candidate_token_ids[vqw_id, rank] = int(bpe_id)
+            candidate_token_counts[vqw_id, rank] = int(count)
+
+    used_vq = vq_total_counts > 0
+
+    print(
+        f"[dictionary] covered="
+        f"{int(used_vq.sum())}/{global_vq_vocab_size} "
+        f"mean_bpe_candidates="
+        f"{vq_candidate_sizes[used_vq].float().mean().item():.2f} "
+        f"max_bpe_candidates="
+        f"{int(vq_candidate_sizes.max())}"
+    )
+
+    dictionary = {
+        # 完全版
+        "vq_to_bpe_ids": vq_to_bpe_ids,
+
+        # 高速アクセス用上位候補
+        "candidate_token_ids": candidate_token_ids,
+        "candidate_token_counts": candidate_token_counts,
+
+        # 統計
+        "vq_total_counts": vq_total_counts,
+        "vq_candidate_sizes": vq_candidate_sizes,
+
+        # metadata
+        "top_k": top_k,
+        "vq_vocab_size": global_vq_vocab_size,
+        "vq_pad_id": global_vq_vocab_size,
+        "token_vocab_size": vocab_size,
+        "tokenizer_name": args.tokenizer,
+        "pad_token_id": pad_id,
+        "unk_token_id": tok.unk_token_id,
+        "vocab_type": "byte_bpe",
+        "partitioned": False,
+        "partition_type": "global_ivf_then_kmeans",
+        "id_scheme": "global_ivf_then_local_kmeans",
+        "global_id_min": 0,
+        "global_id_max": global_vq_vocab_size - 1,
     }
 
     dictionary_out = args.out.replace(".pt", "_dictionary.pt")
-    torch.save(cluster_dict, dictionary_out)
+    torch.save(dictionary, dictionary_out)
     print(f"[save dictionary] {dictionary_out}")
 
     metrics = compute_cluster_metrics(vq_ids, k_req=global_vq_vocab_size)
