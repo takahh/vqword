@@ -104,23 +104,6 @@ class VQWordGNN(nn.Module):
 
 
 @torch.no_grad()
-def init_centers_random(model, ctx, k, batch_size, device):
-    n = len(ctx)
-    if n >= k:
-        selected = torch.randperm(n)[:k]
-    else:
-        selected = torch.randint(0, n, (k,))
-
-    chunks = []
-    for start in tqdm(range(0, len(selected), batch_size), desc="[vq init]"):
-        xb = ctx[selected[start:start + batch_size]].to(device)
-        chunks.append(model.encode_context(xb).float().cpu())
-
-    centers = torch.cat(chunks, dim=0)[:k].to(device)
-    return F.normalize(centers, dim=-1)
-
-
-@torch.no_grad()
 def assign_blockwise(z, centers, k_block=4096):
     z = F.normalize(z.float(), dim=-1)
     centers = F.normalize(centers.float(), dim=-1)
@@ -137,43 +120,6 @@ def assign_blockwise(z, centers, k_block=4096):
         best_id[mask] = index[mask] + start
 
     return best_id
-
-
-@torch.no_grad()
-def ema_update_codebook(centroids, z, ids, decay=0.99):
-    sums = torch.zeros_like(centroids)
-    counts = torch.zeros(centroids.size(0), device=z.device)
-    sums.index_add_(0, ids, z)
-    counts.index_add_(0, ids, torch.ones_like(ids, dtype=torch.float))
-
-    nonempty = counts > 0
-    batch_means = centroids.clone()
-    batch_means[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1)
-    centroids.mul_(decay).add_(batch_means, alpha=1.0 - decay)
-    centroids.copy_(F.normalize(centroids, dim=-1))
-
-
-@torch.no_grad()
-def update_usage_ema(usage_ema, ids, k, decay=0.99):
-    counts = torch.bincount(ids, minlength=k).float().to(usage_ema.device)
-    probs = counts / counts.sum().clamp_min(1.0)
-    usage_ema.mul_(decay).add_(probs, alpha=1.0 - decay)
-    usage_ema.div_(usage_ema.sum().clamp_min(1e-12))
-    return usage_ema
-
-
-def entropy_loss_from_probs(p):
-    p = p[p > 0]
-    return -(-(p * torch.log(p + 1e-12)).sum())
-
-
-def soft_entropy_loss(z, centers, temperature=0.1):
-    z = F.normalize(z.float(), dim=-1)
-    centers = F.normalize(centers.float(), dim=-1)
-    prob = F.softmax((z @ centers.T) / temperature, dim=-1)
-    usage = prob.mean(dim=0)
-    entropy = -(usage * torch.log(usage + 1e-12)).sum()
-    return -entropy
 
 
 def make_windows(token_ids, hop, pad_id):
@@ -551,14 +497,6 @@ def main():
     ap.add_argument("--n_layers", type=int, default=3)
     ap.add_argument("--center_scale", type=float, default=1.0)
 
-    # VQ optimization before final clustering
-    ap.add_argument("--codebook_size", type=int, default=8192)
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--vq_beta", type=float, default=1.0)
-    ap.add_argument("--ema_decay", type=float, default=0.99)
-    ap.add_argument("--entropy_temp", type=float, default=0.1)
-
     # Global IVF -> KMeans
     ap.add_argument("--ivf_nlist", type=int, default=128)
     ap.add_argument(
@@ -630,88 +568,6 @@ def main():
         n_layers=args.n_layers,
         center_scale=args.center_scale,
     ).to(device)
-
-    usage_ema = torch.full(
-        (args.codebook_size,),
-        1.0 / args.codebook_size,
-        device=device,
-    )
-
-    if args.epochs > 0:
-        print(f"[vq-opt] epochs={args.epochs}")
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=0.01,
-        )
-        centers = init_centers_random(
-            model=model,
-            ctx=ctx,
-            k=args.codebook_size,
-            batch_size=args.batch_size,
-            device=device,
-        ).detach()
-
-        for epoch in range(1, args.epochs + 1):
-            model.train()
-            permutation = torch.randperm(len(ctx))
-            total_loss = 0.0
-            total_commit = 0.0
-            total_entropy = 0.0
-            total_n = 0
-
-            pbar = tqdm(
-                range(0, len(ctx), args.batch_size),
-                desc=f"[vq-opt] epoch {epoch}",
-            )
-            for start in pbar:
-                index = permutation[start:start + args.batch_size]
-                xb = ctx[index].to(device)
-
-                z = F.normalize(model.encode_context(xb).float(), dim=-1)
-                with torch.no_grad():
-                    ids = assign_blockwise(z, centers, k_block=args.k_block)
-                    q = centers[ids].detach()
-
-                commit_loss = F.mse_loss(z, q)
-                entropy_loss = soft_entropy_loss(
-                    z=z,
-                    centers=centers,
-                    temperature=args.entropy_temp,
-                )
-                loss = commit_loss + args.vq_beta * entropy_loss
-
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-
-                with torch.no_grad():
-                    z_new = F.normalize(model.encode_context(xb).float(), dim=-1)
-                    ids_new = assign_blockwise(z_new, centers, k_block=args.k_block)
-                    ema_update_codebook(centers, z_new, ids_new, decay=args.ema_decay)
-                    usage_ema = update_usage_ema(
-                        usage_ema,
-                        ids_new,
-                        args.codebook_size,
-                        decay=args.ema_decay,
-                    )
-                    ema_entropy_loss = entropy_loss_from_probs(usage_ema)
-
-                batch_n = xb.size(0)
-                total_loss += loss.item() * batch_n
-                total_commit += commit_loss.item() * batch_n
-                total_entropy += entropy_loss.item() * batch_n
-                total_n += batch_n
-                pbar.set_postfix(
-                    loss=f"{total_loss / total_n:.4f}",
-                    commit=f"{total_commit / total_n:.4f}",
-                    soft_ent=f"{total_entropy / total_n:.4f}",
-                    ema_ent=f"{ema_entropy_loss.item():.4f}",
-                )
-        print("[vq-opt] done")
-    else:
-        print("[vq-opt] skipped")
 
     model.eval()
     (
