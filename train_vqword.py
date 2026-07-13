@@ -11,7 +11,6 @@ from sklearn.cluster import MiniBatchKMeans
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-
 @torch.no_grad()
 def compute_cluster_metrics(y, k_req, topk=5):
     y = y.long().view(-1)
