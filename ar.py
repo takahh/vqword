@@ -776,6 +776,83 @@ def masked_token_ce_by_true_vq(tok_logits, tok_y, vq_y, vq2word_ids):
 
     return torch.stack(losses).sum() / flat_tok_y.numel()
 
+def load_dictionary_entries(path):
+    """
+    旧形式とglobal IVF形式の両方の辞書を読み込み、
+    以下の共通形式へ変換する。
+
+        dict_entries[vq_id] = [
+            (bpe_id, token_text, count),
+            ...
+        ]
+
+    global IVF辞書にはtoken_textが入っていないため、
+    token_textには空文字列を入れる。
+    """
+    raw = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    # ------------------------------------------
+    # 新しいglobal IVF辞書
+    # ------------------------------------------
+    if "vq_to_bpe_ids" in raw:
+        source_entries = raw["vq_to_bpe_ids"]
+
+        print("[dictionary format] global vq_to_bpe_ids")
+
+    # ------------------------------------------
+    # 以前の辞書形式
+    # 数字キーがトップレベルにある
+    # ------------------------------------------
+    else:
+        source_entries = {
+            int(k): v
+            for k, v in raw.items()
+            if isinstance(k, int)
+            or (isinstance(k, str) and k.isdigit())
+        }
+
+        print("[dictionary format] legacy numeric keys")
+
+    dict_entries = {}
+
+    for raw_vq_id, entries in source_entries.items():
+        vq_id = int(raw_vq_id)
+        normalized = []
+
+        for entry in entries:
+            # 新global形式:
+            # (bpe_id, count)
+            if len(entry) == 2:
+                wid, count = entry
+                word = ""
+
+            # 旧形式:
+            # (bpe_id, token文字列, count)
+            elif len(entry) == 3:
+                wid, word, count = entry
+
+            else:
+                raise ValueError(
+                    f"Unexpected dictionary entry: "
+                    f"vq_id={vq_id}, entry={entry}"
+                )
+
+            normalized.append(
+                (
+                    int(wid),
+                    str(word),
+                    int(count),
+                )
+            )
+
+        dict_entries[vq_id] = normalized
+
+    return raw, dict_entries
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="path to VQWord AR training data .pt")
@@ -867,15 +944,38 @@ def main():
     dict_vq_vocab_size = None
 
     if args.dictionary is not None:
-        raw_dict = torch.load(args.dictionary, map_location="cpu")
+        raw_dict, dict_entries = load_dictionary_entries(
+            args.dictionary
+        )
 
-        dict_entries = {
-            int(k): v
-            for k, v in raw_dict.items()
-            if isinstance(k, int) or (isinstance(k, str) and k.isdigit())
-        }
+        print(
+            f"[dictionary] loaded entries="
+            f"{len(dict_entries):,}"
+        )
 
-        print(dict_entries[0][:10])
+        # キー0が未使用でも落ちないように、
+        # 最初の非空エントリを探して表示する
+        sample_found = False
+
+        for sample_vq_id in sorted(dict_entries.keys()):
+            entries = dict_entries[sample_vq_id]
+
+            if len(entries) == 0:
+                continue
+
+            print(
+                f"[dictionary sample] "
+                f"vq_id={sample_vq_id}"
+            )
+            print(entries[:10])
+
+            sample_found = True
+            break
+
+        if not sample_found:
+            raise RuntimeError(
+                "Dictionary contains no non-empty VQ entries"
+            )
 
     else:
         raw_dict = None
