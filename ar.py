@@ -1394,6 +1394,11 @@ def main():
             new_b = model.vq_head.bias.detach().cpu().clone()
             new_b[:old_vq_size] = old_b
             sd["vq_head.bias"] = new_b
+        sd = ckpt["model"]
+
+        if args.reset_heads:
+            sd.pop("tok_head.weight", None)
+            sd.pop("tok_head.bias", None)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"[init_from] {args.init_from}")
         print(f"[init] missing={missing}")
