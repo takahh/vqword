@@ -32,12 +32,12 @@ def compute_cluster_metrics(y, k_req, topk=5):
     }
 
 
-def make_adj_left(seq_len, hop, device):
+def make_adj_bidirectional(seq_len, hop, device):
     pos = torch.arange(seq_len, device=device)
     receiver = pos[:, None]
     sender = pos[None, :]
-    distance = receiver - sender
-    adj = ((distance >= 0) & (distance <= hop)).float()
+    distance = (receiver - sender).abs()
+    adj = (distance <= hop).float()
     deg = adj.sum(dim=-1, keepdim=True).clamp_min(1.0)
     return adj / deg
 
@@ -68,7 +68,7 @@ class VQWordGNN(nn.Module):
     ):
         super().__init__()
         self.hop = hop
-        self.seq_len = hop + 1
+        self.seq_len = 2 * hop + 1
         self.center_idx = hop
         self.center_scale = center_scale
 
@@ -89,7 +89,7 @@ class VQWordGNN(nn.Module):
         tok_h[:, self.center_idx, :] *= self.center_scale
 
         h = self.dropout(tok_h + self.pos_emb(pos))
-        adj = make_adj_left(length, self.hop, ctx_ids.device)
+        adj = make_adj_bidirectional(length, self.hop, ctx_ids.device)
 
         for layer in self.layers:
             h = layer(h, adj)
@@ -124,12 +124,12 @@ def assign_blockwise(z, centers, k_block=4096):
 
 def make_windows(token_ids, hop, pad_id):
     ids = torch.tensor(token_ids, dtype=torch.long)
-    padded = F.pad(ids, (hop, 0), value=pad_id)
+    padded = F.pad(ids, (hop, hop), value=pad_id)
 
     ctx = []
     tgt = []
     for i in range(len(ids)):
-        ctx.append(padded[i:i + hop + 1])
+        ctx.append(padded[i:i + 2 * hop + 1])
         tgt.append(ids[i])
 
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
