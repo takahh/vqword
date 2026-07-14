@@ -746,6 +746,12 @@ def build_word2vq_unique(raw_dict, device):
     }
 
 def build_vq_to_tok(raw_dict, vq_vocab_size, device):
+    """
+    各VQ IDを、そのVQで最多のBPE IDへ対応付ける。
+
+    未使用VQは辞書エントリが空なので、
+    対応値を -1 のまま残す。
+    """
     vq_to_tok = torch.full(
         (vq_vocab_size,),
         -1,
@@ -753,9 +759,35 @@ def build_vq_to_tok(raw_dict, vq_vocab_size, device):
         dtype=torch.long,
     )
 
+    n_used = 0
+    n_empty = 0
+
     for vq_id, entries in raw_dict.items():
+        # 未使用VQは空リスト
+        if entries is None or len(entries) == 0:
+            n_empty += 1
+            continue
+
         wid, word, cnt = entries[0]
-        vq_to_tok[int(vq_id)] = int(wid)
+
+        vq_id = int(vq_id)
+        wid = int(wid)
+
+        if vq_id < 0 or vq_id >= vq_vocab_size:
+            raise ValueError(
+                f"VQ ID out of range: "
+                f"vq_id={vq_id}, "
+                f"vq_vocab_size={vq_vocab_size}"
+            )
+
+        vq_to_tok[vq_id] = wid
+        n_used += 1
+
+    print(
+        f"[build_vq_to_tok] "
+        f"used_vq={n_used:,} "
+        f"empty_vq={n_empty:,}"
+    )
 
     return vq_to_tok
 
