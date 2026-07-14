@@ -703,15 +703,45 @@ def dict_word_ce_fast(vq_logits, tok_y, word2vq_prob):
     return torch.tensor(total_loss, device=vq_logits.device), total_tok
 
 def build_word2vq_unique(raw_dict, device):
+    """
+    各VQ IDを、その辞書内で最頻のBPE IDへ対応付ける。
+
+    未使用VQ IDは entries=[] なのでスキップする。
+    """
     word2vq = {}
 
+    n_empty = 0
+    n_used = 0
+
     for vq_id, entries in raw_dict.items():
-        wid, word, cnt = entries[0]  # VQ -> BPE は一意
+        # 未使用クラスタは辞書候補が空
+        if entries is None or len(entries) == 0:
+            n_empty += 1
+            continue
+
+        # entriesは出現回数順に並んでいるので、
+        # 先頭がそのVQに対応する最多BPE
+        wid, word, cnt = entries[0]
+
         wid = int(wid)
-        word2vq.setdefault(wid, []).append(int(vq_id))
+        vq_id = int(vq_id)
+
+        word2vq.setdefault(wid, []).append(vq_id)
+        n_used += 1
+
+    print(
+        f"[build_word2vq_unique] "
+        f"used_vq={n_used:,} "
+        f"empty_vq={n_empty:,} "
+        f"token_entries={len(word2vq):,}"
+    )
 
     return {
-        wid: torch.tensor(vqs, device=device, dtype=torch.long)
+        wid: torch.tensor(
+            vqs,
+            device=device,
+            dtype=torch.long,
+        )
         for wid, vqs in word2vq.items()
     }
 
