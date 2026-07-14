@@ -1374,6 +1374,9 @@ def main():
     if args.init_from is not None:
         ckpt = torch.load(args.init_from, map_location="cpu")
         sd = ckpt["model"]
+        if args.reset_heads:
+            sd.pop("tok_head.weight", None)
+            sd.pop("tok_head.bias", None)
         old_vq_size = sd["vq_emb.weight"].shape[0]
         new_vq_size = model.vq_emb.weight.shape[0]
 
@@ -1394,11 +1397,6 @@ def main():
             new_b = model.vq_head.bias.detach().cpu().clone()
             new_b[:old_vq_size] = old_b
             sd["vq_head.bias"] = new_b
-        sd = ckpt["model"]
-
-        if args.reset_heads:
-            sd.pop("tok_head.weight", None)
-            sd.pop("tok_head.bias", None)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"[init_from] {args.init_from}")
         print(f"[init] missing={missing}")
