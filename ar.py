@@ -1374,9 +1374,8 @@ def main():
     if args.init_from is not None:
         ckpt = torch.load(args.init_from, map_location="cpu")
         sd = ckpt["model"]
-        if args.reset_heads:
-            sd.pop("tok_head.weight", None)
-            sd.pop("tok_head.bias", None)
+        sd.pop("tok_head.weight", None)
+        sd.pop("tok_head.bias", None)
         old_vq_size = sd["vq_emb.weight"].shape[0]
         new_vq_size = model.vq_emb.weight.shape[0]
 
