@@ -67,7 +67,13 @@ class VQWordARDataset(Dataset):
 
 
 @torch.no_grad()
-def debug_token_prob_sum(model, loader, device, word2vq_prob, max_print=20):
+def debug_token_prob_sum(
+    model,
+    loader,
+    device,
+    word2vq_prob,
+    max_print=20,
+):
     model.eval()
     printed = 0
 
@@ -78,10 +84,21 @@ def debug_token_prob_sum(model, loader, device, word2vq_prob, max_print=20):
         vq_y = vq_y.to(device)
         attn_mask = attn_mask.to(device)
 
-        h, tok_logits, vq_logits = model(tok_in, vq_in, ~attn_mask)
+        h, tok_logits, vq_logits = model(
+            tok_in,
+            vq_in,
+            ~attn_mask,
+        )
 
-        log_vq_prob = F.log_softmax(vq_logits, dim=-1)
-        flat_log_vq = log_vq_prob.reshape(-1, log_vq_prob.size(-1))
+        log_vq_prob = F.log_softmax(
+            vq_logits,
+            dim=-1,
+        )
+
+        flat_log_vq = log_vq_prob.reshape(
+            -1,
+            log_vq_prob.size(-1),
+        )
         flat_tok = tok_y.reshape(-1)
         flat_vq = vq_y.reshape(-1)
 
@@ -90,26 +107,54 @@ def debug_token_prob_sum(model, loader, device, word2vq_prob, max_print=20):
         flat_tok = flat_tok[valid]
         flat_vq = flat_vq[valid]
 
-        for i in range(min(flat_tok.size(0), max_print)):
+        for i in range(flat_tok.size(0)):
             wid = int(flat_tok[i])
             true_vq = int(flat_vq[i])
 
-            vqs = word2vq_prob.get(wid, None)
-            if vqs is None:
+            item = word2vq_prob.get(wid, None)
+
+            if item is None:
                 continue
 
-            p_true_vq = flat_log_vq[i, true_vq].exp().item()
-            p_token = torch.logsumexp(flat_log_vq[i, vqs], dim=0).exp().item()
+            vq_ids, p_word_given_vq = item
+
+            p_true_vq = (
+                flat_log_vq[i, true_vq]
+                .exp()
+                .item()
+            )
+
+            log_p_token = torch.logsumexp(
+                flat_log_vq[i, vq_ids]
+                + torch.log(
+                    p_word_given_vq.clamp_min(1e-12)
+                ),
+                dim=0,
+            )
+
+            p_token = log_p_token.exp().item()
+
+            # 正解VQ内部でのP(word|true VQ)
+            match = vq_ids.eq(true_vq)
+
+            if match.any():
+                true_word_given_vq = (
+                    p_word_given_vq[match][0].item()
+                )
+            else:
+                true_word_given_vq = 0.0
 
             print(
                 "wid", wid,
-                "n_vq", vqs.numel(),
+                "n_vq", vq_ids.numel(),
                 "p_true_vq", p_true_vq,
-                "p_token_sum", p_token,
-                "ratio", p_token / max(p_true_vq, 1e-12),
+                "p_word_given_true_vq",
+                true_word_given_vq,
+                "p_token", p_token,
             )
 
             printed += 1
+
             if printed >= max_print:
                 return
 
@@ -676,9 +721,18 @@ def evaluate_argmax_vq_dict_ppl_fast(model, loader, device, cand_table, cand_pro
 
 @torch.no_grad()
 def dict_word_ce_fast(vq_logits, tok_y, word2vq_prob):
+    """
+    P(word | context)
+      = sum_vq P(vq | context) * P(word | vq)
+
+    を使ってword-level cross entropyを計算する。
+    """
     log_vq_prob = F.log_softmax(vq_logits, dim=-1)
 
-    flat_log_vq = log_vq_prob.reshape(-1, log_vq_prob.size(-1))
+    flat_log_vq = log_vq_prob.reshape(
+        -1,
+        log_vq_prob.size(-1),
+    )
     flat_tok_y = tok_y.reshape(-1)
 
     valid = flat_tok_y.ne(-100)
@@ -686,21 +740,110 @@ def dict_word_ce_fast(vq_logits, tok_y, word2vq_prob):
     flat_tok_y = flat_tok_y[valid]
 
     total_loss = 0.0
-    total_tok = flat_tok_y.numel()
+    total_tok = int(flat_tok_y.numel())
+
+    log_floor = math.log(1e-12)
 
     for wid in flat_tok_y.unique().tolist():
-        vq_ids = word2vq_prob.get(int(wid), None)
-
+        item = word2vq_prob.get(int(wid), None)
         idx = flat_tok_y.eq(wid)
+        n = int(idx.sum().item())
 
-        if vq_ids is None or vq_ids.numel() == 0:
-            total_loss += -math.log(1e-12) * idx.sum().item()
+        if item is None:
+            total_loss += -log_floor * n
             continue
 
-        logp = torch.logsumexp(flat_log_vq[idx][:, vq_ids], dim=1)
-        total_loss += (-logp).sum().item()
+        vq_ids, p_word_given_vq = item
 
-    return torch.tensor(total_loss, device=vq_logits.device), total_tok
+        # log P(vq | context)
+        selected_log_vq = flat_log_vq[idx][:, vq_ids]
+
+        # log P(word | vq)
+        log_p_word_given_vq = torch.log(
+            p_word_given_vq.clamp_min(1e-12)
+        )
+
+        # log sum_v P(v|context) P(word|v)
+        logp_word = torch.logsumexp(
+            selected_log_vq
+            + log_p_word_given_vq.unsqueeze(0),
+            dim=1,
+        )
+
+        total_loss += (-logp_word).sum().item()
+
+    return (
+        torch.tensor(
+            total_loss,
+            device=vq_logits.device,
+        ),
+        total_tok,
+    )
+
+def build_word2vq_weighted(raw_dict, device):
+    """
+    辞書カウントから P(BPE | VQ) を作り、
+    BPEごとに対応するVQ IDと確率をまとめる。
+
+    return:
+        word2vq[wid] = (
+            vq_ids,       # [N]
+            word_probs,   # [N], 各VQにおける P(wid | vq)
+        )
+    """
+    word2vq = {}
+
+    n_used_vq = 0
+    n_empty_vq = 0
+    n_relations = 0
+
+    for vq_id, entries in raw_dict.items():
+        if entries is None or len(entries) == 0:
+            n_empty_vq += 1
+            continue
+
+        total = sum(float(cnt) for wid, word, cnt in entries)
+
+        if total <= 0:
+            n_empty_vq += 1
+            continue
+
+        for wid, word, cnt in entries:
+            wid = int(wid)
+            probability = float(cnt) / total
+
+            word2vq.setdefault(wid, []).append(
+                (int(vq_id), probability)
+            )
+            n_relations += 1
+
+        n_used_vq += 1
+
+    result = {}
+
+    for wid, pairs in word2vq.items():
+        result[wid] = (
+            torch.tensor(
+                [vq_id for vq_id, probability in pairs],
+                device=device,
+                dtype=torch.long,
+            ),
+            torch.tensor(
+                [probability for vq_id, probability in pairs],
+                device=device,
+                dtype=torch.float32,
+            ),
+        )
+
+    print(
+        f"[build_word2vq_weighted] "
+        f"used_vq={n_used_vq:,} "
+        f"empty_vq={n_empty_vq:,} "
+        f"token_entries={len(result):,} "
+        f"relations={n_relations:,}"
+    )
+
+    return result
 
 def build_word2vq_unique(raw_dict, device):
     """
@@ -1118,9 +1261,15 @@ def main():
     word2vq_prob = None
 
     if raw_dict is not None:
-        word2vq_prob = build_word2vq_unique(dict_entries, device)
+        word2vq_prob = build_word2vq_weighted(
+            dict_entries,
+            device,
+        )
 
-        print(f"[word2vq_prob] loaded {len(word2vq_prob)} token entries")
+        print(
+            f"[word2vq_prob] loaded "
+            f"{len(word2vq_prob):,} token entries"
+        )
     if args.vq_vocab_size is not None:
         base_vq_vocab_size = args.vq_vocab_size
     elif "vq_vocab_size" in data:
