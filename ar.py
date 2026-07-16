@@ -188,12 +188,16 @@ class ARVQWordLM(nn.Module):
         max_len=512,
         use_token_input=True,
         use_vq_input=True,
+        concat_inputs=False,
         init_vq_loss_weight=0.05,
     ):
         super().__init__()
 
         self.use_token_input = use_token_input
         self.use_vq_input = use_vq_input
+        self.concat_inputs = (
+            concat_inputs and use_token_input and use_vq_input
+        )
 
         if init_vq_loss_weight <= 0:
             raise ValueError(
@@ -215,6 +219,20 @@ class ARVQWordLM(nn.Module):
             nn.Embedding(vocab_size, d_model)
             if use_token_input else None
         )
+
+        # Fine-tuning fusion layer.  Its initialization exactly reproduces
+        # the pretrained VQ-only input: W_tok=0 and W_vq=I.
+        self.input_fusion = (
+            nn.Linear(2 * d_model, d_model)
+            if self.concat_inputs else None
+        )
+        if self.input_fusion is not None:
+            with torch.no_grad():
+                self.input_fusion.weight.zero_()
+                self.input_fusion.bias.zero_()
+                self.input_fusion.weight[:, d_model:].copy_(
+                    torch.eye(d_model)
+                )
 
         self.pos_emb = nn.Embedding(max_len, d_model)
 
@@ -249,11 +267,19 @@ class ARVQWordLM(nn.Module):
 
         h = self.pos_emb(pos).expand(B, L, -1)
 
-        if self.use_vq_input:
-            h = h + self.vq_emb(vq_in)
+        if self.concat_inputs:
+            tok_h = self.tok_emb(tok_in)
+            vq_h = self.vq_emb(vq_in)
+            fused_h = self.input_fusion(
+                torch.cat([tok_h, vq_h], dim=-1)
+            )
+            h = h + fused_h
+        else:
+            if self.use_vq_input:
+                h = h + self.vq_emb(vq_in)
 
-        if self.use_token_input:
-            h = h + self.tok_emb(tok_in)
+            if self.use_token_input:
+                h = h + self.tok_emb(tok_in)
 
         causal = torch.triu(
             torch.ones(
@@ -1399,6 +1425,7 @@ def main():
         max_len=512,
         use_token_input=use_token_input,
         use_vq_input=use_vq_input,
+        concat_inputs=(args.mode == "finetune"),
         init_vq_loss_weight=args.init_vq_loss_weight,
     ).to(device)
     if not args.learn_vq_loss_weight:
@@ -1443,16 +1470,20 @@ def main():
             for p in model.parameters():
                 p.requires_grad = False
 
+            # Keep the pretrained VQ path fixed, while allowing the newly
+            # added BPE path and fusion layer to learn.
+            if model.tok_emb is not None:
+                for p in model.tok_emb.parameters():
+                    p.requires_grad = True
+
+            if model.input_fusion is not None:
+                for p in model.input_fusion.parameters():
+                    p.requires_grad = True
+
             for p in model.tok_head.parameters():
                 p.requires_grad = True
 
-            print("[freeze] train only tok_head")
-
-            print("[freeze] train tok_head + vq_head")
-
-        print("[freeze] train only tok_head")
-
-        print("[freeze] train only vq_to_tok")
+            print("[freeze] train tok_emb + input_fusion + tok_head")
 
     # ===========================
     # 評価のみ
