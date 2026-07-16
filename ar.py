@@ -1509,10 +1509,34 @@ def main():
 
         return
 
+    regular_params = []
+    weight_params = []
+
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+
+        if name == "raw_vq_loss_weight":
+            weight_params.append(parameter)
+        else:
+            regular_params.append(parameter)
+
+    optimizer_groups = [
+        {
+            "params": regular_params,
+            "weight_decay": 0.01,
+        }
+    ]
+
+    if weight_params:
+        optimizer_groups.append({
+            "params": weight_params,
+            "weight_decay": 0.0,
+        })
+
     opt = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        optimizer_groups,
         lr=args.lr,
-        weight_decay=0.01,
     )
     best_valid = float("inf")
 
