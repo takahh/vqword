@@ -188,14 +188,36 @@ class ARVQWordLM(nn.Module):
         max_len=512,
         use_token_input=True,
         use_vq_input=True,
+        init_vq_loss_weight=0.05,
     ):
         super().__init__()
+
         self.use_token_input = use_token_input
         self.use_vq_input = use_vq_input
 
-        self.vq_emb = nn.Embedding(vq_vocab_size, d_model) if use_vq_input else None
-        self.tok_emb = nn.Embedding(vocab_size, d_model) if use_token_input else None
+        if init_vq_loss_weight <= 0:
+            raise ValueError(
+                "init_vq_loss_weight must be greater than 0"
+            )
+
+        # softplus(raw) = init_vq_loss_weight になるよう初期化
+        raw_init = math.log(math.expm1(init_vq_loss_weight))
+
+        self.raw_vq_loss_weight = nn.Parameter(
+            torch.tensor(raw_init, dtype=torch.float32)
+        )
+
+        self.vq_emb = (
+            nn.Embedding(vq_vocab_size, d_model)
+            if use_vq_input else None
+        )
+        self.tok_emb = (
+            nn.Embedding(vocab_size, d_model)
+            if use_token_input else None
+        )
+
         self.pos_emb = nn.Embedding(max_len, d_model)
+
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -204,42 +226,19 @@ class ARVQWordLM(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.tr = nn.TransformerEncoder(layer, num_layers=n_layers)
+
+        self.tr = nn.TransformerEncoder(
+            layer,
+            num_layers=n_layers,
+        )
+
         self.norm = nn.LayerNorm(d_model)
 
         self.tok_head = nn.Linear(d_model, vocab_size)
         self.vq_head = nn.Linear(d_model, vq_vocab_size)
 
-    def forward(self, tok_in, vq_in, key_padding_mask=None):
-        B, L = tok_in.shape
-        pos = torch.arange(L, device=tok_in.device)[None, :]
-
-        h = self.pos_emb(pos).expand(B, L, -1)
-
-        if self.use_vq_input:
-            h = h + self.vq_emb(vq_in)
-
-        if self.use_token_input:
-            h = h + self.tok_emb(tok_in)
-        causal = torch.triu(
-            torch.ones(L, L, device=tok_in.device, dtype=torch.bool),
-            diagonal=1,
-        )
-
-        h = self.tr(
-            h,
-            mask=causal,
-            src_key_padding_mask=key_padding_mask,
-        )
-        h = self.norm(h)
-        # forward内
-        tok_logits = None
-        vq_logits = self.vq_head(h)
-
-        tok_logits = self.tok_head(h)
-
-        return h, tok_logits, vq_logits
-
+    def get_vq_loss_weight(self):
+        return F.softplus(self.raw_vq_loss_weight)
 
 def candidate_token_ce_from_hidden(
     model,
@@ -1083,6 +1082,18 @@ def main():
     ap.add_argument("--dict_loss", action="store_true")
     ap.add_argument("--eval_only", action="store_true")
     ap.add_argument("--mode", choices=["pretrain", "finetune"], default="pretrain")
+    ap.add_argument(
+        "--learn_vq_loss_weight",
+        action="store_true",
+        help="learn the positive weight applied to vq_loss",
+    )
+
+    ap.add_argument(
+        "--init_vq_loss_weight",
+        type=float,
+        default=0.05,
+        help="initial value of the learnable VQ loss weight",
+    )
     args = ap.parse_args()
 
     history = {
@@ -1350,7 +1361,10 @@ def main():
         max_len=512,
         use_token_input=use_token_input,
         use_vq_input=use_vq_input,
+        init_vq_loss_weight=args.init_vq_loss_weight,
     ).to(device)
+    if not args.learn_vq_loss_weight:
+        model.raw_vq_loss_weight.requires_grad = False
 
     if args.init_from is not None:
         ckpt = torch.load(args.init_from, map_location="cpu")
@@ -1405,13 +1419,19 @@ def main():
     # ===========================
     # 評価のみ
     # ===========================
+    if args.learn_vq_loss_weight:
+        eval_aux_lambda = float(
+            model.get_vq_loss_weight().detach().cpu()
+        )
+    else:
+        eval_aux_lambda = args.aux_lambda
     if args.eval_only:
         valid = evaluate(
             model,
             valid_loader,
             device,
-            aux_lambda=0.0,
-            main_target="vq",
+            eval_aux_lambda,
+            args.main_target,
             vq2word_ids=vq2word_ids,
             dict_loss=False,
             cand_table=cand_table,
@@ -1425,8 +1445,8 @@ def main():
             model,
             test_loader,
             device,
-            aux_lambda=0.0,
-            main_target="vq",
+            eval_aux_lambda,
+            args.main_target,
             vq2word_ids=vq2word_ids,
             dict_loss=False,
             cand_table=cand_table,
@@ -1512,9 +1532,6 @@ def main():
                         cand_mask=cand_mask,
                     )
                 else:
-                    if tok_logits is None:
-                        tok_logits = model.tok_head(h)
-
                     tok_loss = F.cross_entropy(
                         tok_logits.reshape(-1, tok_logits.size(-1)),
                         tok_y.reshape(-1),
@@ -1527,15 +1544,21 @@ def main():
                     ignore_index=-100,
                 )
 
+                if args.learn_vq_loss_weight:
+                    vq_loss_weight = model.get_vq_loss_weight()
+                else:
+                    vq_loss_weight = tok_loss.new_tensor(
+                        args.aux_lambda
+                    )
+
                 if args.main_target == "tok":
-                    loss = tok_loss + args.aux_lambda * vq_loss
+                    loss = tok_loss + vq_loss_weight * vq_loss
 
                 elif args.main_target == "vq":
-                    loss = vq_loss + args.aux_lambda * tok_loss
+                    loss = vq_loss + vq_loss_weight * tok_loss
 
                 elif args.main_target == "both":
-                    loss = tok_loss + args.aux_lambda * vq_loss
-
+                    loss = tok_loss + vq_loss_weight * vq_loss
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1545,7 +1568,14 @@ def main():
                 loss=f"{loss.item():.3f}",
                 tok=f"{tok_loss.item():.3f}",
                 vq=f"{vq_loss.item():.3f}",
+                vqw=f"{float(vq_loss_weight.detach()):.4f}",
             )
+        if args.learn_vq_loss_weight:
+            eval_aux_lambda = float(
+                model.get_vq_loss_weight().detach().cpu()
+            )
+        else:
+            eval_aux_lambda = float(args.aux_lambda)
 
         if args.mode == "pretrain":
             valid = evaluate_vq_only(model, valid_loader, device)
@@ -1555,7 +1585,7 @@ def main():
                 model,
                 valid_loader,
                 device,
-                args.aux_lambda,
+                eval_aux_lambda,
                 args.main_target,
                 vq2word_ids=vq2word_ids,
                 dict_loss=args.dict_loss,
@@ -1565,15 +1595,28 @@ def main():
             )
 
             test = evaluate(
-                model, test_loader, device,
-                args.aux_lambda, args.main_target,
+                model,
+                test_loader,
+                device,
+                eval_aux_lambda,
+                args.main_target,
                 vq2word_ids=vq2word_ids,
                 dict_loss=args.dict_loss,
                 word2vq_prob=word2vq_prob,
                 cand_table=cand_table,
                 cand_mask=cand_mask,
             )
+        if args.learn_vq_loss_weight:
+            current_vq_weight = float(
+                model.get_vq_loss_weight().detach().cpu()
+            )
+        else:
+            current_vq_weight = float(args.aux_lambda)
 
+        print(
+            f"[loss-weight] ep={ep} "
+            f"vq_loss_weight={current_vq_weight:.6f}"
+        )
         pipe_valid = None
         pipe_test = None
 
