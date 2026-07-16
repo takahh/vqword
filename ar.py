@@ -1211,51 +1211,33 @@ def main():
     tokenizer_name = args.tokenizer or data.get("tokenizer", None)
 
     print(f"[data] {args.data}")
+    print(f"[tokenizer metadata] {tokenizer_name}")
 
-    # VQ-only事前学習ではTokenizerをロードしない
-    skip_tokenizer = args.vq_only
+    # このAR学習では、データファイル内に保存済みの
+    # token_ids_flatを直接BPE IDとして使用する。
+    #
+    # そのため、Tokenizer本体をロードする必要はない。
+    # tokenizer_nameはcheckpointへ保存するメタデータとしてのみ保持する。
 
-    if skip_tokenizer:
-        print("[tokenizer] skipped for VQ-only run")
+    if args.token_vocab_size is not None:
+        token_vocab_size = int(args.token_vocab_size)
 
-        if args.token_vocab_size is not None:
-            token_vocab_size = args.token_vocab_size
-        elif "token_ids_flat" in data:
-            token_vocab_size = int(data["token_ids_flat"].max().item()) + 1
-        elif "word2id" in data and data["word2id"] is not None:
-            token_vocab_size = len(data["word2id"])
-        else:
-            # tok_embは使わないが、tok_head構築用に最低1が必要
-            token_vocab_size = 1
+    elif "token_vocab_size" in data:
+        token_vocab_size = int(data["token_vocab_size"])
 
-        pad_token_id = int(data.get("pad_token_id", 0))
+    elif "token_ids_flat" in data:
+        token_vocab_size = int(data["token_ids_flat"].max().item()) + 1
+
+    elif "word2id" in data and data["word2id"] is not None:
+        token_vocab_size = len(data["word2id"])
 
     else:
-        print(f"[tokenizer] {tokenizer_name}")
+        raise ValueError(
+            "Cannot infer token_vocab_size. "
+            "Specify --token_vocab_size."
+        )
 
-        if tokenizer_name is not None:
-            tok = AutoTokenizer.from_pretrained(tokenizer_name)
-
-            if tok.pad_token is None:
-                tok.pad_token = tok.eos_token
-
-            pad_token_id = tok.pad_token_id
-            token_vocab_size = args.token_vocab_size or len(tok)
-
-        else:
-            if args.token_vocab_size is not None:
-                token_vocab_size = args.token_vocab_size
-            elif "word2id" in data and data["word2id"] is not None:
-                token_vocab_size = len(data["word2id"])
-            elif "token_ids_flat" in data:
-                token_vocab_size = int(data["token_ids_flat"].max().item()) + 1
-            else:
-                raise ValueError(
-                    "Cannot infer token_vocab_size. "
-                    "Use --token_vocab_size or --tokenizer."
-                )
-
-            pad_token_id = int(data.get("pad_token_id", 0))
+    pad_token_id = int(data.get("pad_token_id", 0))
 
     print(f"[pad_token_id] {pad_token_id}")
     word2vq_prob = None
