@@ -1690,8 +1690,8 @@ def main():
                 model, test_loader, device, vq2word_ids, topk=16
             )
 
-        valid_loss = valid["main_loss"]
-        test_loss = test["main_loss"]
+        valid_loss = valid["tok_loss"]
+        test_loss = test["tok_loss"]
 
         if args.mode == "pretrain":
             print(
