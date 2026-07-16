@@ -1626,12 +1626,18 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-            pbar.set_postfix(
-                loss=f"{loss.item():.3f}",
-                tok=f"{tok_loss.item():.3f}",
-                vq=f"{vq_loss.item():.3f}",
-                vqw=f"{float(vq_loss_weight.detach()):.4f}",
-            )
+            if args.mode == "pretrain":
+                pbar.set_postfix(
+                    loss=f"{loss.item():.3f}",
+                    vq=f"{vq_loss.item():.3f}",
+                )
+            else:
+                pbar.set_postfix(
+                    loss=f"{loss.item():.3f}",
+                    tok=f"{tok_loss.item():.3f}",
+                    vq=f"{vq_loss.item():.3f}",
+                    vqw=f"{float(vq_loss_weight.detach()):.4f}",
+                )
         if args.learn_vq_loss_weight:
             eval_aux_lambda = float(
                 model.get_vq_loss_weight().detach().cpu()
