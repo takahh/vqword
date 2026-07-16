@@ -240,6 +240,44 @@ class ARVQWordLM(nn.Module):
     def get_vq_loss_weight(self):
         return F.softplus(self.raw_vq_loss_weight)
 
+    def forward(self, tok_in, vq_in, key_padding_mask=None):
+        B, L = tok_in.shape
+        pos = torch.arange(
+            L,
+            device=tok_in.device,
+        )[None, :]
+
+        h = self.pos_emb(pos).expand(B, L, -1)
+
+        if self.use_vq_input:
+            h = h + self.vq_emb(vq_in)
+
+        if self.use_token_input:
+            h = h + self.tok_emb(tok_in)
+
+        causal = torch.triu(
+            torch.ones(
+                L,
+                L,
+                device=tok_in.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+
+        h = self.tr(
+            h,
+            mask=causal,
+            src_key_padding_mask=key_padding_mask,
+        )
+
+        h = self.norm(h)
+
+        tok_logits = self.tok_head(h)
+        vq_logits = self.vq_head(h)
+
+        return h, tok_logits, vq_logits
+
 def candidate_token_ce_from_hidden(
     model,
     h,
