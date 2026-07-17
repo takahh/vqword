@@ -1185,9 +1185,86 @@ def main():
 
     data = torch.load(args.data, map_location="cpu")
 
-    samples = data["samples"]
-    token_ids_flat = data["token_ids_flat"]
-    vq_ids_flat = data["vq_ids_flat"]
+    raw_samples = data["samples"]
+
+    if len(raw_samples) == 0:
+        raise ValueError("No samples found in data file")
+
+    first_sample = raw_samples[0]
+
+    # ============================================================
+    # データ形式を統一する
+    #
+    # 新形式:
+    #   samples = [{"start": ..., "end": ...}, ...]
+    #   token_ids_flat / vq_ids_flat を参照
+    #
+    # 旧形式:
+    #   samples = [{
+    #       "token_ids": Tensor,
+    #       "vqword_ids": Tensor,
+    #       "length": ...
+    #   }, ...]
+    #
+    # どちらも内部では新形式へ統一する。
+    # ============================================================
+
+    if "start" in first_sample and "end" in first_sample:
+        print("[data format] flat start/end format")
+
+        samples = raw_samples
+        token_ids_flat = data["token_ids_flat"].long().reshape(-1)
+        vq_ids_flat = data["vq_ids_flat"].long().reshape(-1)
+
+    elif "token_ids" in first_sample and "vqword_ids" in first_sample:
+        print("[data format] embedded sample format -> converting in memory")
+
+        samples = []
+        token_parts = []
+        vq_parts = []
+        offset = 0
+
+        for sample_idx, sample in enumerate(raw_samples):
+            token_ids = sample["token_ids"].long().reshape(-1)
+            vq_ids = sample["vqword_ids"].long().reshape(-1)
+
+            if token_ids.numel() != vq_ids.numel():
+                raise ValueError(
+                    f"Sample length mismatch at sample {sample_idx}: "
+                    f"token_ids={token_ids.numel()}, "
+                    f"vqword_ids={vq_ids.numel()}"
+                )
+
+            length = token_ids.numel()
+            start = offset
+            end = start + length
+
+            samples.append({
+                "sample_idx": int(
+                    sample.get("sample_idx", sample_idx)
+                ),
+                "start": start,
+                "end": end,
+                "length": length,
+            })
+
+            token_parts.append(token_ids)
+            vq_parts.append(vq_ids)
+            offset = end
+
+        token_ids_flat = torch.cat(token_parts)
+        vq_ids_flat = torch.cat(vq_parts)
+
+        print(
+            f"[converted] samples={len(samples):,} "
+            f"tokens={token_ids_flat.numel():,}"
+        )
+
+    else:
+        raise ValueError(
+            "Unsupported sample format. "
+            f"First sample keys: {list(first_sample.keys())}"
+        )
 
     if len(token_ids_flat) != len(vq_ids_flat):
         raise ValueError(
@@ -1195,13 +1272,15 @@ def main():
             f"token_ids={len(token_ids_flat):,}, "
             f"vq_ids={len(vq_ids_flat):,}"
         )
-    for s in samples:
-        start = int(s["start"])
-        end = int(s["end"])
+
+    for sample_idx, sample in enumerate(samples):
+        start = int(sample["start"])
+        end = int(sample["end"])
 
         if not (0 <= start <= end <= len(token_ids_flat)):
             raise ValueError(
-                f"Invalid sample range: start={start}, end={end}, "
+                f"Invalid sample range at sample {sample_idx}: "
+                f"start={start}, end={end}, "
                 f"flat_len={len(token_ids_flat)}"
             )
 
@@ -1583,12 +1662,16 @@ def main():
             attn_mask = attn_mask.to(device)
 
             key_padding_mask = ~attn_mask
-            if vq_in.min() < 0 or vq_in.max() >= model.vq_emb.num_embeddings:
-                print("[BAD vq_in]")
-                print("vq_in min:", int(vq_in.min()))
-                print("vq_in max:", int(vq_in.max()))
-                print("model.vq_emb.num_embeddings:", model.vq_emb.num_embeddings)
-                raise RuntimeError("vq_in out of range")
+            if model.vq_emb is not None:
+                if vq_in.min() < 0 or vq_in.max() >= model.vq_emb.num_embeddings:
+                    print("[BAD vq_in]")
+                    print("vq_in min:", int(vq_in.min()))
+                    print("vq_in max:", int(vq_in.max()))
+                    print(
+                        "model.vq_emb.num_embeddings:",
+                        model.vq_emb.num_embeddings,
+                    )
+                    raise RuntimeError("vq_in out of range")
 
             valid_vq_y = vq_y[vq_y.ne(-100)]
 
