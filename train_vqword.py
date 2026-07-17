@@ -68,7 +68,9 @@ class VQWordGNN(nn.Module):
     ):
         super().__init__()
         self.hop = hop
-        self.seq_len = 2 * hop + 1
+
+        # 過去hop個 + 現在位置
+        self.seq_len = hop + 1
         self.center_idx = hop
         self.center_scale = center_scale
 
@@ -124,12 +126,16 @@ def assign_blockwise(z, centers, k_block=4096):
 
 def make_windows(token_ids, hop, pad_id):
     ids = torch.tensor(token_ids, dtype=torch.long)
-    padded = F.pad(ids, (hop, hop), value=pad_id)
+
+    # 左側だけpaddingする
+    padded = F.pad(ids, (hop, 0), value=pad_id)
 
     ctx = []
     tgt = []
+
     for i in range(len(ids)):
-        ctx.append(padded[i:i + 2 * hop + 1])
+        # 過去hop個 + 現在位置
+        ctx.append(padded[i:i + hop + 1])
         tgt.append(ids[i])
 
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
