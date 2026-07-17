@@ -32,7 +32,7 @@ def compute_cluster_metrics(y, k_req, topk=5):
     }
 
 
-def make_adj_bidirectional(seq_len, hop, device):
+def make_adj_within_window(seq_len, hop, device):
     pos = torch.arange(seq_len, device=device)
     receiver = pos[:, None]
     sender = pos[None, :]
@@ -91,7 +91,7 @@ class VQWordGNN(nn.Module):
         tok_h[:, self.center_idx, :] *= self.center_scale
 
         h = self.dropout(tok_h + self.pos_emb(pos))
-        adj = make_adj_bidirectional(length, self.hop, ctx_ids.device)
+        adj = make_adj_within_window(length, self.hop, ctx_ids.device)
 
         for layer in self.layers:
             h = layer(h, adj)
