@@ -771,11 +771,13 @@ set net:max-retries 5
 set net:timeout 30
 set cmd:fail-exit yes
 
-mkdir -p ${FTP_REMOTE_ROOT}
-cd ${FTP_REMOTE_ROOT}
+# lftp の mkdir は、既存ディレクトリに対して失敗することがある。
+# cmd:fail-exit=yes のままでも止まらないよう、存在確認してから作成する。
+cls -d "${FTP_REMOTE_ROOT}" >/dev/null 2>&1 || mkdir "${FTP_REMOTE_ROOT}"
+cd "${FTP_REMOTE_ROOT}"
 
-mkdir -p ${RUN_NAME}
-cd ${RUN_NAME}
+cls -d "${RUN_NAME}" >/dev/null 2>&1 || mkdir "${RUN_NAME}"
+cd "${RUN_NAME}"
 
 put "${RUN_DIR}/pipeline.log" -o pipeline.log
 put "${DISCOVER_LOG}" -o discover.log
