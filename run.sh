@@ -608,6 +608,7 @@ python ar.py \
   --epochs "${FINETUNE_EPOCHS}" \
   --batch_size "${AR_BATCH_SIZE}" \
   --d_model "${AR_D_MODEL}" \
+  --init_source bpe \
   --n_layers "${AR_N_LAYERS}" \
   --n_heads "${AR_N_HEADS}" \
   --lr "${AR_LR}" \
