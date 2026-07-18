@@ -22,6 +22,10 @@ set -euo pipefail
 #   TOKENIZER_DIR=/vqword/tokenizer_wikitext103_bpe50k
 #   PRETRAIN_EPOCHS=40
 #   FINETUNE_EPOCHS=30
+#   FTP_USER=your-user
+#   FTP_PASS=your-password
+#   FTP_HOST=ftp.example.com
+#   FTP_REMOTE_ROOT=vqword_logs
 # ============================================================
 
 VQ_CODEBOOK_SIZE="${1:-}"
@@ -99,6 +103,13 @@ AR_LR="${AR_LR:-3e-4}"
 PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-40}"
 FINETUNE_EPOCHS="${FINETUNE_EPOCHS:-30}"
 AUX_LAMBDA="${AUX_LAMBDA:-0.05}"
+
+# 最後にログだけをFTPへ送る。
+# 認証情報はシェルへ直書きせず、環境変数で渡す。
+FTP_USER="${FTP_USER:-}"
+FTP_PASS="${FTP_PASS:-}"
+FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
+FTP_REMOTE_ROOT="${FTP_REMOTE_ROOT:-vqword_logs}"
 
 # ============================================================
 # リポジトリと実行ディレクトリ
@@ -225,6 +236,9 @@ FINETUNE_BEST="${FINETUNE_PREFIX}.pt"
 FINETUNE_LAST="${FINETUNE_PREFIX}_last.pt"
 FINETUNE_LOG="${FINETUNE_PREFIX}.log"
 
+DISCOVER_LOG="${RUN_DIR}/discover.log"
+ASSIGN_LOG="${RUN_DIR}/assign.log"
+
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 require_file() {
@@ -266,11 +280,13 @@ python train_vqword.py \
   --batch_size "${DISCOVER_BATCH_SIZE}" \
   --k_block "${K_BLOCK}" \
   --seed "${DISCRETIZATION_SEED}" \
-  --out "${DISCOVER_CKPT}"
+  --out "${DISCOVER_CKPT}" \
+  2>&1 | tee "${DISCOVER_LOG}"
 
 require_file "${DISCOVER_CKPT}"
 require_file "${DISCOVER_DICTIONARY}"
 require_file "${DISCOVER_IDS}"
+require_file "${DISCOVER_LOG}"
 
 ls -lh \
   "${DISCOVER_CKPT}" \
@@ -358,10 +374,12 @@ python assign_vqword_ids.py \
   --seq_len "${TINYSTORIES_SEQ_LEN}" \
   --batch_size "${ASSIGN_BATCH_SIZE}" \
   --k_block "${K_BLOCK}" \
-  --out "${TINYSTORIES_IDS}"
+  --out "${TINYSTORIES_IDS}" \
+  2>&1 | tee "${ASSIGN_LOG}"
 
 require_file "${TINYSTORIES_IDS}"
-ls -lh "${TINYSTORIES_IDS}"
+require_file "${ASSIGN_LOG}"
+ls -lh "${TINYSTORIES_IDS}" "${ASSIGN_LOG}"
 
 python - "${TINYSTORIES_IDS}" "${VQ_CODEBOOK_SIZE}" <<'PY'
 import sys
@@ -653,6 +671,12 @@ pretrain_best=${PRETRAIN_BEST}
 pretrain_last=${PRETRAIN_LAST}
 finetune_best=${FINETUNE_BEST}
 finetune_last=${FINETUNE_LAST}
+
+pipeline_log=${RUN_DIR}/pipeline.log
+discover_log=${DISCOVER_LOG}
+assign_log=${ASSIGN_LOG}
+pretrain_log=${PRETRAIN_LOG}
+finetune_log=${FINETUNE_LOG}
 EOF
 
 find "${RUN_DIR}" -maxdepth 1 -type f \
@@ -661,6 +685,76 @@ find "${RUN_DIR}" -maxdepth 1 -type f \
   | sort -z \
   | xargs -0 sha256sum \
   > "${RUN_DIR}/SHA256SUMS"
+
+# ============================================================
+# 最後にログと実行情報だけをFTPへアップロード
+#
+# アップロード対象:
+#   pipeline.log
+#   discover.log
+#   assign.log
+#   pretrain.log
+#   finetune.log
+#   run_config.txt
+#   SHA256SUMS
+#
+# checkpoint、dictionary、IDデータはアップロードしない。
+# ============================================================
+
+if [[ -n "${FTP_USER}" && -n "${FTP_PASS}" ]]; then
+  echo "============================================================"
+  echo "[upload logs only]"
+  echo "host        = ${FTP_HOST}"
+  echo "remote root = ${FTP_REMOTE_ROOT}"
+  echo "remote run  = ${RUN_NAME}"
+  echo "============================================================"
+
+  if ! command -v lftp >/dev/null 2>&1; then
+    apt update
+    apt install -y lftp
+  fi
+
+  require_file "${RUN_DIR}/pipeline.log"
+  require_file "${DISCOVER_LOG}"
+  require_file "${ASSIGN_LOG}"
+  require_file "${PRETRAIN_LOG}"
+  require_file "${FINETUNE_LOG}"
+  require_file "${RUN_DIR}/run_config.txt"
+  require_file "${RUN_DIR}/SHA256SUMS"
+
+  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+set ftp:ssl-allow no
+set net:max-retries 5
+set net:timeout 30
+set cmd:fail-exit yes
+
+mkdir -p ${FTP_REMOTE_ROOT}
+cd ${FTP_REMOTE_ROOT}
+
+mkdir -p ${RUN_NAME}
+cd ${RUN_NAME}
+
+put "${RUN_DIR}/pipeline.log" -o pipeline.log
+put "${DISCOVER_LOG}" -o discover.log
+put "${ASSIGN_LOG}" -o assign.log
+put "${PRETRAIN_LOG}" -o pretrain.log
+put "${FINETUNE_LOG}" -o finetune.log
+put "${RUN_DIR}/run_config.txt" -o run_config.txt
+put "${RUN_DIR}/SHA256SUMS" -o SHA256SUMS
+
+bye
+EOF
+
+  echo "[upload logs only] completed"
+else
+  echo "============================================================"
+  echo "[upload logs only] skipped"
+  echo "Set FTP_USER and FTP_PASS to enable the final log upload."
+  echo "Example:"
+  echo "  FTP_USER='user' FTP_PASS='pass' FTP_HOST='ftp.lolipop.jp' \\"
+  echo "    bash $0 ${VQ_CODEBOOK_SIZE} ${HOP}"
+  echo "============================================================"
+fi
 
 echo "============================================================"
 echo "[completed]"
@@ -673,4 +767,9 @@ echo "finetune best = ${FINETUNE_BEST}"
 echo "config        = ${RUN_DIR}/run_config.txt"
 echo "checksums     = ${RUN_DIR}/SHA256SUMS"
 echo "pipeline log  = ${RUN_DIR}/pipeline.log"
+echo "discover log  = ${DISCOVER_LOG}"
+echo "assign log    = ${ASSIGN_LOG}"
+echo "pretrain log  = ${PRETRAIN_LOG}"
+echo "finetune log  = ${FINETUNE_LOG}"
+echo "FTP logs      = ${FTP_REMOTE_ROOT}/${RUN_NAME}/"
 echo "============================================================"
