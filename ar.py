@@ -1141,6 +1141,16 @@ def main():
     ap.add_argument("--vq_only", action="store_true")
     ap.add_argument("--token_only", action="store_true")
     ap.add_argument("--init_from", default=None, help="pretrained AR checkpoint .pt")
+    ap.add_argument(
+        "--init_source",
+        choices=["vq", "bpe"],
+        default="vq",
+        help=(
+            "checkpoint type used by --init_from: "
+            "'vq' for VQ-pretrained model, "
+            "'bpe' for token-only BPE baseline"
+        ),
+    )
     ap.add_argument("--reset_heads", action="store_true")
     ap.add_argument("--dictionary", default=None)
     ap.add_argument("--dict_loss", action="store_true")
@@ -1511,58 +1521,246 @@ def main():
         model.raw_vq_loss_weight.requires_grad = False
 
     if args.init_from is not None:
-        ckpt = torch.load(args.init_from, map_location="cpu")
-        sd = ckpt["model"]
-        sd.pop("tok_head.weight", None)
-        sd.pop("tok_head.bias", None)
-        old_vq_size = sd["vq_emb.weight"].shape[0]
-        new_vq_size = model.vq_emb.weight.shape[0]
+        ckpt = torch.load(
+            args.init_from,
+            map_location="cpu",
+            weights_only=False,
+        )
 
-        if old_vq_size != new_vq_size:
-            print(f"[resize ckpt vq] {old_vq_size} -> {new_vq_size}")
+        if "model" not in ckpt:
+            raise KeyError(
+                f"Checkpoint does not contain 'model': "
+                f"{args.init_from}"
+            )
 
-            old_w = sd["vq_emb.weight"]
-            new_w = model.vq_emb.weight.detach().cpu().clone()
-            new_w[:old_vq_size] = old_w
-            sd["vq_emb.weight"] = new_w
+        # 元checkpointの辞書を壊さないようコピーする
+        sd = dict(ckpt["model"])
 
-            old_w = sd["vq_head.weight"]
-            new_w = model.vq_head.weight.detach().cpu().clone()
-            new_w[:old_vq_size] = old_w
-            sd["vq_head.weight"] = new_w
-
-            old_b = sd["vq_head.bias"]
-            new_b = model.vq_head.bias.detach().cpu().clone()
-            new_b[:old_vq_size] = old_b
-            sd["vq_head.bias"] = new_b
-        missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"[init_from] {args.init_from}")
+        print(f"[init_source] {args.init_source}")
+
+        # ====================================================
+        # VQ pretrained checkpointから初期化
+        # ====================================================
+        if args.init_source == "vq":
+            # VQ pretrain時のtok_headは使わない
+            sd.pop("tok_head.weight", None)
+            sd.pop("tok_head.bias", None)
+
+            if "vq_emb.weight" not in sd:
+                raise KeyError(
+                    "VQ checkpoint does not contain "
+                    "'vq_emb.weight'"
+                )
+
+            old_vq_size = sd["vq_emb.weight"].shape[0]
+            new_vq_size = model.vq_emb.weight.shape[0]
+
+            if old_vq_size != new_vq_size:
+                print(
+                    f"[resize ckpt vq] "
+                    f"{old_vq_size} -> {new_vq_size}"
+                )
+
+                copy_n = min(old_vq_size, new_vq_size)
+
+                # ----------------------------
+                # VQ embedding
+                # ----------------------------
+                old_w = sd["vq_emb.weight"]
+                new_w = (
+                    model.vq_emb.weight
+                    .detach()
+                    .cpu()
+                    .clone()
+                )
+                new_w[:copy_n] = old_w[:copy_n]
+                sd["vq_emb.weight"] = new_w
+
+                # ----------------------------
+                # VQ output head
+                # ----------------------------
+                if "vq_head.weight" in sd:
+                    old_w = sd["vq_head.weight"]
+                    new_w = (
+                        model.vq_head.weight
+                        .detach()
+                        .cpu()
+                        .clone()
+                    )
+                    new_w[:copy_n] = old_w[:copy_n]
+                    sd["vq_head.weight"] = new_w
+
+                if "vq_head.bias" in sd:
+                    old_b = sd["vq_head.bias"]
+                    new_b = (
+                        model.vq_head.bias
+                        .detach()
+                        .cpu()
+                        .clone()
+                    )
+                    new_b[:copy_n] = old_b[:copy_n]
+                    sd["vq_head.bias"] = new_b
+
+        # ====================================================
+        # token-only BPE baselineから初期化
+        # ====================================================
+        elif args.init_source == "bpe":
+            print("[bpe init] loading token-only BPE baseline")
+
+            # BPE baselineから引き継ぐもの
+            #
+            #   tok_emb
+            #   pos_emb
+            #   Transformer
+            #   norm
+            #   tok_head
+            #
+            # VQ関連とfusionは今回のモデル用に新規初期化する。
+
+            sd.pop("vq_emb.weight", None)
+            sd.pop("vq_head.weight", None)
+            sd.pop("vq_head.bias", None)
+
+            sd.pop("input_fusion.weight", None)
+            sd.pop("input_fusion.bias", None)
+
+            # 今回指定したVQ loss weightを使う
+            sd.pop("raw_vq_loss_weight", None)
+
+            current_sd = model.state_dict()
+
+            required_bpe_keys = [
+                "tok_emb.weight",
+                "pos_emb.weight",
+                "tok_head.weight",
+                "tok_head.bias",
+            ]
+
+            for key in required_bpe_keys:
+                if key not in sd:
+                    raise KeyError(
+                        f"BPE checkpoint is missing required key: "
+                        f"{key}"
+                    )
+
+                if sd[key].shape != current_sd[key].shape:
+                    raise ValueError(
+                        f"Shape mismatch for {key}: "
+                        f"checkpoint={tuple(sd[key].shape)}, "
+                        f"current={tuple(current_sd[key].shape)}"
+                    )
+
+            # Transformer層の形も事前確認
+            for key, value in sd.items():
+                if key not in current_sd:
+                    continue
+
+                if value.shape != current_sd[key].shape:
+                    raise ValueError(
+                        f"Shape mismatch for {key}: "
+                        f"checkpoint={tuple(value.shape)}, "
+                        f"current={tuple(current_sd[key].shape)}"
+                    )
+
+        # ====================================================
+        # 共通：checkpointをロード
+        # ====================================================
+        missing, unexpected = model.load_state_dict(
+            sd,
+            strict=False,
+        )
+
         print(f"[init] missing={missing}")
         print(f"[init] unexpected={unexpected}")
 
+        # ====================================================
+        # BPE初期化時：
+        # fusion([BPE, VQW]) = BPE
+        #
+        # concat順：
+        #   [tok_h | vq_h]
+        #
+        # fusion重み：
+        #   [I | 0]
+        # ====================================================
+        if args.init_source == "bpe":
+            if model.input_fusion is None:
+                raise RuntimeError(
+                    "BPE initialization requires input_fusion. "
+                    "Run with --mode finetune."
+                )
+
+            d_model = model.tok_emb.embedding_dim
+
+            with torch.no_grad():
+                model.input_fusion.weight.zero_()
+                model.input_fusion.bias.zero_()
+
+                identity = torch.eye(
+                    d_model,
+                    device=model.input_fusion.weight.device,
+                    dtype=model.input_fusion.weight.dtype,
+                )
+
+                # 左半分＝BPE側をIdentityにする
+                model.input_fusion.weight[
+                    :,
+                    :d_model
+                ].copy_(identity)
+
+            print(
+                "[fusion init] "
+                "BPE path = identity, VQW path = zero"
+            )
+
+        # reset_headsを明示した場合だけheadを初期化し直す
         if args.reset_heads:
             print("[init] reset tok_head / vq_head")
             model.tok_head.reset_parameters()
             model.vq_head.reset_parameters()
 
+        # ====================================================
+        # freeze処理
+        # ====================================================
         if args.freeze_vq_backbone:
             for p in model.parameters():
                 p.requires_grad = False
 
-            # Keep the pretrained VQ path fixed, while allowing the newly
-            # added BPE path and fusion layer to learn.
-            if model.tok_emb is not None:
-                for p in model.tok_emb.parameters():
+            if args.init_source == "vq":
+                # 従来：
+                # VQ経路を固定し、新しいBPE側を学習
+                if model.tok_emb is not None:
+                    for p in model.tok_emb.parameters():
+                        p.requires_grad = True
+
+                if model.input_fusion is not None:
+                    for p in model.input_fusion.parameters():
+                        p.requires_grad = True
+
+                for p in model.tok_head.parameters():
                     p.requires_grad = True
 
-            if model.input_fusion is not None:
-                for p in model.input_fusion.parameters():
-                    p.requires_grad = True
+                print(
+                    "[freeze] "
+                    "train tok_emb + input_fusion + tok_head"
+                )
 
-            for p in model.tok_head.parameters():
-                p.requires_grad = True
+            elif args.init_source == "bpe":
+                # BPE baselineを固定し、
+                # VQ embeddingとfusionだけ学習する場合
+                if model.vq_emb is not None:
+                    for p in model.vq_emb.parameters():
+                        p.requires_grad = True
 
-            print("[freeze] train tok_emb + input_fusion + tok_head")
+                if model.input_fusion is not None:
+                    for p in model.input_fusion.parameters():
+                        p.requires_grad = True
+
+                print(
+                    "[freeze] "
+                    "train vq_emb + input_fusion"
+                )
 
     # ===========================
     # 評価のみ

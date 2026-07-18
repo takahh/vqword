@@ -580,22 +580,29 @@ if args.get("main_target") not in (None, "vq"):
 
 print("[check] pretrain checkpoint OK:", path)
 PY
-
 # ============================================================
 # Stage 4: BPE + VQW -> BPE autoregressive finetuning
 # ============================================================
 
+BPE_BASELINE_CKPT="${BPE_BASELINE_CKPT:-/vqword/ar_token_only_20260624_015604.pt}"
+
 echo "============================================================"
 echo "[stage 4/4] BPE + VQW -> BPE finetuning"
-echo "data      = ${TINYSTORIES_IDS}"
-echo "init_from = ${PRETRAIN_BEST}"
-echo "best      = ${FINETUNE_BEST}"
+echo "data        = ${TINYSTORIES_IDS}"
+echo "init_from   = ${BPE_BASELINE_CKPT}"
+echo "best        = ${FINETUNE_BEST}"
 echo "============================================================"
+
+if [[ ! -s "${BPE_BASELINE_CKPT}" ]]; then
+  echo "[error] BPE baseline checkpoint not found:"
+  echo "        ${BPE_BASELINE_CKPT}"
+  exit 1
+fi
 
 python ar.py \
   --mode finetune \
   --data "${TINYSTORIES_IDS}" \
-  --init_from "${PRETRAIN_BEST}" \
+  --init_from "${BPE_BASELINE_CKPT}" \
   --main_target tok \
   --aux_lambda "${AUX_LAMBDA}" \
   --epochs "${FINETUNE_EPOCHS}" \
