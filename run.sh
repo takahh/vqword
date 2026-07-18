@@ -180,7 +180,6 @@ echo "[git] commit=${GIT_COMMIT}"
 # ============================================================
 
 TOKENIZER_DIR="${TOKENIZER_DIR:-${REPO_DIR}/tokenizer_wikitext103_bpe${BPE_VOCAB_LABEL}}"
-TOKENIZER_REMOTE_DIR="${TOKENIZER_REMOTE_DIR:-bpe_wikitext103_50k}"
 
 # 旧名称のローカルディレクトリも自動検出
 if [[ ! -f "${TOKENIZER_DIR}/tokenizer.json" ]]; then
@@ -211,7 +210,6 @@ if [[ "${tokenizer_complete}" != "true" ]]; then
   echo "============================================================"
   echo "[download BPE tokenizer only]"
   echo "local directory  = ${TOKENIZER_DIR}"
-  echo "remote directory = ${TOKENIZER_REMOTE_DIR}"
   echo "============================================================"
 
   if [[ -z "${FTP_USER}" || -z "${FTP_PASS}" ]]; then
@@ -233,7 +231,6 @@ set net:max-retries 5
 set net:timeout 30
 set cmd:fail-exit yes
 
-cd ${TOKENIZER_REMOTE_DIR}
 
 get vocab.json -o ${TOKENIZER_DIR}/vocab.json
 get merges.txt -o ${TOKENIZER_DIR}/merges.txt
