@@ -26,6 +26,7 @@ set -euo pipefail
 #   FTP_PASS=your-password
 #   FTP_HOST=ftp.example.com
 #   FTP_REMOTE_ROOT=vqword_logs
+#   TOKENIZER_REMOTE_DIR=bpe_wikitext103_50k
 # ============================================================
 
 VQ_CODEBOOK_SIZE="${1:-}"
@@ -171,16 +172,17 @@ GIT_COMMIT="$(git rev-parse HEAD)"
 echo "[git] commit=${GIT_COMMIT}"
 
 # ============================================================
-# BPE tokenizer確認
+# BPE tokenizer確認・必要時のみFTP取得
 #
-# lftpは使わない。
-# tokenizerはリポジトリ内、またはTOKENIZER_DIRで指定した場所に
-# すでに存在している必要がある。
+# tokenizerがローカルにあればそのまま使用する。
+# 見つからない場合だけ、FTPから4ファイルを取得する。
+# checkpointやIDデータはFTPから取得しない。
 # ============================================================
 
 TOKENIZER_DIR="${TOKENIZER_DIR:-${REPO_DIR}/tokenizer_wikitext103_bpe${BPE_VOCAB_LABEL}}"
+TOKENIZER_REMOTE_DIR="${TOKENIZER_REMOTE_DIR:-bpe_wikitext103_50k}"
 
-# 旧名称のディレクトリも自動検出
+# 旧名称のローカルディレクトリも自動検出
 if [[ ! -f "${TOKENIZER_DIR}/tokenizer.json" ]]; then
   LEGACY_TOKENIZER_DIR="${REPO_DIR}/bpe_wikitext103_50k"
 
@@ -196,12 +198,56 @@ TOKENIZER_FILES=(
   "tokenizer_config.json"
 )
 
+tokenizer_complete=true
+
 for filename in "${TOKENIZER_FILES[@]}"; do
   if [[ ! -s "${TOKENIZER_DIR}/${filename}" ]]; then
-    echo "[error] tokenizer file is missing or empty:"
+    tokenizer_complete=false
+    break
+  fi
+done
+
+if [[ "${tokenizer_complete}" != "true" ]]; then
+  echo "============================================================"
+  echo "[download BPE tokenizer only]"
+  echo "local directory  = ${TOKENIZER_DIR}"
+  echo "remote directory = ${TOKENIZER_REMOTE_DIR}"
+  echo "============================================================"
+
+  if [[ -z "${FTP_USER}" || -z "${FTP_PASS}" ]]; then
+    echo "[error] BPE tokenizer is missing and FTP credentials are not set."
+    echo "Set FTP_USER and FTP_PASS."
+    exit 1
+  fi
+
+  if ! command -v lftp >/dev/null 2>&1; then
+    apt update
+    apt install -y lftp
+  fi
+
+  mkdir -p "${TOKENIZER_DIR}"
+
+  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+set ftp:ssl-allow no
+set net:max-retries 5
+set net:timeout 30
+set cmd:fail-exit yes
+
+cd ${TOKENIZER_REMOTE_DIR}
+
+get vocab.json -o ${TOKENIZER_DIR}/vocab.json
+get merges.txt -o ${TOKENIZER_DIR}/merges.txt
+get tokenizer.json -o ${TOKENIZER_DIR}/tokenizer.json
+get tokenizer_config.json -o ${TOKENIZER_DIR}/tokenizer_config.json
+
+bye
+EOF
+fi
+
+for filename in "${TOKENIZER_FILES[@]}"; do
+  if [[ ! -s "${TOKENIZER_DIR}/${filename}" ]]; then
+    echo "[error] tokenizer file is missing or empty after download:"
     echo "        ${TOKENIZER_DIR}/${filename}"
-    echo
-    echo "Set TOKENIZER_DIR to the local BPE tokenizer directory."
     exit 1
   fi
 done
