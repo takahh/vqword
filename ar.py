@@ -2031,14 +2031,6 @@ def main():
                 f"test_tok_ppl={test['tok_ppl']:.2f} "
                 f"test_vq_ppl={test['vq_ppl']:.2f}"
             )
-        else:
-            print(
-                f"[eval] ep={ep} "
-                f"valid_tok_ppl={valid['tok_ppl']:.2f} "
-                f"valid_vq_ppl={valid['vq_ppl']:.2f} "
-                f"test_tok_ppl={test['tok_ppl']:.2f} "
-                f"test_vq_ppl={test['vq_ppl']:.2f}"
-            )
 
         if pipe_valid is not None:
             print(
@@ -2090,6 +2082,7 @@ def main():
             print(f"[save] {args.out}")
 
         torch.save({
+            "epoch": ep,
             "model": model.state_dict(),
             "args": vars(args),
             "tokenizer": tokenizer_name,
