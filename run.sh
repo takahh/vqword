@@ -504,9 +504,23 @@ PY
 BPE_BASELINE_CKPT="${BPE_BASELINE_CKPT:-/vqword/ar_token_only_20260624_015604.pt}"
 
 if [[ ! -s "${BPE_BASELINE_CKPT}" ]]; then
-  echo "[download] BPE baseline checkpoint"
+  echo "============================================================"
+  echo "[download BPE baseline checkpoint]"
+  echo "output = ${BPE_BASELINE_CKPT}"
+  echo "============================================================"
 
-  lftp -u "chicappa.jp-wakou","実際のFTPパスワード" ftp.lolipop.jp <<EOF
+  if [[ -z "${FTP_USER}" || -z "${FTP_PASS}" ]]; then
+    echo "[error] BPE checkpoint is missing and FTP credentials are not set."
+    echo "Set FTP_USER and FTP_PASS."
+    exit 1
+  fi
+
+  if ! command -v lftp >/dev/null 2>&1; then
+    apt update
+    apt install -y lftp
+  fi
+
+  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
@@ -517,6 +531,7 @@ get ar_token_only_20260624_015604.pt -o "${BPE_BASELINE_CKPT}"
 bye
 EOF
 fi
+
 
 if [[ ! -s "${BPE_BASELINE_CKPT}" ]]; then
   echo "[error] BPE baseline checkpoint not found:"
