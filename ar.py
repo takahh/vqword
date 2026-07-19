@@ -2008,13 +2008,27 @@ def main():
                 model, test_loader, device, vq2word_ids, topk=16
             )
 
-        valid_loss = valid["tok_loss"]
-        test_loss = test["tok_loss"]
+        if args.mode == "pretrain":
+            # VQ pretrainではvalid VQ lossをbest判定に使う
+            valid_loss = valid["vq_loss"]
+            test_loss = test["vq_loss"]
+        else:
+            # finetuneではvalid token lossをbest判定に使う
+            valid_loss = valid["tok_loss"]
+            test_loss = test["tok_loss"]
 
         if args.mode == "pretrain":
             print(
                 f"[eval] ep={ep} "
                 f"valid_vq_ppl={valid['vq_ppl']:.2f} "
+                f"test_vq_ppl={test['vq_ppl']:.2f}"
+            )
+        else:
+            print(
+                f"[eval] ep={ep} "
+                f"valid_tok_ppl={valid['tok_ppl']:.2f} "
+                f"valid_vq_ppl={valid['vq_ppl']:.2f} "
+                f"test_tok_ppl={test['tok_ppl']:.2f} "
                 f"test_vq_ppl={test['vq_ppl']:.2f}"
             )
         else:
