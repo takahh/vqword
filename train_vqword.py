@@ -210,55 +210,81 @@ def count_ivf_lists(model, ctx, ivf_centers, batch_size, device, k_block):
     return counts
 
 
-def allocate_k_per_ivf_list(ivf_counts, requested_k):
-    """Allocate final centers in proportion to point counts."""
-    counts = ivf_counts.long()
-    nonempty = counts > 0
-    n_nonempty = int(nonempty.sum().item())
-    target_k = min(int(requested_k), int(counts.sum().item()))
+def allocate_k_per_ivf_list(
+    ivf_counts: torch.Tensor,
+    requested_k: int,
+) -> torch.Tensor:
+    """
+    各IVFリストに割り当てるfine center数を決める。
 
-    if target_k < n_nonempty:
+    方針:
+      - すべてのIVFリストに最低1個割り当てる
+      - 残りを、各リストのデータ数に比例して配分する
+      - 合計はrequested_kに厳密に一致させる
+    """
+    ivf_counts = ivf_counts.to(dtype=torch.long)
+    requested_k = int(requested_k)
+
+    nlist = int(ivf_counts.numel())
+
+    if requested_k < nlist:
         raise ValueError(
-            f"global_codebook_size={target_k} is smaller than "
-            f"nonempty IVF lists={n_nonempty}. Reduce --ivf_nlist."
+            f"requested_k={requested_k} is smaller than "
+            f"number of IVF lists={nlist}. "
+            "Cannot assign at least one fine center to every IVF list."
         )
 
-    k_per_list = torch.zeros_like(counts)
-    k_per_list[nonempty] = 1
-    remaining = target_k - n_nonempty
+    device = ivf_counts.device
+
+    # すべてのIVFリストに最低1個
+    k_per_list = torch.ones(
+        nlist,
+        dtype=torch.long,
+        device=device,
+    )
+
+    remaining = requested_k - nlist
+
     if remaining == 0:
         return k_per_list
 
-    capacity = (counts - k_per_list).clamp_min(0)
-    weights = counts.double()
-    ideal = remaining * weights / weights.sum().clamp_min(1.0)
-    extra = torch.minimum(torch.floor(ideal).long(), capacity)
+    weights = ivf_counts.to(dtype=torch.float64)
+
+    # 念のため、全カウントが0の場合にも対応
+    if float(weights.sum().item()) <= 0.0:
+        weights = torch.ones_like(weights)
+
+    # 残りを点数に比例配分
+    raw_extra = weights / weights.sum() * remaining
+    extra = torch.floor(raw_extra).to(dtype=torch.long)
+
     k_per_list += extra
-    remaining -= int(extra.sum().item())
 
-    fractional = ideal - torch.floor(ideal)
-    while remaining > 0:
-        available = k_per_list < counts
-        if not available.any():
-            break
-        score = fractional.clone()
-        score[~available] = -1.0
-        for list_id in torch.argsort(score, descending=True).tolist():
-            if remaining <= 0:
-                break
-            if k_per_list[list_id] >= counts[list_id]:
-                continue
-            k_per_list[list_id] += 1
-            remaining -= 1
+    # floorにより余ったcenterを小数部分が大きい順に配る
+    leftover = requested_k - int(k_per_list.sum().item())
 
-    if int(k_per_list.sum().item()) != target_k:
+    if leftover > 0:
+        fractional = raw_extra - extra.to(dtype=raw_extra.dtype)
+        order = torch.argsort(fractional, descending=True)
+        k_per_list[order[:leftover]] += 1
+
+    # 最終チェック
+    actual_total = int(k_per_list.sum().item())
+
+    if actual_total != requested_k:
         raise RuntimeError(
-            f"Failed to allocate final K: allocated={int(k_per_list.sum())}, "
-            f"target={target_k}"
+            f"k allocation mismatch: "
+            f"actual={actual_total}, requested={requested_k}"
+        )
+
+    if int(k_per_list.min().item()) < 1:
+        zero_lists = torch.where(k_per_list < 1)[0]
+        raise RuntimeError(
+            "Some IVF lists received no fine centers: "
+            f"{zero_lists[:50].tolist()}"
         )
 
     return k_per_list
-
 
 @torch.no_grad()
 def initialize_fine_centers_streaming(
@@ -270,42 +296,203 @@ def initialize_fine_centers_streaming(
     device,
     k_block,
 ):
-    """Collect K initial points from each IVF list without per-point Python loops."""
+    """
+    Collect initial fine centers from each IVF list.
+
+    実データ点を優先して使い、必要数に足りないIVFリストについては、
+    対応するcoarse IVF centerで不足分を埋める。
+    """
     nlist = ivf_centers.size(0)
     d_model = ivf_centers.size(1)
-    offsets = torch.zeros(nlist + 1, dtype=torch.long)
+
+    # CPU上で扱う型を明示的に統一
+    k_per_list = k_per_list.to(
+        device="cpu",
+        dtype=torch.long,
+    )
+
+    if k_per_list.numel() != nlist:
+        raise ValueError(
+            f"k_per_list size mismatch: "
+            f"{k_per_list.numel()} != nlist={nlist}"
+        )
+
+    if torch.any(k_per_list <= 0):
+        bad = torch.where(k_per_list <= 0)[0]
+        raise ValueError(
+            "Every IVF list must receive at least one fine center. "
+            f"Bad lists: {bad[:20].tolist()}"
+        )
+
+    offsets = torch.zeros(
+        nlist + 1,
+        dtype=torch.long,
+    )
     offsets[1:] = torch.cumsum(k_per_list, dim=0)
+
     total_k = int(offsets[-1].item())
 
-    initial = torch.empty((total_k, d_model), dtype=torch.float32)
-    filled = torch.zeros(nlist, dtype=torch.long)
-    coarse = ivf_centers.to(device)
+    initial = torch.empty(
+        (total_k, d_model),
+        dtype=torch.float32,
+    )
 
-    for start in tqdm(range(0, len(ctx), batch_size), desc="[fine init]"):
-        z, _ = encode_batch(model, ctx, start, batch_size, device)
-        ivf_ids = assign_blockwise(z, coarse, k_block=k_block).cpu()
+    filled = torch.zeros(
+        nlist,
+        dtype=torch.long,
+    )
+
+    # coarseはassignment用としてdevice上に置く
+    coarse = F.normalize(
+        ivf_centers.to(
+            device=device,
+            dtype=torch.float32,
+        ),
+        dim=-1,
+    )
+
+    for start in tqdm(
+        range(0, len(ctx), batch_size),
+        desc="[fine init]",
+    ):
+        z, _ = encode_batch(
+            model,
+            ctx,
+            start,
+            batch_size,
+            device,
+        )
+
+        z = F.normalize(
+            z.to(dtype=torch.float32),
+            dim=-1,
+        )
+
+        ivf_ids = assign_blockwise(
+            z,
+            coarse,
+            k_block=k_block,
+        ).cpu()
+
         z_cpu = z.cpu()
 
         for list_id in torch.unique(ivf_ids).tolist():
-            need = int(k_per_list[list_id] - filled[list_id])
+            list_id = int(list_id)
+
+            need = int(
+                k_per_list[list_id].item()
+                - filled[list_id].item()
+            )
+
             if need <= 0:
                 continue
 
             candidates = z_cpu[ivf_ids == list_id]
-            take = min(need, candidates.size(0))
-            if take == 0:
+
+            take = min(
+                need,
+                int(candidates.size(0)),
+            )
+
+            if take <= 0:
                 continue
 
-            begin = int(offsets[list_id] + filled[list_id])
-            initial[begin:begin + take] = candidates[:take]
+            begin = int(
+                offsets[list_id].item()
+                + filled[list_id].item()
+            )
+
+            initial[begin : begin + take] = candidates[:take]
             filled[list_id] += take
 
         if torch.equal(filled, k_per_list):
             break
 
+    # --------------------------------------------------------
+    # 不足分を対応するcoarse IVF centerで埋める
+    # --------------------------------------------------------
+    coarse_cpu = coarse.cpu()
+
+    fallback_lists = torch.where(
+        filled < k_per_list
+    )[0]
+
+    fallback_center_count = 0
+
+    for list_id_tensor in fallback_lists:
+        list_id = int(list_id_tensor.item())
+
+        begin = int(
+            offsets[list_id].item()
+            + filled[list_id].item()
+        )
+        end = int(offsets[list_id + 1].item())
+
+        missing = end - begin
+
+        if missing <= 0:
+            continue
+
+        initial[begin:end] = coarse_cpu[list_id].unsqueeze(0).expand(
+            missing,
+            -1,
+        )
+
+        filled[list_id] += missing
+        fallback_center_count += missing
+
+    # --------------------------------------------------------
+    # 最終検査
+    # --------------------------------------------------------
     if not torch.equal(filled, k_per_list):
-        bad = torch.where(filled != k_per_list)[0].tolist()[:20]
-        raise RuntimeError(f"Failed to initialize fine centers for IVF lists: {bad}")
+        bad = torch.where(
+            filled != k_per_list
+        )[0]
+
+        details = [
+            {
+                "list": int(i),
+                "filled": int(filled[i]),
+                "required": int(k_per_list[i]),
+            }
+            for i in bad[:20].tolist()
+        ]
+
+        raise RuntimeError(
+            "Failed to initialize fine centers: "
+            f"{details}"
+        )
+
+    sizes_from_offsets = offsets[1:] - offsets[:-1]
+
+    if not torch.equal(
+        sizes_from_offsets,
+        k_per_list,
+    ):
+        bad = torch.where(
+            sizes_from_offsets != k_per_list
+        )[0]
+
+        raise RuntimeError(
+            "offsets do not match k_per_list: "
+            f"{bad[:20].tolist()}"
+        )
+
+    empty_lists = torch.where(
+        sizes_from_offsets == 0
+    )[0]
+
+    if empty_lists.numel() > 0:
+        raise RuntimeError(
+            "Some IVF lists have zero fine centers: "
+            f"{empty_lists[:20].tolist()}"
+        )
+
+    print(
+        f"[fine init] total_centers={total_k} "
+        f"fallback_lists={int(fallback_lists.numel())} "
+        f"fallback_centers={fallback_center_count}"
+    )
 
     return F.normalize(initial, dim=-1), offsets
 
@@ -433,12 +620,23 @@ def fit_global_ivf_then_kmeans_streaming(model, ctx, batch_size, device, args):
         ivf_counts=ivf_counts,
         requested_k=args.global_codebook_size,
     )
+
+    zero_lists = torch.where(k_per_list == 0)[0]
     nonzero = k_per_list[k_per_list > 0]
+
     print(
         f"[stage 2 allocation] total={int(k_per_list.sum())} "
-        f"min={int(nonzero.min())} mean={nonzero.float().mean().item():.2f} "
-        f"max={int(nonzero.max())}"
+        f"min={int(nonzero.min())} "
+        f"mean={nonzero.float().mean().item():.2f} "
+        f"max={int(nonzero.max())} "
+        f"zero_lists={int(zero_lists.numel())}"
     )
+
+    if zero_lists.numel() > 0:
+        raise RuntimeError(
+            "Allocation produced zero-center IVF lists: "
+            f"{zero_lists[:50].tolist()}"
+        )
 
     print("[stage 2] initialize fine centers")
     fine_centers, offsets = initialize_fine_centers_streaming(
@@ -449,6 +647,41 @@ def fit_global_ivf_then_kmeans_streaming(model, ctx, batch_size, device, args):
         batch_size=batch_size,
         device=device,
         k_block=args.k_block,
+    )
+
+    expected_total = int(k_per_list.sum().item())
+    actual_total = int(fine_centers.size(0))
+
+    if actual_total != expected_total:
+        raise RuntimeError(
+            f"Fine center count mismatch: "
+            f"actual={actual_total}, expected={expected_total}"
+        )
+
+    offset_sizes = offsets[1:] - offsets[:-1]
+
+    if not torch.equal(offset_sizes.cpu(), k_per_list.cpu()):
+        bad = torch.where(
+            offset_sizes.cpu() != k_per_list.cpu()
+        )[0]
+
+        raise RuntimeError(
+            "global_offsets and k_per_list mismatch: "
+            f"{bad[:20].tolist()}"
+        )
+
+    empty_lists = torch.where(offset_sizes <= 0)[0]
+
+    if empty_lists.numel() > 0:
+        raise RuntimeError(
+            "IVF lists without fine centers remain: "
+            f"{empty_lists[:20].tolist()}"
+        )
+
+    print(
+        f"[stage 2 validation] "
+        f"fine_centers={actual_total} "
+        f"empty_lists=0"
     )
 
     print("[stage 2] fit KMeans inside each IVF list")
