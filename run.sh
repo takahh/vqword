@@ -107,7 +107,7 @@ AUX_LAMBDA="${AUX_LAMBDA:-0.05}"
 # 最後にログだけをFTPへ送る。
 # 認証情報はシェルへ直書きせず、環境変数で渡す。
 FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
-FTP_PASS="${FTP_PASS:-squat200k}"
+FTP_PASS="${FTP_PASS:-}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 FTP_REMOTE_ROOT="${FTP_REMOTE_ROOT:-vqword_logs}"
 
