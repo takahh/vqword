@@ -101,7 +101,6 @@ AR_N_HEADS="${AR_N_HEADS:-8}"
 AR_BATCH_SIZE="${AR_BATCH_SIZE:-16}"
 AR_LR="${AR_LR:-3e-4}"
 
-PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-40}"
 FINETUNE_EPOCHS="${FINETUNE_EPOCHS:-30}"
 AUX_LAMBDA="${AUX_LAMBDA:-0.05}"
 
@@ -269,11 +268,6 @@ DISCOVER_IDS="${RUN_DIR}/wikitext103_vqword_${TAG}_ids.pt"
 
 TINYSTORIES_IDS="${RUN_DIR}/tinystories_vqword_${TAG}_ids.pt"
 
-PRETRAIN_PREFIX="${RUN_DIR}/ar_vqw2vqw_pretrain_${TAG}_d${AR_D_MODEL}_l${AR_N_LAYERS}_h${AR_N_HEADS}_arseed${AR_SEED}"
-PRETRAIN_BEST="${PRETRAIN_PREFIX}.pt"
-PRETRAIN_LAST="${PRETRAIN_PREFIX}_last.pt"
-PRETRAIN_LOG="${PRETRAIN_PREFIX}.log"
-
 FINETUNE_PREFIX="${RUN_DIR}/ar_bpeplusvqw2bpe_concatft_${TAG}_d${AR_D_MODEL}_l${AR_N_LAYERS}_h${AR_N_HEADS}_arseed${AR_SEED}_aux${AUX_LAMBDA}"
 FINETUNE_BEST="${FINETUNE_PREFIX}.pt"
 FINETUNE_LAST="${FINETUNE_PREFIX}_last.pt"
@@ -299,7 +293,7 @@ require_file() {
 # ============================================================
 
 echo "============================================================"
-echo "[stage 1/4] Discover"
+echo "[stage 1/3] Discover"
 echo "output = ${DISCOVER_CKPT}"
 echo "============================================================"
 
@@ -402,7 +396,7 @@ PY
 # ============================================================
 
 echo "============================================================"
-echo "[stage 2/4] Assign TinyStories VQW IDs"
+echo "[stage 2/3] Assign TinyStories VQW IDs"
 echo "checkpoint = ${DISCOVER_CKPT}"
 echo "output     = ${TINYSTORIES_IDS}"
 echo "============================================================"
@@ -503,91 +497,15 @@ print("[check] TinyStories IDs OK")
 print("============================================================")
 PY
 
+
 # ============================================================
-# Stage 3: VQW -> VQW autoregressive pretraining
-# ============================================================
-
-echo "============================================================"
-echo "[stage 3/4] VQW -> VQW pretraining"
-echo "data = ${TINYSTORIES_IDS}"
-echo "best = ${PRETRAIN_BEST}"
-echo "============================================================"
-
-python ar.py \
-  --mode pretrain \
-  --data "${TINYSTORIES_IDS}" \
-  --epochs "${PRETRAIN_EPOCHS}" \
-  --batch_size "${AR_BATCH_SIZE}" \
-  --d_model "${AR_D_MODEL}" \
-  --n_layers "${AR_N_LAYERS}" \
-  --n_heads "${AR_N_HEADS}" \
-  --lr "${AR_LR}" \
-  --vq_only \
-  --main_target vq \
-  --aux_lambda 0 \
-  --seed "${AR_SEED}" \
-  --out "${PRETRAIN_BEST}" \
-  2>&1 | tee "${PRETRAIN_LOG}"
-
-require_file "${PRETRAIN_BEST}"
-require_file "${PRETRAIN_LAST}"
-require_file "${PRETRAIN_LOG}"
-
-ls -lh \
-  "${PRETRAIN_BEST}" \
-  "${PRETRAIN_LAST}" \
-  "${PRETRAIN_LOG}"
-
-python - "${PRETRAIN_BEST}" "${VQ_CODEBOOK_SIZE}" "${AR_D_MODEL}" "${AR_N_LAYERS}" "${AR_N_HEADS}" "${AR_SEED}" <<'PY'
-import sys
-import torch
-
-path, vq_size, d_model, n_layers, n_heads, seed = sys.argv[1:]
-ckpt = torch.load(path, map_location="cpu", weights_only=False)
-
-expected_vq_size = int(vq_size)
-actual_vq_size = ckpt.get("vq_vocab_size")
-
-if actual_vq_size is None:
-    raise KeyError("pretrain checkpoint is missing vq_vocab_size")
-
-if int(actual_vq_size) != expected_vq_size:
-    raise ValueError(
-        f"pretrain VQ size mismatch: "
-        f"expected={expected_vq_size}, actual={actual_vq_size}"
-    )
-
-args = ckpt.get("args", {})
-checks = {
-    "d_model": int(d_model),
-    "n_layers": int(n_layers),
-    "n_heads": int(n_heads),
-    "seed": int(seed),
-}
-
-for key, expected in checks.items():
-    actual = args.get(key)
-
-    if actual is not None and int(actual) != expected:
-        raise ValueError(
-            f"pretrain mismatch: {key} expected={expected}, actual={actual}"
-        )
-
-if args.get("main_target") not in (None, "vq"):
-    raise ValueError(
-        f"pretrain main_target must be vq: {args.get('main_target')}"
-    )
-
-print("[check] pretrain checkpoint OK:", path)
-PY
-# ============================================================
-# Stage 4: BPE + VQW -> BPE autoregressive finetuning
+# Stage ３: BPE + VQW -> BPE autoregressive finetuning
 # ============================================================
 
 BPE_BASELINE_CKPT="${BPE_BASELINE_CKPT:-/vqword/ar_token_only_20260624_015604.pt}"
 
 echo "============================================================"
-echo "[stage 4/4] BPE + VQW -> BPE finetuning"
+echo "[stage 3/3] BPE + VQW -> BPE finetuning"
 echo "data        = ${TINYSTORIES_IDS}"
 echo "init_from   = ${BPE_BASELINE_CKPT}"
 echo "best        = ${FINETUNE_BEST}"
@@ -718,15 +636,12 @@ discover_ckpt=${DISCOVER_CKPT}
 discover_dictionary=${DISCOVER_DICTIONARY}
 discover_ids=${DISCOVER_IDS}
 tinystories_ids=${TINYSTORIES_IDS}
-pretrain_best=${PRETRAIN_BEST}
-pretrain_last=${PRETRAIN_LAST}
 finetune_best=${FINETUNE_BEST}
 finetune_last=${FINETUNE_LAST}
 
 pipeline_log=${RUN_DIR}/pipeline.log
 discover_log=${DISCOVER_LOG}
 assign_log=${ASSIGN_LOG}
-pretrain_log=${PRETRAIN_LOG}
 finetune_log=${FINETUNE_LOG}
 EOF
 
@@ -744,7 +659,6 @@ find "${RUN_DIR}" -maxdepth 1 -type f \
 #   pipeline.log
 #   discover.log
 #   assign.log
-#   pretrain.log
 #   finetune.log
 #   run_config.txt
 #   SHA256SUMS
@@ -768,7 +682,6 @@ if [[ -n "${FTP_USER}" && -n "${FTP_PASS}" ]]; then
   require_file "${RUN_DIR}/pipeline.log"
   require_file "${DISCOVER_LOG}"
   require_file "${ASSIGN_LOG}"
-  require_file "${PRETRAIN_LOG}"
   require_file "${FINETUNE_LOG}"
   require_file "${RUN_DIR}/run_config.txt"
   require_file "${RUN_DIR}/SHA256SUMS"
@@ -790,7 +703,6 @@ cd "${RUN_NAME}"
 put "${RUN_DIR}/pipeline.log" -o pipeline.log
 put "${DISCOVER_LOG}" -o discover.log
 put "${ASSIGN_LOG}" -o assign.log
-put "${PRETRAIN_LOG}" -o pretrain.log
 put "${FINETUNE_LOG}" -o finetune.log
 put "${RUN_DIR}/run_config.txt" -o run_config.txt
 put "${RUN_DIR}/SHA256SUMS" -o SHA256SUMS
@@ -815,14 +727,12 @@ echo "run directory = ${RUN_DIR}"
 echo "tag           = ${TAG}"
 echo "Discover      = ${DISCOVER_CKPT}"
 echo "TinyStories   = ${TINYSTORIES_IDS}"
-echo "pretrain best = ${PRETRAIN_BEST}"
 echo "finetune best = ${FINETUNE_BEST}"
 echo "config        = ${RUN_DIR}/run_config.txt"
 echo "checksums     = ${RUN_DIR}/SHA256SUMS"
 echo "pipeline log  = ${RUN_DIR}/pipeline.log"
 echo "discover log  = ${DISCOVER_LOG}"
 echo "assign log    = ${ASSIGN_LOG}"
-echo "pretrain log  = ${PRETRAIN_LOG}"
 echo "finetune log  = ${FINETUNE_LOG}"
 echo "FTP logs      = ${FTP_REMOTE_ROOT}/${RUN_NAME}/"
 echo "============================================================"
