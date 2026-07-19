@@ -2076,6 +2076,7 @@ def main():
                 "model": model.state_dict(),
                 "args": vars(args),
                 "data": args.data,
+                "epoch": ep,
                 "tokenizer": tokenizer_name,
                 "token_vocab_size": token_vocab_size,
                 "base_vq_vocab_size": base_vq_vocab_size,
