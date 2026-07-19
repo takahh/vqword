@@ -497,12 +497,32 @@ print("[check] TinyStories IDs OK")
 print("============================================================")
 PY
 
-
 # ============================================================
-# Stage ３: BPE + VQW -> BPE autoregressive finetuning
+# Stage 3: BPE + VQW -> BPE autoregressive finetuning
 # ============================================================
 
 BPE_BASELINE_CKPT="${BPE_BASELINE_CKPT:-/vqword/ar_token_only_20260624_015604.pt}"
+
+if [[ ! -s "${BPE_BASELINE_CKPT}" ]]; then
+  echo "[download] BPE baseline checkpoint"
+
+  lftp -u "chicappa.jp-wakou","実際のFTPパスワード" ftp.lolipop.jp <<EOF
+set ftp:ssl-allow no
+set net:max-retries 5
+set net:timeout 30
+set cmd:fail-exit yes
+
+get ar_token_only_20260624_015604.pt -o "${BPE_BASELINE_CKPT}"
+
+bye
+EOF
+fi
+
+if [[ ! -s "${BPE_BASELINE_CKPT}" ]]; then
+  echo "[error] BPE baseline checkpoint not found:"
+  echo "        ${BPE_BASELINE_CKPT}"
+  exit 1
+fi
 
 echo "============================================================"
 echo "[stage 3/3] BPE + VQW -> BPE finetuning"
@@ -510,12 +530,6 @@ echo "data        = ${TINYSTORIES_IDS}"
 echo "init_from   = ${BPE_BASELINE_CKPT}"
 echo "best        = ${FINETUNE_BEST}"
 echo "============================================================"
-
-if [[ ! -s "${BPE_BASELINE_CKPT}" ]]; then
-  echo "[error] BPE baseline checkpoint not found:"
-  echo "        ${BPE_BASELINE_CKPT}"
-  exit 1
-fi
 
 python ar.py \
   --mode finetune \
@@ -533,7 +547,6 @@ python ar.py \
   --seed "${AR_SEED}" \
   --out "${FINETUNE_BEST}" \
   2>&1 | tee "${FINETUNE_LOG}"
-
 require_file "${FINETUNE_BEST}"
 require_file "${FINETUNE_LAST}"
 require_file "${FINETUNE_LOG}"
