@@ -500,8 +500,10 @@ PY
 # ============================================================
 # Stage 3: BPE + VQW -> BPE autoregressive finetuning
 # ============================================================
+BPE_BASELINE_NAME="ar_token_only_wikitextbpe50242_20260719_215427.pt"
 
-BPE_BASELINE_CKPT="${BPE_BASELINE_CKPT:-/vqword/ar_token_only_20260624_015604.pt}"
+BPE_BASELINE_CKPT="${BPE_BASELINE_CKPT:-/vqword/${BPE_BASELINE_NAME}}"
+
 
 if [[ ! -s "${BPE_BASELINE_CKPT}" ]]; then
   echo "============================================================"
@@ -519,19 +521,14 @@ if [[ ! -s "${BPE_BASELINE_CKPT}" ]]; then
     apt update
     apt install -y lftp
   fi
-
   lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
 set cmd:fail-exit yes
-
-get ar_token_only_20260624_015604.pt -o "${BPE_BASELINE_CKPT}"
-
+get "vqword_logs/${BPE_BASELINE_NAME}" -o "${BPE_BASELINE_CKPT}"
 bye
 EOF
-fi
-
 
 if [[ ! -s "${BPE_BASELINE_CKPT}" ]]; then
   echo "[error] BPE baseline checkpoint not found:"

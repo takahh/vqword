@@ -25,7 +25,7 @@ tokenizer.train(
     special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"],
 )
 
-out_dir = Path("bpe_wikitext103_50k")
+out_dir = Path("bpe_wikitext103_50257")
 out_dir.mkdir(exist_ok=True)
 
 # Save vocab.json + merges.txt
