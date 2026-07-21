@@ -100,7 +100,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[device]", device)
 
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(
+        args.ckpt,
+        map_location="cpu",
+        weights_only=False,
+    )
     cargs = ckpt["args"]
 
     required_keys = {
