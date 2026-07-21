@@ -60,7 +60,7 @@ VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
 OUT="tinystories_vqword_${TAG}_ids.pt"
 OUT_PATH="/vqword/${OUT}"
 
-ASSIGN_SCRIPT="/vqword/assign_tiny_vqword_ids.py"
+ASSIGN_SCRIPT="/vqword/assign_vqword_ids.py"
 
 # ============================================================
 # FTP設定
