@@ -106,6 +106,10 @@ LR=3e-4
 #
 # 補助目的:
 #   VQW next-token prediction
+# VQW embeddingの入力倍率
+INPUT_VQ_WEIGHT="${INPUT_VQ_WEIGHT:-1.0}"
+
+# VQW next-token lossの倍率
 AUX_LAMBDA="${AUX_LAMBDA:-0.05}"
 
 # ============================================================
@@ -120,7 +124,7 @@ DATA_PATH="/vqword/${DATA}"
 
 
 # Step 7の実行名
-RUN="ar_bpeplusvqw2bpe_randominit_${TAG}_d${D_MODEL}_l${N_LAYERS}_h${N_HEADS}_arseed${AR_SEED}_aux${AUX_LAMBDA}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_bpeplusvqw2bpe_randominit_${TAG}_d${D_MODEL}_l${N_LAYERS}_h${N_HEADS}_arseed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_$(date +%Y%m%d_%H%M%S)"
 
 BEST_PATH="/vqword/${RUN}.pt"
 LAST_PATH="/vqword/${RUN}_last.pt"
@@ -396,6 +400,7 @@ python ar.py \
   --token_vocab_size "${BPE_VOCAB_SIZE}" \
   --vq_vocab_size "${VQ_CODEBOOK_SIZE}" \
   --main_target tok \
+  --input_vq_weight "${INPUT_VQ_WEIGHT}" \
   --aux_lambda "${AUX_LAMBDA}" \
   --epochs "${EPOCHS}" \
   --batch_size "${BATCH_SIZE}" \

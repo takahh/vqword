@@ -1150,7 +1150,21 @@ def main():
     ap.add_argument("--freeze_vq_backbone", action="store_true")
     ap.add_argument("--n_heads", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--aux_lambda", type=float, default=0.1)
+
+    ap.add_argument(
+        "--input_vq_weight",
+        type=float,
+        default=1.0,
+        help="multiplicative weight applied to the VQ embedding input",
+    )
+
+    ap.add_argument(
+        "--aux_lambda",
+        type=float,
+        default=0.1,
+        help="weight applied to the auxiliary VQ prediction loss",
+    )
+
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vq_only", action="store_true")
     ap.add_argument("--token_only", action="store_true")
@@ -1529,6 +1543,7 @@ def main():
         use_token_input=use_token_input,
         use_vq_input=use_vq_input,
         concat_inputs=(args.mode == "finetune"),
+        input_vq_weight=args.input_vq_weight,
         init_vq_loss_weight=args.init_vq_loss_weight,
     ).to(device)
     if not args.learn_vq_loss_weight:
