@@ -284,7 +284,6 @@ class ARVQWordLM(nn.Module):
                 torch.cat([tok_h, vq_h], dim=-1)
             )
             h = h + fused_h
-
         else:
             if self.use_vq_input:
                 h = (
