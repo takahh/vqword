@@ -39,7 +39,7 @@ set -euo pipefail
 #   BPE_BASELINE_TIMESTAMP=20260721_184530
 # ============================================================
 
-BPE_BASELINE_TIMESTAMP=YYYYMMDD_HHMMSS
+BPE_BASELINE_TIMESTAMP="20260721_084915"
 
 
 # ============================================================

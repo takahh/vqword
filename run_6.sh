@@ -559,7 +559,6 @@ set net:max-retries 5
 set net:timeout 30
 set cmd:fail-exit yes
 
-mkdir -p vqword_logs
 cd vqword_logs
 
 put "${BEST_PATH}" \
