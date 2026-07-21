@@ -106,8 +106,7 @@ LR=3e-4
 #
 # 補助目的:
 #   VQW next-token prediction
-AUX_LAMBDA=0.05
-
+AUX_LAMBDA="${AUX_LAMBDA:-0.05}"
 
 # ============================================================
 # ファイル名
