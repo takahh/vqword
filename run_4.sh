@@ -204,21 +204,26 @@ if missing:
         f"Missing checkpoint keys: {missing}"
     )
 
-if int(ckpt["vq_vocab_size"]) != ${VQ_CODEBOOK_SIZE}:
+expected_vq_vocab_size = int("${VQ_CODEBOOK_SIZE}")
+expected_bpe_vocab_size = int("${BPE_VOCAB_LABEL}")
+
+actual_vq_vocab_size = int(ckpt["vq_vocab_size"])
+
+if actual_vq_vocab_size != expected_vq_vocab_size:
     raise ValueError(
         "VQ vocabulary mismatch: "
-        f"expected=${VQ_CODEBOOK_SIZE:,}, "
-        f"actual={int(ckpt['vq_vocab_size']):,}"
+        f"expected={expected_vq_vocab_size:,}, "
+        f"actual={actual_vq_vocab_size:,}"
     )
 
 model_vocab_size = int(
     ckpt["model"]["tok_emb.weight"].shape[0]
 )
 
-if model_vocab_size != ${BPE_VOCAB_LABEL}:
+if model_vocab_size != expected_bpe_vocab_size:
     raise ValueError(
         "BPE vocabulary mismatch: "
-        f"expected=${BPE_VOCAB_LABEL:,}, "
+        f"expected={expected_bpe_vocab_size:,}, "
         f"actual={model_vocab_size:,}"
     )
 
