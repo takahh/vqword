@@ -189,6 +189,7 @@ class ARVQWordLM(nn.Module):
         use_token_input=True,
         use_vq_input=True,
         concat_inputs=False,
+        input_vq_weight=1.0,
         init_vq_loss_weight=0.05,
     ):
         super().__init__()
@@ -198,7 +199,12 @@ class ARVQWordLM(nn.Module):
         self.concat_inputs = (
             concat_inputs and use_token_input and use_vq_input
         )
+        if input_vq_weight < 0:
+            raise ValueError(
+                "input_vq_weight must be greater than or equal to 0"
+            )
 
+        self.input_vq_weight = float(input_vq_weight)
         if init_vq_loss_weight <= 0:
             raise ValueError(
                 "init_vq_loss_weight must be greater than 0"
@@ -269,14 +275,23 @@ class ARVQWordLM(nn.Module):
 
         if self.concat_inputs:
             tok_h = self.tok_emb(tok_in)
-            vq_h = self.vq_emb(vq_in)
+            vq_h = (
+                self.input_vq_weight
+                * self.vq_emb(vq_in)
+            )
+
             fused_h = self.input_fusion(
                 torch.cat([tok_h, vq_h], dim=-1)
             )
             h = h + fused_h
+
         else:
             if self.use_vq_input:
-                h = h + self.vq_emb(vq_in)
+                h = (
+                    h
+                    + self.input_vq_weight
+                    * self.vq_emb(vq_in)
+                )
 
             if self.use_token_input:
                 h = h + self.tok_emb(tok_in)
