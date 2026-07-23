@@ -124,8 +124,7 @@ DATA_PATH="/vqword/${DATA}"
 
 
 # Step 7の実行名
-RUN="ar_bpeplusvqw2bpe_randominit_${TAG}_d${D_MODEL}_l${N_LAYERS}_h${N_HEADS}_arseed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_$(date +%Y%m%d_%H%M%S)"
-
+RUN="ar_bpeplusvqw2bpe_cb${VQ_CODEBOOK_LABEL}_seed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_${TAG}_$(date +%Y%m%d_%H%M%S)"
 BEST_PATH="/vqword/${RUN}.pt"
 LAST_PATH="/vqword/${RUN}_last.pt"
 LOG_PATH="/vqword/${RUN}.log"
