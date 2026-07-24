@@ -57,8 +57,18 @@ case "${CB_SIZE}" in
     VQ_CODEBOOK_SIZE=100000
     ;;
 
+  200k)
+    VQ_CODEBOOK_LABEL=200k
+    VQ_CODEBOOK_SIZE=200000
+    ;;
+
+  300k)
+    VQ_CODEBOOK_LABEL=300k
+    VQ_CODEBOOK_SIZE=300000
+    ;;
+
   *)
-    echo "Usage: $0 {25k|50k|100k}"
+    echo "Usage: $0 {25k|50k|100k|200k|300k}"
     exit 1
     ;;
 esac
