@@ -75,12 +75,14 @@ FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 BPE_VOCAB_LABEL=50257
 BPE_VOCAB_SIZE=50257
 
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 {25k|50k|100k}"
+if [ "$#" -ne 3 ]; then
+    echo "Usage: $0 {25k|50k|100k} {0|0.001|0.01} {seed}"
     exit 1
 fi
 
 VQ_CODEBOOK_LABEL="$1"
+INPUT_VQ_WEIGHT="$2"
+AR_SEED="$3"
 
 case "${VQ_CODEBOOK_LABEL}" in
     25k)
@@ -103,7 +105,6 @@ CENTER_SCALE=0.0
 IVF_NLIST=256
 
 DISCRETIZATION_SEED=0
-AR_SEED=0
 
 
 # ============================================================
@@ -127,7 +128,6 @@ LR=3e-4
 # 補助目的:
 #   VQW next-token prediction
 # VQW embeddingの入力倍率
-INPUT_VQ_WEIGHT="${INPUT_VQ_WEIGHT:-1.0}"
 
 # VQW next-token lossの倍率
 AUX_LAMBDA="${AUX_LAMBDA:-0.05}"
@@ -174,6 +174,7 @@ echo "dropout               = ${DROPOUT}"
 echo "epochs                = ${EPOCHS}"
 echo "batch size            = ${BATCH_SIZE}"
 echo "learning rate         = ${LR}"
+echo "input VQ weight      = ${INPUT_VQ_WEIGHT}"
 echo "aux lambda            = ${AUX_LAMBDA}"
 echo "tag                   = ${TAG}"
 echo "data                  = ${DATA}"
