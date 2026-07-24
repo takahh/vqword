@@ -130,7 +130,8 @@ LR=3e-4
 # VQW embeddingの入力倍率
 
 # VQW next-token lossの倍率
-AUX_LAMBDA="${AUX_LAMBDA:0}"
+AUX_LAMBDA=0.0
+AUX_LAMBDA="${AUX_LAMBDA:-0.0}"
 
 # ============================================================
 # ファイル名
