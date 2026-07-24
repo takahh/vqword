@@ -34,8 +34,58 @@ git pull
 
 BPE_VOCAB_LABEL=50257
 
-VQ_CODEBOOK_LABEL=200k
-VQ_CODEBOOK_SIZE=200000
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# 使用方法
+#
+#   bash assign_tinystories_vqword.sh 25k
+#   bash assign_tinystories_vqword.sh 50k
+#   bash assign_tinystories_vqword.sh 100k
+#   bash assign_tinystories_vqword.sh 200k
+#
+# 25k / 50k / 100k:
+#   checkpoint名に _seed0 が付く
+#
+# 200k:
+#   既存ファイルとの互換性のため _seed0 なし
+# ============================================================
+
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 {25k|50k|100k|200k}"
+  exit 1
+fi
+
+VQ_CODEBOOK_LABEL="$1"
+
+case "${VQ_CODEBOOK_LABEL}" in
+  25k)
+    VQ_CODEBOOK_SIZE=25000
+    VQ_SEED=0
+    VQ_FILENAME_SUFFIX="_seed${VQ_SEED}"
+    ;;
+  50k)
+    VQ_CODEBOOK_SIZE=50000
+    VQ_SEED=0
+    VQ_FILENAME_SUFFIX="_seed${VQ_SEED}"
+    ;;
+  100k)
+    VQ_CODEBOOK_SIZE=100000
+    VQ_SEED=0
+    VQ_FILENAME_SUFFIX="_seed${VQ_SEED}"
+    ;;
+  200k)
+    VQ_CODEBOOK_SIZE=200000
+    VQ_SEED=0
+    VQ_FILENAME_SUFFIX=""
+    ;;
+  *)
+    echo "[error] Unsupported VQ vocabulary size: ${VQ_CODEBOOK_LABEL}"
+    echo "Supported values: 25k, 50k, 100k, 200k"
+    exit 1
+    ;;
+esac
 
 HOP=20
 IVF_NLIST=256
@@ -49,15 +99,22 @@ K_BLOCK=4096
 # ファイル名
 # ============================================================
 
-TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center0_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}"
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center0_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}"
+
+# checkpoint側のタグ
+# 25k / 50k / 100k は _seed0 付き
+# 200kは既存ファイルに合わせてseed表記なし
+VQ_TAG="${BASE_TAG}${VQ_FILENAME_SUFFIX}"
 
 BPE_ARCHIVE="bpe_wikitext103_50257.tar.gz"
 TOKENIZER_DIR="/vqword/bpe_wikitext103_50257"
 
-VQ_CKPT="wikitext103_vqword_${TAG}.pt"
+VQ_CKPT="wikitext103_vqword_${VQ_TAG}.pt"
 VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
 
-OUT="tinystories_vqword_${TAG}_ids.pt"
+# 出力には必ずVQ vocab sizeを含める
+# seedも含めて、どのtokenizerから作ったか明確にする
+OUT="tinystories_vqword_${VQ_TAG}_ids.pt"
 OUT_PATH="/vqword/${OUT}"
 
 ASSIGN_SCRIPT="/vqword/assign_vqword_ids.py"
@@ -74,7 +131,9 @@ echo "============================================================"
 echo "[configuration]"
 echo "BPE tokenizer        = ${BPE_ARCHIVE}"
 echo "VQ checkpoint        = ${VQ_CKPT}"
+echo "VQ codebook label    = ${VQ_CODEBOOK_LABEL}"
 echo "VQ codebook size     = ${VQ_CODEBOOK_SIZE}"
+echo "VQ seed              = ${VQ_SEED}"
 echo "context              = left ${HOP}"
 echo "TinyStories samples  = ${MAX_SAMPLES}"
 echo "sequence length      = ${SEQ_LEN}"
@@ -389,6 +448,9 @@ fi
 echo "============================================================"
 echo "[completed]"
 echo "VQ checkpoint = ${VQ_CKPT}"
+echo "VQ vocab label = ${VQ_CODEBOOK_LABEL}"
+echo "VQ vocab size  = ${VQ_CODEBOOK_SIZE}"
+echo "VQ seed        = ${VQ_SEED}"
 echo "BPE tokenizer = ${BPE_ARCHIVE}"
 echo "TinyStories   = ${MAX_SAMPLES} samples"
 echo "output        = ${OUT}"
