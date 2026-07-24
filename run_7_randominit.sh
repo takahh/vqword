@@ -76,14 +76,13 @@ BPE_VOCAB_LABEL=50257
 BPE_VOCAB_SIZE=50257
 
 if [ "$#" -ne 3 ]; then
-    echo "Usage: $0 {25k|50k|100k} {0|0.001|0.01} {seed}"
+    echo "Usage: $0 {25k|50k|100k|200k} {0|0.001|0.01} {seed}"
     exit 1
 fi
 
 VQ_CODEBOOK_LABEL="$1"
 INPUT_VQ_WEIGHT="$2"
 AR_SEED="$3"
-
 case "${VQ_CODEBOOK_LABEL}" in
     25k)
         VQ_CODEBOOK_SIZE=25000
@@ -93,6 +92,9 @@ case "${VQ_CODEBOOK_LABEL}" in
         ;;
     100k)
         VQ_CODEBOOK_SIZE=100000
+        ;;
+    200k)
+        VQ_CODEBOOK_SIZE=200000
         ;;
     *)
         echo "Unsupported VQ vocabulary: ${VQ_CODEBOOK_LABEL}"
