@@ -75,8 +75,28 @@ FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 BPE_VOCAB_LABEL=50257
 BPE_VOCAB_SIZE=50257
 
-VQ_CODEBOOK_LABEL=200k
-VQ_CODEBOOK_SIZE=200000
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 {25k|50k|100k}"
+    exit 1
+fi
+
+VQ_CODEBOOK_LABEL="$1"
+
+case "${VQ_CODEBOOK_LABEL}" in
+    25k)
+        VQ_CODEBOOK_SIZE=25000
+        ;;
+    50k)
+        VQ_CODEBOOK_SIZE=50000
+        ;;
+    100k)
+        VQ_CODEBOOK_SIZE=100000
+        ;;
+    *)
+        echo "Unsupported VQ vocabulary: ${VQ_CODEBOOK_LABEL}"
+        exit 1
+        ;;
+esac
 
 HOP=20
 CENTER_SCALE=0.0
@@ -115,16 +135,14 @@ AUX_LAMBDA="${AUX_LAMBDA:-0.05}"
 # ============================================================
 # ファイル名
 # ============================================================
+TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center0_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 
-TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center0_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}"
-
-# Step 4&5の成果物
 DATA="tinystories_vqword_${TAG}_ids.pt"
 DATA_PATH="/vqword/${DATA}"
 
 
 # Step 7の実行名
-RUN="ar_bpeplusvqw2bpe_cb${VQ_CODEBOOK_LABEL}_seed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_${TAG}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_bpeplusvqw2bpe_${TAG}_arseed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_$(date +%Y%m%d_%H%M%S)"
 BEST_PATH="/vqword/${RUN}.pt"
 LAST_PATH="/vqword/${RUN}_last.pt"
 LOG_PATH="/vqword/${RUN}.log"
