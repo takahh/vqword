@@ -34,9 +34,6 @@ git pull
 
 BPE_VOCAB_LABEL=50257
 
-#!/usr/bin/env bash
-set -euo pipefail
-
 # ============================================================
 # 使用方法
 #
