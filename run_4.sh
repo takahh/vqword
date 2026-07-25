@@ -71,7 +71,7 @@ case "${VQ_CODEBOOK_LABEL}" in
         ;;
     200k)
         VQ_CODEBOOK_SIZE=200000
-        DATA_SEED_SUFFIX=""
+        DATA_SEED_SUFFIX="_seed${DISCRETIZATION_SEED}"
         ;;
     *)
         echo "Unsupported VQ vocabulary: ${VQ_CODEBOOK_LABEL}"
