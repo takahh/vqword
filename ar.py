@@ -226,22 +226,48 @@ class ARVQWordLM(nn.Module):
             if use_token_input else None
         )
 
-        # Residual fusion:
+        # ============================================================
+        # VQ Residual Adapter
         #
         #   h = position_embedding
         #       + token_embedding
-        #       + input_vq_weight * projected_vq_embedding
+        #       + input_vq_weight
+        #         * MLP(LayerNorm(vq_embedding))
         #
-        # input_vq_weight=0 のとき、VQW経路は完全に消える。
-        self.vq_projection = (
-            nn.Linear(
-                d_model,
-                d_model,
-                bias=False,
+        # 最終Linearをゼロ初期化するため、学習開始時点では
+        #
+        #   MLP(LayerNorm(vq_embedding)) = 0
+        #
+        # となり、入力は厳密にBPE baselineと同じになる。
+        # ============================================================
+
+        if self.concat_inputs:
+            self.vq_adapter_norm = nn.LayerNorm(d_model)
+
+            self.vq_adapter = nn.Sequential(
+                nn.Linear(
+                    d_model,
+                    d_model,
+                    bias=True,
+                ),
+                nn.GELU(),
+                nn.Linear(
+                    d_model,
+                    d_model,
+                    bias=True,
+                ),
             )
-            if self.concat_inputs
-            else None
-        )
+
+            # 学習開始時点ではResidual branchを完全にゼロにする。
+            #
+            # これにより、BPE checkpointから初期化した直後のモデル出力は
+            # VQ経路を持たないBPE baselineと一致する。
+            nn.init.zeros_(self.vq_adapter[-1].weight)
+            nn.init.zeros_(self.vq_adapter[-1].bias)
+
+        else:
+            self.vq_adapter_norm = None
+            self.vq_adapter = None
 
         self.pos_emb = nn.Embedding(max_len, d_model)
 
@@ -280,7 +306,11 @@ class ARVQWordLM(nn.Module):
             tok_h = self.tok_emb(tok_in)
             vq_h = self.vq_emb(vq_in)
 
-            vq_delta = self.vq_projection(vq_h)
+            # VQ埋め込みを正規化してから、
+            # 小さなMLPでBPE側が利用しやすいResidual表現へ変換する。
+            vq_delta = self.vq_adapter(
+                self.vq_adapter_norm(vq_h)
+            )
 
             h = (
                     h
@@ -1654,9 +1684,20 @@ def main():
             sd.pop("vq_head.weight", None)
             sd.pop("vq_head.bias", None)
 
+            # 旧fusion層
             sd.pop("input_fusion.weight", None)
             sd.pop("input_fusion.bias", None)
             sd.pop("vq_projection.weight", None)
+            sd.pop("vq_projection.bias", None)
+
+            # 新しいVQ adapterは今回の実験用に新規初期化する。
+            sd.pop("vq_adapter_norm.weight", None)
+            sd.pop("vq_adapter_norm.bias", None)
+
+            sd.pop("vq_adapter.0.weight", None)
+            sd.pop("vq_adapter.0.bias", None)
+            sd.pop("vq_adapter.2.weight", None)
+            sd.pop("vq_adapter.2.bias", None)
             # 今回指定したVQ loss weightを使う
             sd.pop("raw_vq_loss_weight", None)
 
