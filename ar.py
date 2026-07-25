@@ -226,19 +226,22 @@ class ARVQWordLM(nn.Module):
             if use_token_input else None
         )
 
-        # Fine-tuning fusion layer.  Its initialization exactly reproduces
-        # the pretrained VQ-only input: W_tok=0 and W_vq=I.
-        self.input_fusion = (
-            nn.Linear(2 * d_model, d_model)
-            if self.concat_inputs else None
+        # Residual fusion:
+        #
+        #   h = position_embedding
+        #       + token_embedding
+        #       + input_vq_weight * projected_vq_embedding
+        #
+        # input_vq_weight=0 のとき、VQW経路は完全に消える。
+        self.vq_projection = (
+            nn.Linear(
+                d_model,
+                d_model,
+                bias=False,
+            )
+            if self.concat_inputs
+            else None
         )
-        if self.input_fusion is not None:
-            with torch.no_grad():
-                self.input_fusion.weight.zero_()
-                self.input_fusion.bias.zero_()
-                self.input_fusion.weight[:, d_model:].copy_(
-                    torch.eye(d_model)
-                )
 
         self.pos_emb = nn.Embedding(max_len, d_model)
 
@@ -275,21 +278,21 @@ class ARVQWordLM(nn.Module):
 
         if self.concat_inputs:
             tok_h = self.tok_emb(tok_in)
-            vq_h = (
-                self.input_vq_weight
-                * self.vq_emb(vq_in)
-            )
+            vq_h = self.vq_emb(vq_in)
 
-            fused_h = self.input_fusion(
-                torch.cat([tok_h, vq_h], dim=-1)
+            vq_delta = self.vq_projection(vq_h)
+
+            h = (
+                    h
+                    + tok_h
+                    + self.input_vq_weight * vq_delta
             )
-            h = h + fused_h
         else:
             if self.use_vq_input:
                 h = (
-                    h
-                    + self.input_vq_weight
-                    * self.vq_emb(vq_in)
+                        h
+                        + self.input_vq_weight
+                        * self.vq_emb(vq_in)
                 )
 
             if self.use_token_input:
@@ -1653,7 +1656,7 @@ def main():
 
             sd.pop("input_fusion.weight", None)
             sd.pop("input_fusion.bias", None)
-
+            sd.pop("vq_projection.weight", None)
             # 今回指定したVQ loss weightを使う
             sd.pop("raw_vq_loss_weight", None)
 
@@ -1703,46 +1706,6 @@ def main():
         print(f"[init] missing={missing}")
         print(f"[init] unexpected={unexpected}")
 
-        # ====================================================
-        # BPE初期化時：
-        # fusion([BPE, VQW]) = BPE
-        #
-        # concat順：
-        #   [tok_h | vq_h]
-        #
-        # fusion重み：
-        #   [I | 0]
-        # ====================================================
-        if args.init_source == "bpe":
-            if model.input_fusion is None:
-                raise RuntimeError(
-                    "BPE initialization requires input_fusion. "
-                    "Run with --mode finetune."
-                )
-
-            d_model = model.tok_emb.embedding_dim
-
-            with torch.no_grad():
-                model.input_fusion.weight.zero_()
-                model.input_fusion.bias.zero_()
-
-                identity = torch.eye(
-                    d_model,
-                    device=model.input_fusion.weight.device,
-                    dtype=model.input_fusion.weight.dtype,
-                )
-
-                # 左半分＝BPE側をIdentityにする
-                model.input_fusion.weight[
-                    :,
-                    :d_model
-                ].copy_(identity)
-
-            print(
-                "[fusion init] "
-                "BPE path = identity, VQW path = zero"
-            )
-
         # reset_headsを明示した場合だけheadを初期化し直す
         if args.reset_heads:
             print("[init] reset tok_head / vq_head")
@@ -1763,8 +1726,8 @@ def main():
                     for p in model.tok_emb.parameters():
                         p.requires_grad = True
 
-                if model.input_fusion is not None:
-                    for p in model.input_fusion.parameters():
+                if model.vq_projection is not None:
+                    for p in model.vq_projection.parameters():
                         p.requires_grad = True
 
                 for p in model.tok_head.parameters():
@@ -1772,7 +1735,7 @@ def main():
 
                 print(
                     "[freeze] "
-                    "train tok_emb + input_fusion + tok_head"
+                    "train tok_emb + vq_projection + tok_head"
                 )
 
             elif args.init_source == "bpe":
@@ -1782,13 +1745,13 @@ def main():
                     for p in model.vq_emb.parameters():
                         p.requires_grad = True
 
-                if model.input_fusion is not None:
-                    for p in model.input_fusion.parameters():
+                if model.vq_projection is not None:
+                    for p in model.vq_projection.parameters():
                         p.requires_grad = True
 
                 print(
                     "[freeze] "
-                    "train vq_emb + input_fusion"
+                    "train vq_emb + vq_projection"
                 )
 
     # ===========================

@@ -137,7 +137,8 @@ DATA_PATH="/vqword/${DATA}"
 
 
 # Step 7の実行名
-RUN="ar_bpeplusvqw2bpe_${TAG}_arseed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_bpeplusvqw2bpe_residual_${TAG}_arseed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_$(date +%Y%m%d_%H%M%S)"
+
 BEST_PATH="/vqword/${RUN}.pt"
 LAST_PATH="/vqword/${RUN}_last.pt"
 LOG_PATH="/vqword/${RUN}.log"
@@ -568,12 +569,11 @@ for path in paths:
     model = checkpoint["model"]
 
     required_keys = [
-        "tok_emb.weight",
-        "vq_emb.weight",
-        "input_fusion.weight",
-        "input_fusion.bias",
-        "tok_head.weight",
-        "vq_head.weight",
+      "tok_emb.weight",
+      "vq_emb.weight",
+      "vq_projection.weight",
+      "tok_head.weight",
+      "vq_head.weight",
     ]
 
     for key in required_keys:
@@ -590,8 +590,8 @@ for path in paths:
         model["vq_emb.weight"].shape
     )
 
-    fusion_shape = tuple(
-        model["input_fusion.weight"].shape
+    projection_shape = tuple(
+      model["vq_projection.weight"].shape
     )
 
     tok_head_shape = tuple(
@@ -604,7 +604,7 @@ for path in paths:
 
     print("tok_emb shape:", tok_emb_shape)
     print("vq_emb shape:", vq_emb_shape)
-    print("input_fusion shape:", fusion_shape)
+    print("vq_projection shape:", projection_shape)
     print("tok_head shape:", tok_head_shape)
     print("vq_head shape:", vq_head_shape)
 
@@ -637,16 +637,16 @@ for path in paths:
             "Output tok_emb d_model mismatch"
         )
 
-    if fusion_shape != (
-        expected_d_model,
-        expected_d_model * 2,
+    if projection_shape != (
+    expected_d_model,
+    expected_d_model,
     ):
-        raise ValueError(
-            "Unexpected input_fusion shape: "
-            f"expected="
-            f"({expected_d_model}, {expected_d_model * 2}), "
-            f"actual={fusion_shape}"
-        )
+    raise ValueError(
+        "Unexpected vq_projection shape: "
+        f"expected="
+        f"({expected_d_model}, {expected_d_model}), "
+        f"actual={projection_shape}"
+    )
 
     args = checkpoint.get("args", {})
 
