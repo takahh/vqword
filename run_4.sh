@@ -57,31 +57,26 @@ fi
 VQ_CODEBOOK_LABEL="$1"
 
 case "${VQ_CODEBOOK_LABEL}" in
-  25k)
-    VQ_CODEBOOK_SIZE=25000
-    VQ_SEED=0
-    VQ_FILENAME_SUFFIX="_seed${VQ_SEED}"
-    ;;
-  50k)
-    VQ_CODEBOOK_SIZE=50000
-    VQ_SEED=0
-    VQ_FILENAME_SUFFIX="_seed${VQ_SEED}"
-    ;;
-  100k)
-    VQ_CODEBOOK_SIZE=100000
-    VQ_SEED=0
-    VQ_FILENAME_SUFFIX="_seed${VQ_SEED}"
-    ;;
-  200k)
-    VQ_CODEBOOK_SIZE=200000
-    VQ_SEED=0
-    VQ_FILENAME_SUFFIX=""
-    ;;
-  *)
-    echo "[error] Unsupported VQ vocabulary size: ${VQ_CODEBOOK_LABEL}"
-    echo "Supported values: 25k, 50k, 100k, 200k"
-    exit 1
-    ;;
+    25k)
+        VQ_CODEBOOK_SIZE=25000
+        DATA_SEED_SUFFIX="_seed${DISCRETIZATION_SEED}"
+        ;;
+    50k)
+        VQ_CODEBOOK_SIZE=50000
+        DATA_SEED_SUFFIX="_seed${DISCRETIZATION_SEED}"
+        ;;
+    100k)
+        VQ_CODEBOOK_SIZE=100000
+        DATA_SEED_SUFFIX="_seed${DISCRETIZATION_SEED}"
+        ;;
+    200k)
+        VQ_CODEBOOK_SIZE=200000
+        DATA_SEED_SUFFIX=""
+        ;;
+    *)
+        echo "Unsupported VQ vocabulary: ${VQ_CODEBOOK_LABEL}"
+        exit 1
+        ;;
 esac
 
 HOP=20
