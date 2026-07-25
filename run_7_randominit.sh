@@ -131,7 +131,6 @@ LR=3e-4
 # ファイル名
 # ============================================================
 TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center0_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
-
 DATA="tinystories_vqword_${TAG}_ids.pt"
 DATA_PATH="/vqword/${DATA}"
 
