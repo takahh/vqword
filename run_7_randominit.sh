@@ -75,14 +75,17 @@ FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 BPE_VOCAB_LABEL=50257
 BPE_VOCAB_SIZE=50257
 
-if [ "$#" -ne 3 ]; then
-    echo "Usage: $0 {25k|50k|100k|200k} {0|0.001|0.01} {seed}"
+if [ "$#" -ne 4 ]; then
+    echo "Usage: $0 {25k|50k|100k|200k} {input_vq_weight} {ar_seed} {vqw_loss_weight}"
+    echo "Example: $0 100k 0.001 0 0.001"
     exit 1
 fi
 
 VQ_CODEBOOK_LABEL="$1"
 INPUT_VQ_WEIGHT="$2"
 AR_SEED="$3"
+AUX_LAMBDA="$4"
+
 case "${VQ_CODEBOOK_LABEL}" in
     25k)
         VQ_CODEBOOK_SIZE=25000
@@ -123,17 +126,6 @@ DROPOUT=0.1
 EPOCHS=30
 BATCH_SIZE=16
 LR=3e-4
-
-# 主目的:
-#   BPE next-token prediction
-#
-# 補助目的:
-#   VQW next-token prediction
-# VQW embeddingの入力倍率
-
-# VQW next-token lossの倍率
-AUX_LAMBDA=0.0
-AUX_LAMBDA="${AUX_LAMBDA:-0.0}"
 
 # ============================================================
 # ファイル名
