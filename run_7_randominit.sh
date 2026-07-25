@@ -568,11 +568,16 @@ for path in paths:
     model = checkpoint["model"]
 
     required_keys = [
-      "tok_emb.weight",
-      "vq_emb.weight",
-      "vq_projection.weight",
-      "tok_head.weight",
-      "vq_head.weight",
+    "tok_emb.weight",
+    "vq_emb.weight",
+    "vq_adapter_norm.weight",
+    "vq_adapter_norm.bias",
+    "vq_adapter.0.weight",
+    "vq_adapter.0.bias",
+    "vq_adapter.2.weight",
+    "vq_adapter.2.bias",
+    "tok_head.weight",
+    "vq_head.weight",
     ]
 
     for key in required_keys:
@@ -589,9 +594,16 @@ for path in paths:
         model["vq_emb.weight"].shape
     )
 
-    projection_shape = tuple(
-      model["vq_projection.weight"].shape
+    adapter0_shape = tuple(
+    model["vq_adapter.0.weight"].shape
     )
+
+    adapter2_shape = tuple(
+        model["vq_adapter.2.weight"].shape
+    )
+
+    print("vq_adapter.0 shape:", adapter0_shape)
+    print("vq_adapter.2 shape:", adapter2_shape)
 
     tok_head_shape = tuple(
         model["tok_head.weight"].shape
@@ -636,16 +648,21 @@ for path in paths:
             "Output tok_emb d_model mismatch"
         )
 
-    if projection_shape != (
+    if adapter0_shape != (
     expected_d_model,
     expected_d_model,
     ):
-    raise ValueError(
-        "Unexpected vq_projection shape: "
-        f"expected="
-        f"({expected_d_model}, {expected_d_model}), "
-        f"actual={projection_shape}"
-    )
+        raise ValueError(
+            f"Unexpected vq_adapter.0 shape: {adapter0_shape}"
+        )
+
+    if adapter2_shape != (
+        expected_d_model,
+        expected_d_model,
+    ):
+        raise ValueError(
+            f"Unexpected vq_adapter.2 shape: {adapter2_shape}"
+        )
 
     args = checkpoint.get("args", {})
 
