@@ -38,8 +38,55 @@ FTP_PASS='Squat#201k'
 BPE_VOCAB_LABEL=50257
 BPE_VOCAB_SIZE=50257
 
-# VQW codebookだけ引数で変更
-CB_SIZE="${1:-}"
+# ============================================================
+# 実行引数
+#
+# $1: VQW codebook size
+# $2: center scale
+#
+# 例:
+#   bash run_vqword.sh 100k 0.1
+# ============================================================
+
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale}"
+  echo
+  echo "Examples:"
+  echo "  $0 100k 0.0"
+  echo "  $0 100k 0.1"
+  echo "  $0 100k 0.3"
+  echo "  $0 100k 1.0"
+  exit 1
+fi
+
+CB_SIZE="$1"
+CENTER_SCALE_RAW="$2"
+
+CENTER_SCALE="$(
+  python -c '
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(
+        f"[error] center_scale must be numeric: {sys.argv[1]}"
+    )
+
+if not math.isfinite(value):
+    raise SystemExit(
+        f"[error] center_scale must be finite: {value}"
+    )
+
+if value < 0:
+    raise SystemExit(
+        f"[error] center_scale must be >= 0: {value}"
+    )
+
+print(f"{value:g}")
+' "${CENTER_SCALE_RAW}"
+)"
 
 case "${CB_SIZE}" in
   25k)
@@ -74,7 +121,6 @@ case "${CB_SIZE}" in
 esac
 
 HOP=20
-CENTER_SCALE=0.0
 IVF_NLIST=256
 SEED=0
 
@@ -89,7 +135,7 @@ BPE_ARCHIVE_PATH="/vqword/${BPE_ARCHIVE}"
 
 TOKENIZER_DIR="/vqword/bpe_wikitext103_${BPE_VOCAB_LABEL}"
 
-TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center0_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}"
+TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}"
 
 OUT="wikitext103_vqword_${TAG}.pt"
 DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
