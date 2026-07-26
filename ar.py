@@ -242,9 +242,12 @@ class ARVQWordLM(nn.Module):
         # ============================================================
 
         if self.concat_inputs:
-            self.vq_adapter_norm = nn.LayerNorm(d_model)
+            # BPEとVQを別々に正規化
+            self.tok_fusion_norm = nn.LayerNorm(d_model)
+            self.vq_fusion_norm = nn.LayerNorm(d_model)
 
-            self.vq_adapter = nn.Sequential(
+            # VQ埋め込みをBPEが利用しやすい特徴へ変換
+            self.vq_projection = nn.Sequential(
                 nn.Linear(
                     d_model,
                     d_model,
@@ -258,16 +261,25 @@ class ARVQWordLM(nn.Module):
                 ),
             )
 
-            # 学習開始時点ではResidual branchを完全にゼロにする。
-            #
-            # これにより、BPE checkpointから初期化した直後のモデル出力は
-            # VQ経路を持たないBPE baselineと一致する。
-            nn.init.zeros_(self.vq_adapter[-1].weight)
-            nn.init.zeros_(self.vq_adapter[-1].bias)
+            # [BPE ; transformed VQ] : 2*d_model
+            #                   ↓
+            #               d_model
+            self.input_fusion = nn.Linear(
+                2 * d_model,
+                d_model,
+                bias=True,
+            )
+
+            # 学習開始時はfusion residualを完全にゼロにする。
+            # したがって初期状態では純BPEと厳密に同じ入力になる。
+            nn.init.zeros_(self.input_fusion.weight)
+            nn.init.zeros_(self.input_fusion.bias)
 
         else:
-            self.vq_adapter_norm = None
-            self.vq_adapter = None
+            self.tok_fusion_norm = None
+            self.vq_fusion_norm = None
+            self.vq_projection = None
+            self.input_fusion = None
 
         self.pos_emb = nn.Embedding(max_len, d_model)
 
@@ -306,16 +318,29 @@ class ARVQWordLM(nn.Module):
             tok_h = self.tok_emb(tok_in)
             vq_h = self.vq_emb(vq_in)
 
-            # VQ埋め込みを正規化してから、
-            # 小さなMLPでBPE側が利用しやすいResidual表現へ変換する。
-            vq_delta = self.vq_adapter(
-                self.vq_adapter_norm(vq_h)
+            # VQ埋め込みを線形・非線形変換
+            vq_feature = self.vq_projection(
+                self.vq_fusion_norm(vq_h)
             )
 
+            # BPEと変換後VQを結合
+            fused_input = torch.cat(
+                [
+                    self.tok_fusion_norm(tok_h),
+                    vq_feature,
+                ],
+                dim=-1,
+            )
+
+            # concatした2*d_modelをd_modelへ戻す
+            fusion_delta = self.input_fusion(fused_input)
+
+            # BPEを主経路として維持し、
+            # concat fusionを残差として加える
             h = (
                     h
                     + tok_h
-                    + self.input_vq_weight * vq_delta
+                    + self.input_vq_weight * fusion_delta
             )
         else:
             if self.use_vq_input:
@@ -1691,13 +1716,20 @@ def main():
             sd.pop("vq_projection.bias", None)
 
             # 新しいVQ adapterは今回の実験用に新規初期化する。
-            sd.pop("vq_adapter_norm.weight", None)
-            sd.pop("vq_adapter_norm.bias", None)
+            # concat residual fusionは今回の実験用に新規初期化する
+            sd.pop("tok_fusion_norm.weight", None)
+            sd.pop("tok_fusion_norm.bias", None)
 
-            sd.pop("vq_adapter.0.weight", None)
-            sd.pop("vq_adapter.0.bias", None)
-            sd.pop("vq_adapter.2.weight", None)
-            sd.pop("vq_adapter.2.bias", None)
+            sd.pop("vq_fusion_norm.weight", None)
+            sd.pop("vq_fusion_norm.bias", None)
+
+            sd.pop("vq_projection.0.weight", None)
+            sd.pop("vq_projection.0.bias", None)
+            sd.pop("vq_projection.2.weight", None)
+            sd.pop("vq_projection.2.bias", None)
+
+            sd.pop("input_fusion.weight", None)
+            sd.pop("input_fusion.bias", None)
             # 今回指定したVQ loss weightを使う
             sd.pop("raw_vq_loss_weight", None)
 

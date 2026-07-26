@@ -136,7 +136,7 @@ DATA_PATH="/vqword/${DATA}"
 
 
 # Step 7の実行名
-RUN="ar_bpeplusvqw2bpe_residual_${TAG}_arseed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_bpeplusvqw2bpe_concatresidual_${TAG}_arseed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_$(date +%Y%m%d_%H%M%S)"
 
 BEST_PATH="/vqword/${RUN}.pt"
 LAST_PATH="/vqword/${RUN}_last.pt"
@@ -390,7 +390,8 @@ PY
 #
 #
 # --mode finetune:
-#   BPEとVQWをconcatしてinput_fusionを使用
+#   transformed VQWとBPEをconcatし、
+#   input_fusionでd_modelへ戻した残差をBPEへ加える
 #
 # freezeは行わず、モデル全体をゼロから学習する。
 # ============================================================
@@ -568,16 +569,20 @@ for path in paths:
     model = checkpoint["model"]
 
     required_keys = [
-    "tok_emb.weight",
-    "vq_emb.weight",
-    "vq_adapter_norm.weight",
-    "vq_adapter_norm.bias",
-    "vq_adapter.0.weight",
-    "vq_adapter.0.bias",
-    "vq_adapter.2.weight",
-    "vq_adapter.2.bias",
-    "tok_head.weight",
-    "vq_head.weight",
+        "tok_emb.weight",
+        "vq_emb.weight",
+        "tok_fusion_norm.weight",
+        "tok_fusion_norm.bias",
+        "vq_fusion_norm.weight",
+        "vq_fusion_norm.bias",
+        "vq_projection.0.weight",
+        "vq_projection.0.bias",
+        "vq_projection.2.weight",
+        "vq_projection.2.bias",
+        "input_fusion.weight",
+        "input_fusion.bias",
+        "tok_head.weight",
+        "vq_head.weight",
     ]
 
     for key in required_keys:
@@ -594,16 +599,21 @@ for path in paths:
         model["vq_emb.weight"].shape
     )
 
-    adapter0_shape = tuple(
-    model["vq_adapter.0.weight"].shape
+    projection0_shape = tuple(
+        model["vq_projection.0.weight"].shape
     )
 
-    adapter2_shape = tuple(
-        model["vq_adapter.2.weight"].shape
+    projection2_shape = tuple(
+        model["vq_projection.2.weight"].shape
     )
 
-    print("vq_adapter.0 shape:", adapter0_shape)
-    print("vq_adapter.2 shape:", adapter2_shape)
+    fusion_shape = tuple(
+        model["input_fusion.weight"].shape
+    )
+
+    print("vq_projection.0 shape:", projection0_shape)
+    print("vq_projection.2 shape:", projection2_shape)
+    print("input_fusion shape:", fusion_shape)
 
     tok_head_shape = tuple(
         model["tok_head.weight"].shape
@@ -615,7 +625,9 @@ for path in paths:
 
     print("tok_emb shape:", tok_emb_shape)
     print("vq_emb shape:", vq_emb_shape)
-    print("vq_projection shape:", projection_shape)
+    print("vq_projection.0 shape:", projection0_shape)
+    print("vq_projection.2 shape:", projection2_shape)
+    print("input_fusion shape:", fusion_shape)
     print("tok_head shape:", tok_head_shape)
     print("vq_head shape:", vq_head_shape)
 
@@ -648,20 +660,28 @@ for path in paths:
             "Output tok_emb d_model mismatch"
         )
 
-    if adapter0_shape != (
-    expected_d_model,
-    expected_d_model,
+    if projection0_shape != (
+        expected_d_model,
+        expected_d_model,
     ):
         raise ValueError(
-            f"Unexpected vq_adapter.0 shape: {adapter0_shape}"
+            f"Unexpected vq_projection.0 shape: {projection0_shape}"
         )
 
-    if adapter2_shape != (
+    if projection2_shape != (
         expected_d_model,
         expected_d_model,
     ):
         raise ValueError(
-            f"Unexpected vq_adapter.2 shape: {adapter2_shape}"
+            f"Unexpected vq_projection.2 shape: {projection2_shape}"
+        )
+
+    if fusion_shape != (
+        expected_d_model,
+        2 * expected_d_model,
+    ):
+        raise ValueError(
+            f"Unexpected input_fusion shape: {fusion_shape}"
         )
 
     args = checkpoint.get("args", {})
