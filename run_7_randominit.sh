@@ -75,16 +75,17 @@ FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 BPE_VOCAB_LABEL=50257
 BPE_VOCAB_SIZE=50257
 
-if [ "$#" -ne 4 ]; then
-    echo "Usage: $0 {25k|50k|100k|200k} {input_vq_weight} {ar_seed} {vqw_loss_weight}"
-    echo "Example: $0 100k 0.001 0 0.001"
+if [ "$#" -ne 5 ]; then
+    echo "Usage: $0 {25k|50k|100k|200k} {center_scale} {input_vq_weight} {ar_seed} {vqw_loss_weight}"
+    echo "Example: $0 100k 0.3 1.0 0 0.0"
     exit 1
 fi
 
 VQ_CODEBOOK_LABEL="$1"
-INPUT_VQ_WEIGHT="$2"
-AR_SEED="$3"
-AUX_LAMBDA="$4"
+CENTER_SCALE="$2"
+INPUT_VQ_WEIGHT="$3"
+AR_SEED="$4"
+AUX_LAMBDA="$5"
 
 case "${VQ_CODEBOOK_LABEL}" in
     25k)
@@ -106,7 +107,6 @@ case "${VQ_CODEBOOK_LABEL}" in
 esac
 
 HOP=20
-CENTER_SCALE=0.0
 IVF_NLIST=256
 
 DISCRETIZATION_SEED=0
@@ -130,7 +130,7 @@ LR=3e-4
 # ============================================================
 # ファイル名
 # ============================================================
-TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center0_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 DATA="tinystories_vqword_${TAG}_ids.pt"
 DATA_PATH="/vqword/${DATA}"
 

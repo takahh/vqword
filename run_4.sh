@@ -49,12 +49,15 @@ BPE_VOCAB_LABEL=50257
 #   既存ファイルとの互換性のため _seed0 なし
 # ============================================================
 
-if [ "$#" -ne 1 ]; then
-  echo "Usage: $0 {25k|50k|100k|200k}"
+
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale}"
+  echo "Example: $0 100k 0.3"
   exit 1
 fi
 
 VQ_CODEBOOK_LABEL="$1"
+CENTER_SCALE="$2"
 
 case "${VQ_CODEBOOK_LABEL}" in
     25k)
@@ -91,8 +94,7 @@ K_BLOCK=4096
 # ファイル名
 # ============================================================
 
-BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center0_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}"
-
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}"
 # checkpoint側のタグ
 # 25k / 50k / 100k は _seed0 付き
 # 200kは既存ファイルに合わせてseed表記なし
@@ -131,6 +133,7 @@ echo "TinyStories samples  = ${MAX_SAMPLES}"
 echo "sequence length      = ${SEQ_LEN}"
 echo "batch size           = ${BATCH_SIZE}"
 echo "output               = ${OUT}"
+echo "center scale        = ${CENTER_SCALE}"
 echo "============================================================"
 
 # ============================================================
