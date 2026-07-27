@@ -119,145 +119,6 @@ def iter_index_batches(n, batch_size, shuffle, device=None):
 
 
 @torch.no_grad()
-def evaluate_reconstruction_encoder(
-    model,
-    ctx,
-    tgt,
-    batch_size,
-    device,
-    max_items=None,
-):
-    model.eval()
-
-    n = len(tgt)
-    if max_items is not None:
-        n = min(n, int(max_items))
-
-    total_loss = 0.0
-    total_correct = 0
-    total_count = 0
-
-    for idx in iter_index_batches(n, batch_size, shuffle=False):
-        xb = ctx[idx].to(device)
-        yb = tgt[idx].to(device)
-
-        loss, logits, _ = model(xb, yb)
-        count = yb.numel()
-
-        total_loss += float(loss.item()) * count
-        total_correct += int(logits.argmax(dim=-1).eq(yb).sum().item())
-        total_count += count
-
-    mean_loss = total_loss / max(total_count, 1)
-
-    return {
-        "loss": mean_loss,
-        "ppl": float(np.exp(min(mean_loss, 20.0))),
-        "top1": total_correct / max(total_count, 1),
-        "count": total_count,
-    }
-
-
-def train_reconstruction_encoder(
-    model,
-    ctx,
-    tgt,
-    epochs,
-    batch_size,
-    lr,
-    weight_decay,
-    device,
-    eval_size,
-):
-    """
-    BPE reconstruction pretraining.
-
-    The GNN encoder is trained before clustering so that its continuous
-    representation preserves enough information to reconstruct the center BPE.
-    This makes the subsequent clustering reconstruction-aware.
-    """
-    epochs = int(epochs)
-
-    if epochs <= 0:
-        print("[reconstruction pretrain] skipped")
-        return []
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-
-    history = []
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-
-        total_loss = 0.0
-        total_correct = 0
-        total_count = 0
-
-        pbar = tqdm(
-            iter_index_batches(
-                len(tgt),
-                batch_size,
-                shuffle=True,
-            ),
-            total=(len(tgt) + batch_size - 1) // batch_size,
-            desc=f"[reconstruction pretrain] epoch {epoch}/{epochs}",
-        )
-
-        for idx in pbar:
-            xb = ctx[idx].to(device)
-            yb = tgt[idx].to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            loss, logits, _ = model(xb, yb)
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            count = yb.numel()
-            total_loss += float(loss.item()) * count
-            total_correct += int(logits.argmax(dim=-1).eq(yb).sum().item())
-            total_count += count
-
-            mean_loss = total_loss / max(total_count, 1)
-            pbar.set_postfix(
-                loss=f"{mean_loss:.4f}",
-                ppl=f"{np.exp(min(mean_loss, 20.0)):.2f}",
-                acc=f"{total_correct / max(total_count, 1):.4f}",
-            )
-
-        metrics = evaluate_reconstruction_encoder(
-            model=model,
-            ctx=ctx,
-            tgt=tgt,
-            batch_size=batch_size,
-            device=device,
-            max_items=eval_size,
-        )
-
-        history.append({
-            "epoch": epoch,
-            **metrics,
-        })
-
-        print(
-            f"[reconstruction pretrain eval] "
-            f"epoch={epoch} "
-            f"loss={metrics['loss']:.6f} "
-            f"ppl={metrics['ppl']:.4f} "
-            f"top1={metrics['top1']:.4f} "
-            f"N={metrics['count']:,}"
-        )
-
-    return history
-
-
-@torch.no_grad()
 def evaluate_discrete_decoder(
     decoder,
     centers,
@@ -320,10 +181,11 @@ def train_discrete_decoder(
     eval_size,
 ):
     """
-    Train VQ ID/center -> BPE decoder after clustering.
+    Train VQ center -> BPE decoder after clustering.
 
-    Only the lightweight decoder is optimized here. The GNN and the clustered
-    centers remain fixed, so the resulting decoder can be reused by the AR model.
+    Only the lightweight decoder is optimized. The GNN and clustered centers
+    remain fixed. This directly measures how much physical-token information
+    center-aware clustering retained.
     """
     epochs = int(epochs)
 
@@ -1047,23 +909,6 @@ def main():
     ap.add_argument("--center_scale", type=float, default=1.0)
 
     ap.add_argument(
-        "--recon_epochs",
-        type=int,
-        default=5,
-        help="epochs for GNN/BPE reconstruction pretraining before clustering",
-    )
-    ap.add_argument(
-        "--recon_lr",
-        type=float,
-        default=3e-4,
-        help="learning rate for reconstruction-aware GNN pretraining",
-    )
-    ap.add_argument(
-        "--recon_weight_decay",
-        type=float,
-        default=1e-4,
-    )
-    ap.add_argument(
         "--decoder_epochs",
         type=int,
         default=3,
@@ -1080,10 +925,10 @@ def main():
         default=1e-4,
     )
     ap.add_argument(
-        "--recon_eval_size",
+        "--decoder_eval_size",
         type=int,
         default=100000,
-        help="maximum number of windows used for reconstruction evaluation",
+        help="maximum number of windows used for discrete decoder evaluation",
     )
 
     # Global IVF -> KMeans
@@ -1158,18 +1003,9 @@ def main():
         center_scale=args.center_scale,
     ).to(device)
 
-    reconstruction_history = train_reconstruction_encoder(
-        model=model,
-        ctx=ctx,
-        tgt=tgt,
-        epochs=args.recon_epochs,
-        batch_size=args.batch_size,
-        lr=args.recon_lr,
-        weight_decay=args.recon_weight_decay,
-        device=device,
-        eval_size=args.recon_eval_size,
-    )
-
+    # Keep the GNN encoder unchanged.
+    # With center_scale > 0, the current BPE embedding is already included
+    # in the representation before clustering.
     model.eval()
     (
         global_centers,
@@ -1201,7 +1037,7 @@ def main():
         lr=args.decoder_lr,
         weight_decay=args.decoder_weight_decay,
         device=device,
-        eval_size=args.recon_eval_size,
+        eval_size=args.decoder_eval_size,
     )
 
     final_decoder_metrics = evaluate_discrete_decoder(
@@ -1211,7 +1047,7 @@ def main():
         tgt=tgt,
         batch_size=args.batch_size,
         device=device,
-        max_items=args.recon_eval_size,
+        max_items=args.decoder_eval_size,
     )
 
     print(
@@ -1329,8 +1165,8 @@ def main():
         },
         "decoder_type": "linear_center_to_bpe",
         "decoder_metrics": final_decoder_metrics,
-        "reconstruction_history": reconstruction_history,
         "discrete_decoder_history": discrete_decoder_history,
+        "encoder_reconstruction_pretraining": False,
     }
 
     dictionary_out = args.out.replace(".pt", "_dictionary.pt")
@@ -1369,8 +1205,8 @@ def main():
             "global_id_max": global_vq_vocab_size - 1,
             "decoder_type": "linear_center_to_bpe",
             "decoder_metrics": final_decoder_metrics,
-            "reconstruction_history": reconstruction_history,
-            "discrete_decoder_history": discrete_decoder_history,
+                "discrete_decoder_history": discrete_decoder_history,
+        "encoder_reconstruction_pretraining": False,
         },
         args.out,
     )
