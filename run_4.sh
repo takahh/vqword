@@ -94,11 +94,10 @@ K_BLOCK=4096
 # ファイル名
 # ============================================================
 
-BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}"
-# checkpoint側のタグ
-# 25k / 50k / 100k は _seed0 付き
-# 200kは既存ファイルに合わせてseed表記なし
-VQ_TAG="${BASE_TAG}${VQ_FILENAME_SUFFIX}"
+DECODER_EPOCHS=3
+
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed0"
+VQ_TAG="${BASE_TAG}_deconly_dec${DECODER_EPOCHS}"
 
 BPE_ARCHIVE="bpe_wikitext103_50257.tar.gz"
 TOKENIZER_DIR="/vqword/bpe_wikitext103_50257"
@@ -249,6 +248,7 @@ required = {
     "global_offsets",
     "vq_vocab_size",
     "args",
+    "decoder_state_dict",
 }
 
 missing = sorted(required - set(ckpt.keys()))
