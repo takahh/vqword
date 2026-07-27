@@ -134,8 +134,7 @@ BPE_ARCHIVE="bpe_wikitext103_${BPE_VOCAB_LABEL}.tar.gz"
 BPE_ARCHIVE_PATH="/vqword/${BPE_ARCHIVE}"
 
 TOKENIZER_DIR="/vqword/bpe_wikitext103_${BPE_VOCAB_LABEL}"
-
-TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_recon5_dec3_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}"
+TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_deconly_dec3_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}"
 
 OUT="wikitext103_vqword_${TAG}.pt"
 DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
@@ -281,7 +280,9 @@ echo "context    = past ${HOP} tokens + center"
 echo "codebook   = ${VQ_CODEBOOK_SIZE}"
 echo "============================================================"
 
-python train_vqword_reconstruct.py \
+DECODER_EPOCHS=3
+
+python train_vqword_decoder_only.py \
   --dataset Salesforce/wikitext \
   --dataset_config wikitext-103-raw-v1 \
   --text_col text \
@@ -292,7 +293,7 @@ python train_vqword_reconstruct.py \
   --d_model "${D_MODEL}" \
   --n_layers "${N_LAYERS}" \
   --center_scale "${CENTER_SCALE}" \
-  --decoder_epochs 3 \
+  --decoder_epochs "${DECODER_EPOCHS}" \
   --decoder_lr 1e-3 \
   --decoder_weight_decay 1e-4 \
   --decoder_eval_size 100000 \
