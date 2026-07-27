@@ -281,7 +281,7 @@ echo "context    = past ${HOP} tokens + center"
 echo "codebook   = ${VQ_CODEBOOK_SIZE}"
 echo "============================================================"
 
-python train_vqword_reconstruct.py \
+python train_vqword_decoder_only.py \
   --dataset Salesforce/wikitext \
   --dataset_config wikitext-103-raw-v1 \
   --text_col text \
@@ -292,13 +292,10 @@ python train_vqword_reconstruct.py \
   --d_model "${D_MODEL}" \
   --n_layers "${N_LAYERS}" \
   --center_scale "${CENTER_SCALE}" \
-  --recon_epochs 5 \
-  --recon_lr 3e-4 \
-  --recon_weight_decay 1e-4 \
   --decoder_epochs 3 \
   --decoder_lr 1e-3 \
   --decoder_weight_decay 1e-4 \
-  --recon_eval_size 100000 \
+  --decoder_eval_size 100000 \
   --ivf_nlist "${IVF_NLIST}" \
   --ivf_iters 1 \
   --ivf_batch_size 8192 \
