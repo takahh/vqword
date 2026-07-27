@@ -95,9 +95,10 @@ K_BLOCK=4096
 # ファイル名
 # ============================================================
 DECODER_EPOCHS=3
+RECON_EPOCHS=5
 
-BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
-VQ_TAG="${BASE_TAG}_deconly_dec${DECODER_EPOCHS}"
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center1_recon${RECON_EPOCHS}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+VQ_TAG="${BASE_TAG}"
 
 BPE_ARCHIVE="bpe_wikitext103_50257.tar.gz"
 TOKENIZER_DIR="/vqword/bpe_wikitext103_50257"
