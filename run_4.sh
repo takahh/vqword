@@ -94,7 +94,6 @@ K_BLOCK=4096
 # ============================================================
 # ファイル名
 # ============================================================
-
 DECODER_EPOCHS=3
 
 BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
