@@ -1,0 +1,1407 @@
+#!/usr/bin/env python3
+import argparse
+from collections import Counter, defaultdict
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from datasets import load_dataset
+from sklearn.cluster import MiniBatchKMeans
+from tqdm import tqdm
+from transformers import AutoTokenizer
+
+@torch.no_grad()
+def compute_cluster_metrics(y, k_req, topk=5):
+    y = y.long().view(-1)
+    n = y.numel()
+    bc = torch.bincount(y, minlength=k_req)
+    nz = bc[bc > 0]
+    p = nz.float() / max(1, n)
+    entropy = -(p * torch.log(p.clamp_min(1e-12))).sum() if nz.numel() else torch.tensor(0.0)
+
+    return {
+        "N": int(n),
+        "K_req": int(k_req),
+        "K_eff": int(nz.numel()),
+        "max_frac": float(p.max().item()) if nz.numel() else 0.0,
+        "top5_frac": float(torch.topk(p, min(topk, p.numel())).values.sum().item()) if nz.numel() else 0.0,
+        "entropy": float(entropy.item()),
+        "perplexity": float(torch.exp(entropy).item()) if nz.numel() else 1.0,
+        "singleton_ratio": float((nz == 1).float().mean().item()) if nz.numel() else 0.0,
+    }
+
+
+def make_adj_within_window(seq_len, hop, device):
+    pos = torch.arange(seq_len, device=device)
+    receiver = pos[:, None]
+    sender = pos[None, :]
+    distance = (receiver - sender).abs()
+    adj = (distance <= hop).float()
+    deg = adj.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    return adj / deg
+
+
+class AdjGNNLayer(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.self_lin = nn.Linear(d_model, d_model)
+        self.nei_lin = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, h, adj):
+        m = torch.einsum("ij,bjd->bid", adj, h)
+        out = self.self_lin(h) + self.nei_lin(m)
+        out = F.gelu(out)
+        return self.norm(h + out)
+
+
+class VQWordGNN(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        d_model=256,
+        hop=3,
+        n_layers=3,
+        dropout=0.1,
+        center_scale=1.0,
+    ):
+        super().__init__()
+        self.hop = hop
+
+        # 過去hop個 + 現在位置
+        self.seq_len = hop + 1
+        self.center_idx = hop
+        self.center_scale = center_scale
+
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(self.seq_len, d_model)
+        self.layers = nn.ModuleList([
+            AdjGNNLayer(d_model) for _ in range(n_layers)
+        ])
+        self.dropout = nn.Dropout(dropout)
+        self.decoder = nn.Linear(d_model, vocab_size)
+
+    def encode_context(self, ctx_ids):
+        batch_size, length = ctx_ids.shape
+        pos = torch.arange(length, device=ctx_ids.device)
+        pos = pos.unsqueeze(0).expand(batch_size, length)
+
+        tok_h = self.tok_emb(ctx_ids)
+        tok_h[:, self.center_idx, :] *= self.center_scale
+
+        h = self.dropout(tok_h + self.pos_emb(pos))
+        adj = make_adj_within_window(length, self.hop, ctx_ids.device)
+
+        for layer in self.layers:
+            h = layer(h, adj)
+
+        return F.normalize(h[:, self.center_idx], dim=-1)
+
+    def forward(self, ctx_ids, target_ids):
+        z = self.encode_context(ctx_ids)
+        logits = self.decoder(z)
+        loss = F.cross_entropy(logits, target_ids)
+        return loss, logits, z
+
+
+def iter_index_batches(n, batch_size, shuffle, device=None):
+    if shuffle:
+        order = torch.randperm(n)
+    else:
+        order = torch.arange(n)
+
+    for start in range(0, n, batch_size):
+        idx = order[start:start + batch_size]
+        if device is not None:
+            idx = idx.to(device)
+        yield idx
+
+
+@torch.no_grad()
+def evaluate_reconstruction_encoder(
+    model,
+    ctx,
+    tgt,
+    batch_size,
+    device,
+    max_items=None,
+):
+    model.eval()
+
+    n = len(tgt)
+    if max_items is not None:
+        n = min(n, int(max_items))
+
+    total_loss = 0.0
+    total_correct = 0
+    total_count = 0
+
+    for idx in iter_index_batches(n, batch_size, shuffle=False):
+        xb = ctx[idx].to(device)
+        yb = tgt[idx].to(device)
+
+        loss, logits, _ = model(xb, yb)
+        count = yb.numel()
+
+        total_loss += float(loss.item()) * count
+        total_correct += int(logits.argmax(dim=-1).eq(yb).sum().item())
+        total_count += count
+
+    mean_loss = total_loss / max(total_count, 1)
+
+    return {
+        "loss": mean_loss,
+        "ppl": float(np.exp(min(mean_loss, 20.0))),
+        "top1": total_correct / max(total_count, 1),
+        "count": total_count,
+    }
+
+
+def train_reconstruction_encoder(
+    model,
+    ctx,
+    tgt,
+    epochs,
+    batch_size,
+    lr,
+    weight_decay,
+    device,
+    eval_size,
+):
+    """
+    BPE reconstruction pretraining.
+
+    The GNN encoder is trained before clustering so that its continuous
+    representation preserves enough information to reconstruct the center BPE.
+    This makes the subsequent clustering reconstruction-aware.
+    """
+    epochs = int(epochs)
+
+    if epochs <= 0:
+        print("[reconstruction pretrain] skipped")
+        return []
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+
+    history = []
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+
+        total_loss = 0.0
+        total_correct = 0
+        total_count = 0
+
+        pbar = tqdm(
+            iter_index_batches(
+                len(tgt),
+                batch_size,
+                shuffle=True,
+            ),
+            total=(len(tgt) + batch_size - 1) // batch_size,
+            desc=f"[reconstruction pretrain] epoch {epoch}/{epochs}",
+        )
+
+        for idx in pbar:
+            xb = ctx[idx].to(device)
+            yb = tgt[idx].to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            loss, logits, _ = model(xb, yb)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            count = yb.numel()
+            total_loss += float(loss.item()) * count
+            total_correct += int(logits.argmax(dim=-1).eq(yb).sum().item())
+            total_count += count
+
+            mean_loss = total_loss / max(total_count, 1)
+            pbar.set_postfix(
+                loss=f"{mean_loss:.4f}",
+                ppl=f"{np.exp(min(mean_loss, 20.0)):.2f}",
+                acc=f"{total_correct / max(total_count, 1):.4f}",
+            )
+
+        metrics = evaluate_reconstruction_encoder(
+            model=model,
+            ctx=ctx,
+            tgt=tgt,
+            batch_size=batch_size,
+            device=device,
+            max_items=eval_size,
+        )
+
+        history.append({
+            "epoch": epoch,
+            **metrics,
+        })
+
+        print(
+            f"[reconstruction pretrain eval] "
+            f"epoch={epoch} "
+            f"loss={metrics['loss']:.6f} "
+            f"ppl={metrics['ppl']:.4f} "
+            f"top1={metrics['top1']:.4f} "
+            f"N={metrics['count']:,}"
+        )
+
+    return history
+
+
+@torch.no_grad()
+def evaluate_discrete_decoder(
+    decoder,
+    centers,
+    vq_ids,
+    tgt,
+    batch_size,
+    device,
+    max_items=None,
+):
+    decoder.eval()
+
+    n = len(tgt)
+    if max_items is not None:
+        n = min(n, int(max_items))
+
+    total_loss = 0.0
+    total_top1 = 0
+    total_top5 = 0
+    total_count = 0
+
+    centers = centers.to(device)
+
+    for idx in iter_index_batches(n, batch_size, shuffle=False):
+        ids = vq_ids[idx].to(device)
+        yb = tgt[idx].to(device)
+
+        q = centers[ids]
+        logits = decoder(q)
+        loss = F.cross_entropy(logits, yb, reduction="sum")
+
+        k = min(5, logits.size(-1))
+        topk = logits.topk(k, dim=-1).indices
+
+        total_loss += float(loss.item())
+        total_top1 += int(topk[:, 0].eq(yb).sum().item())
+        total_top5 += int(topk.eq(yb[:, None]).any(dim=1).sum().item())
+        total_count += yb.numel()
+
+    mean_loss = total_loss / max(total_count, 1)
+
+    return {
+        "loss": mean_loss,
+        "ppl": float(np.exp(min(mean_loss, 20.0))),
+        "top1": total_top1 / max(total_count, 1),
+        "top5": total_top5 / max(total_count, 1),
+        "count": total_count,
+    }
+
+
+def train_discrete_decoder(
+    decoder,
+    centers,
+    vq_ids,
+    tgt,
+    epochs,
+    batch_size,
+    lr,
+    weight_decay,
+    device,
+    eval_size,
+):
+    """
+    Train VQ ID/center -> BPE decoder after clustering.
+
+    Only the lightweight decoder is optimized here. The GNN and the clustered
+    centers remain fixed, so the resulting decoder can be reused by the AR model.
+    """
+    epochs = int(epochs)
+
+    if epochs <= 0:
+        print("[discrete decoder] skipped")
+        return []
+
+    decoder.train()
+    decoder.requires_grad_(True)
+
+    optimizer = torch.optim.AdamW(
+        decoder.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+
+    centers_device = centers.to(device)
+    history = []
+
+    for epoch in range(1, epochs + 1):
+        decoder.train()
+
+        total_loss = 0.0
+        total_correct = 0
+        total_count = 0
+
+        pbar = tqdm(
+            iter_index_batches(
+                len(tgt),
+                batch_size,
+                shuffle=True,
+            ),
+            total=(len(tgt) + batch_size - 1) // batch_size,
+            desc=f"[discrete decoder] epoch {epoch}/{epochs}",
+        )
+
+        for idx in pbar:
+            ids = vq_ids[idx].to(device)
+            yb = tgt[idx].to(device)
+
+            q = centers_device[ids]
+
+            optimizer.zero_grad(set_to_none=True)
+
+            logits = decoder(q)
+            loss = F.cross_entropy(logits, yb)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
+            optimizer.step()
+
+            count = yb.numel()
+            total_loss += float(loss.item()) * count
+            total_correct += int(logits.argmax(dim=-1).eq(yb).sum().item())
+            total_count += count
+
+            mean_loss = total_loss / max(total_count, 1)
+            pbar.set_postfix(
+                loss=f"{mean_loss:.4f}",
+                ppl=f"{np.exp(min(mean_loss, 20.0)):.2f}",
+                acc=f"{total_correct / max(total_count, 1):.4f}",
+            )
+
+        metrics = evaluate_discrete_decoder(
+            decoder=decoder,
+            centers=centers,
+            vq_ids=vq_ids,
+            tgt=tgt,
+            batch_size=batch_size,
+            device=device,
+            max_items=eval_size,
+        )
+
+        history.append({
+            "epoch": epoch,
+            **metrics,
+        })
+
+        print(
+            f"[discrete decoder eval] "
+            f"epoch={epoch} "
+            f"loss={metrics['loss']:.6f} "
+            f"ppl={metrics['ppl']:.4f} "
+            f"top1={metrics['top1']:.4f} "
+            f"top5={metrics['top5']:.4f} "
+            f"N={metrics['count']:,}"
+        )
+
+    return history
+
+
+@torch.no_grad()
+def assign_blockwise(z, centers, k_block=4096):
+    z = F.normalize(z.float(), dim=-1)
+    centers = F.normalize(centers.float(), dim=-1)
+
+    best_sim = torch.full((z.size(0),), -1e9, device=z.device)
+    best_id = torch.zeros(z.size(0), dtype=torch.long, device=z.device)
+
+    for start in range(0, centers.size(0), k_block):
+        c = centers[start:start + k_block]
+        sim = z @ c.T
+        value, index = sim.max(dim=1)
+        mask = value > best_sim
+        best_sim[mask] = value[mask]
+        best_id[mask] = index[mask] + start
+
+    return best_id
+
+
+def make_windows(token_ids, hop, pad_id):
+    ids = torch.tensor(token_ids, dtype=torch.long)
+
+    # 左側だけpaddingする
+    padded = F.pad(ids, (hop, 0), value=pad_id)
+
+    ctx = []
+    tgt = []
+
+    for i in range(len(ids)):
+        # 過去hop個 + 現在位置
+        ctx.append(padded[i:i + hop + 1])
+        tgt.append(ids[i])
+
+    return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
+
+
+@torch.no_grad()
+def encode_batch(model, ctx, start, batch_size, device):
+    end = min(start + batch_size, len(ctx))
+    xb = ctx[start:end].to(device)
+    z = model.encode_context(xb).float()
+    return z, end
+
+
+@torch.no_grad()
+def fit_ivf_streaming(model, ctx, batch_size, device, args):
+    """Fit coarse IVF centers without storing all embeddings."""
+    n = len(ctx)
+    nlist = min(args.ivf_nlist, n)
+    if nlist < 1:
+        raise ValueError("ivf_nlist must be positive")
+
+    ivf = MiniBatchKMeans(
+        n_clusters=nlist,
+        init="k-means++",
+        n_init=1,
+        batch_size=max(args.ivf_batch_size, nlist),
+        random_state=args.seed,
+        reassignment_ratio=0.01,
+        verbose=0,
+    )
+
+    initialized = False
+    pending = []
+    pending_n = 0
+
+    for epoch in range(args.ivf_iters):
+        pbar = tqdm(range(0, n, batch_size), desc=f"[IVF fit] pass {epoch + 1}/{args.ivf_iters}")
+        for start in pbar:
+            z, _ = encode_batch(model, ctx, start, batch_size, device)
+            x = z.cpu().numpy().astype(np.float32, copy=False)
+
+            if not initialized:
+                pending.append(x)
+                pending_n += len(x)
+                if pending_n < nlist:
+                    continue
+                first = np.concatenate(pending, axis=0)
+                ivf.partial_fit(first)
+                initialized = True
+                pending.clear()
+            else:
+                ivf.partial_fit(x)
+
+    if not initialized:
+        raise RuntimeError("Not enough samples to initialize IVF")
+
+    centers = torch.from_numpy(ivf.cluster_centers_).float()
+    centers = F.normalize(centers, dim=-1)
+    return centers
+
+
+@torch.no_grad()
+def count_ivf_lists(model, ctx, ivf_centers, batch_size, device, k_block):
+    centers = ivf_centers.to(device)
+    counts = torch.zeros(centers.size(0), dtype=torch.long)
+
+    for start in tqdm(range(0, len(ctx), batch_size), desc="[IVF count]"):
+        z, _ = encode_batch(model, ctx, start, batch_size, device)
+        ids = assign_blockwise(z, centers, k_block=k_block).cpu()
+        counts += torch.bincount(ids, minlength=centers.size(0))
+
+    return counts
+
+
+def allocate_k_per_ivf_list(
+    ivf_counts: torch.Tensor,
+    requested_k: int,
+) -> torch.Tensor:
+    """
+    各IVFリストに割り当てるfine center数を決める。
+
+    方針:
+      - すべてのIVFリストに最低1個割り当てる
+      - 残りを、各リストのデータ数に比例して配分する
+      - 合計はrequested_kに厳密に一致させる
+    """
+    ivf_counts = ivf_counts.to(dtype=torch.long)
+    requested_k = int(requested_k)
+
+    nlist = int(ivf_counts.numel())
+
+    if requested_k < nlist:
+        raise ValueError(
+            f"requested_k={requested_k} is smaller than "
+            f"number of IVF lists={nlist}. "
+            "Cannot assign at least one fine center to every IVF list."
+        )
+
+    device = ivf_counts.device
+
+    # すべてのIVFリストに最低1個
+    k_per_list = torch.ones(
+        nlist,
+        dtype=torch.long,
+        device=device,
+    )
+
+    remaining = requested_k - nlist
+
+    if remaining == 0:
+        return k_per_list
+
+    weights = ivf_counts.to(dtype=torch.float64)
+
+    # 念のため、全カウントが0の場合にも対応
+    if float(weights.sum().item()) <= 0.0:
+        weights = torch.ones_like(weights)
+
+    # 残りを点数に比例配分
+    raw_extra = weights / weights.sum() * remaining
+    extra = torch.floor(raw_extra).to(dtype=torch.long)
+
+    k_per_list += extra
+
+    # floorにより余ったcenterを小数部分が大きい順に配る
+    leftover = requested_k - int(k_per_list.sum().item())
+
+    if leftover > 0:
+        fractional = raw_extra - extra.to(dtype=raw_extra.dtype)
+        order = torch.argsort(fractional, descending=True)
+        k_per_list[order[:leftover]] += 1
+
+    # 最終チェック
+    actual_total = int(k_per_list.sum().item())
+
+    if actual_total != requested_k:
+        raise RuntimeError(
+            f"k allocation mismatch: "
+            f"actual={actual_total}, requested={requested_k}"
+        )
+
+    if int(k_per_list.min().item()) < 1:
+        zero_lists = torch.where(k_per_list < 1)[0]
+        raise RuntimeError(
+            "Some IVF lists received no fine centers: "
+            f"{zero_lists[:50].tolist()}"
+        )
+
+    return k_per_list
+
+@torch.no_grad()
+def initialize_fine_centers_streaming(
+    model,
+    ctx,
+    ivf_centers,
+    k_per_list,
+    batch_size,
+    device,
+    k_block,
+):
+    """
+    Collect initial fine centers from each IVF list.
+
+    実データ点を優先して使い、必要数に足りないIVFリストについては、
+    対応するcoarse IVF centerで不足分を埋める。
+    """
+    nlist = ivf_centers.size(0)
+    d_model = ivf_centers.size(1)
+
+    # CPU上で扱う型を明示的に統一
+    k_per_list = k_per_list.to(
+        device="cpu",
+        dtype=torch.long,
+    )
+
+    if k_per_list.numel() != nlist:
+        raise ValueError(
+            f"k_per_list size mismatch: "
+            f"{k_per_list.numel()} != nlist={nlist}"
+        )
+
+    if torch.any(k_per_list <= 0):
+        bad = torch.where(k_per_list <= 0)[0]
+        raise ValueError(
+            "Every IVF list must receive at least one fine center. "
+            f"Bad lists: {bad[:20].tolist()}"
+        )
+
+    offsets = torch.zeros(
+        nlist + 1,
+        dtype=torch.long,
+    )
+    offsets[1:] = torch.cumsum(k_per_list, dim=0)
+
+    total_k = int(offsets[-1].item())
+
+    initial = torch.empty(
+        (total_k, d_model),
+        dtype=torch.float32,
+    )
+
+    filled = torch.zeros(
+        nlist,
+        dtype=torch.long,
+    )
+
+    # coarseはassignment用としてdevice上に置く
+    coarse = F.normalize(
+        ivf_centers.to(
+            device=device,
+            dtype=torch.float32,
+        ),
+        dim=-1,
+    )
+
+    for start in tqdm(
+        range(0, len(ctx), batch_size),
+        desc="[fine init]",
+    ):
+        z, _ = encode_batch(
+            model,
+            ctx,
+            start,
+            batch_size,
+            device,
+        )
+
+        z = F.normalize(
+            z.to(dtype=torch.float32),
+            dim=-1,
+        )
+
+        ivf_ids = assign_blockwise(
+            z,
+            coarse,
+            k_block=k_block,
+        ).cpu()
+
+        z_cpu = z.cpu()
+
+        for list_id in torch.unique(ivf_ids).tolist():
+            list_id = int(list_id)
+
+            need = int(
+                k_per_list[list_id].item()
+                - filled[list_id].item()
+            )
+
+            if need <= 0:
+                continue
+
+            candidates = z_cpu[ivf_ids == list_id]
+
+            take = min(
+                need,
+                int(candidates.size(0)),
+            )
+
+            if take <= 0:
+                continue
+
+            begin = int(
+                offsets[list_id].item()
+                + filled[list_id].item()
+            )
+
+            initial[begin : begin + take] = candidates[:take]
+            filled[list_id] += take
+
+        if torch.equal(filled, k_per_list):
+            break
+
+    # --------------------------------------------------------
+    # 不足分を対応するcoarse IVF centerで埋める
+    # --------------------------------------------------------
+    coarse_cpu = coarse.cpu()
+
+    fallback_lists = torch.where(
+        filled < k_per_list
+    )[0]
+
+    fallback_center_count = 0
+
+    for list_id_tensor in fallback_lists:
+        list_id = int(list_id_tensor.item())
+
+        begin = int(
+            offsets[list_id].item()
+            + filled[list_id].item()
+        )
+        end = int(offsets[list_id + 1].item())
+
+        missing = end - begin
+
+        if missing <= 0:
+            continue
+
+        initial[begin:end] = coarse_cpu[list_id].unsqueeze(0).expand(
+            missing,
+            -1,
+        )
+
+        filled[list_id] += missing
+        fallback_center_count += missing
+
+    # --------------------------------------------------------
+    # 最終検査
+    # --------------------------------------------------------
+    if not torch.equal(filled, k_per_list):
+        bad = torch.where(
+            filled != k_per_list
+        )[0]
+
+        details = [
+            {
+                "list": int(i),
+                "filled": int(filled[i]),
+                "required": int(k_per_list[i]),
+            }
+            for i in bad[:20].tolist()
+        ]
+
+        raise RuntimeError(
+            "Failed to initialize fine centers: "
+            f"{details}"
+        )
+
+    sizes_from_offsets = offsets[1:] - offsets[:-1]
+
+    if not torch.equal(
+        sizes_from_offsets,
+        k_per_list,
+    ):
+        bad = torch.where(
+            sizes_from_offsets != k_per_list
+        )[0]
+
+        raise RuntimeError(
+            "offsets do not match k_per_list: "
+            f"{bad[:20].tolist()}"
+        )
+
+    empty_lists = torch.where(
+        sizes_from_offsets == 0
+    )[0]
+
+    if empty_lists.numel() > 0:
+        raise RuntimeError(
+            "Some IVF lists have zero fine centers: "
+            f"{empty_lists[:20].tolist()}"
+        )
+
+    print(
+        f"[fine init] total_centers={total_k} "
+        f"fallback_lists={int(fallback_lists.numel())} "
+        f"fallback_centers={fallback_center_count}"
+    )
+
+    return F.normalize(initial, dim=-1), offsets
+
+
+@torch.no_grad()
+def fit_fine_kmeans_streaming(
+    model,
+    ctx,
+    ivf_centers,
+    fine_centers,
+    offsets,
+    batch_size,
+    device,
+    args,
+):
+    coarse = ivf_centers.to(device)
+    centers = fine_centers.to(device)
+    total_k, d_model = centers.shape
+
+    for iteration in range(args.global_kmeans_iters):
+        sums = torch.zeros((total_k, d_model), device=device)
+        counts = torch.zeros(total_k, device=device)
+
+        pbar = tqdm(
+            range(0, len(ctx), batch_size),
+            desc=f"[fine kmeans] iter {iteration + 1}/{args.global_kmeans_iters}",
+        )
+        for start in pbar:
+            z, _ = encode_batch(model, ctx, start, batch_size, device)
+            ivf_ids = assign_blockwise(z, coarse, k_block=args.k_block)
+
+            for list_id in torch.unique(ivf_ids).tolist():
+                mask = ivf_ids == list_id
+                begin = int(offsets[list_id])
+                end = int(offsets[list_id + 1])
+                local_centers = centers[begin:end]
+                local_ids = assign_blockwise(
+                    z[mask],
+                    local_centers,
+                    k_block=args.k_block,
+                )
+                global_ids = local_ids + begin
+                sums.index_add_(0, global_ids, z[mask])
+                counts.index_add_(
+                    0,
+                    global_ids,
+                    torch.ones_like(global_ids, dtype=torch.float),
+                )
+
+        nonempty = counts > 0
+        new_centers = centers.clone()
+        new_centers[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1)
+        new_centers = F.normalize(new_centers, dim=-1)
+        shift = (new_centers - centers).pow(2).sum(dim=1).sqrt().mean().item()
+        centers = new_centers
+
+        print(
+            f"[fine kmeans] used={int(nonempty.sum())}/{total_k} "
+            f"shift={shift:.6f}"
+        )
+
+    return centers.cpu()
+
+
+@torch.no_grad()
+def assign_global_ids_streaming(
+    model,
+    ctx,
+    ivf_centers,
+    fine_centers,
+    offsets,
+    batch_size,
+    device,
+    k_block,
+):
+    coarse = ivf_centers.to(device)
+    fine = fine_centers.to(device)
+    vq_ids = torch.empty(len(ctx), dtype=torch.long)
+    ivf_ids_all = torch.empty(len(ctx), dtype=torch.long)
+
+    for start in tqdm(range(0, len(ctx), batch_size), desc="[final assign]"):
+        z, end = encode_batch(model, ctx, start, batch_size, device)
+        ivf_ids = assign_blockwise(z, coarse, k_block=k_block)
+        batch_global = torch.empty(z.size(0), dtype=torch.long, device=device)
+
+        for list_id in torch.unique(ivf_ids).tolist():
+            mask = ivf_ids == list_id
+            begin = int(offsets[list_id])
+            finish = int(offsets[list_id + 1])
+            local_ids = assign_blockwise(
+                z[mask],
+                fine[begin:finish],
+                k_block=k_block,
+            )
+            batch_global[mask] = local_ids + begin
+
+        vq_ids[start:end] = batch_global.cpu()
+        ivf_ids_all[start:end] = ivf_ids.cpu()
+
+    return vq_ids, ivf_ids_all
+
+
+@torch.no_grad()
+def fit_global_ivf_then_kmeans_streaming(model, ctx, batch_size, device, args):
+    print("[stage 1] fit global IVF")
+    ivf_centers = fit_ivf_streaming(
+        model=model,
+        ctx=ctx,
+        batch_size=batch_size,
+        device=device,
+        args=args,
+    )
+
+    print("[stage 1] count points in IVF lists")
+    ivf_counts = count_ivf_lists(
+        model=model,
+        ctx=ctx,
+        ivf_centers=ivf_centers,
+        batch_size=batch_size,
+        device=device,
+        k_block=args.k_block,
+    )
+
+    k_per_list = allocate_k_per_ivf_list(
+        ivf_counts=ivf_counts,
+        requested_k=args.global_codebook_size,
+    )
+
+    zero_lists = torch.where(k_per_list == 0)[0]
+    nonzero = k_per_list[k_per_list > 0]
+
+    print(
+        f"[stage 2 allocation] total={int(k_per_list.sum())} "
+        f"min={int(nonzero.min())} "
+        f"mean={nonzero.float().mean().item():.2f} "
+        f"max={int(nonzero.max())} "
+        f"zero_lists={int(zero_lists.numel())}"
+    )
+
+    if zero_lists.numel() > 0:
+        raise RuntimeError(
+            "Allocation produced zero-center IVF lists: "
+            f"{zero_lists[:50].tolist()}"
+        )
+
+    print("[stage 2] initialize fine centers")
+    fine_centers, offsets = initialize_fine_centers_streaming(
+        model=model,
+        ctx=ctx,
+        ivf_centers=ivf_centers,
+        k_per_list=k_per_list,
+        batch_size=batch_size,
+        device=device,
+        k_block=args.k_block,
+    )
+
+    expected_total = int(k_per_list.sum().item())
+    actual_total = int(fine_centers.size(0))
+
+    if actual_total != expected_total:
+        raise RuntimeError(
+            f"Fine center count mismatch: "
+            f"actual={actual_total}, expected={expected_total}"
+        )
+
+    offset_sizes = offsets[1:] - offsets[:-1]
+
+    if not torch.equal(offset_sizes.cpu(), k_per_list.cpu()):
+        bad = torch.where(
+            offset_sizes.cpu() != k_per_list.cpu()
+        )[0]
+
+        raise RuntimeError(
+            "global_offsets and k_per_list mismatch: "
+            f"{bad[:20].tolist()}"
+        )
+
+    empty_lists = torch.where(offset_sizes <= 0)[0]
+
+    if empty_lists.numel() > 0:
+        raise RuntimeError(
+            "IVF lists without fine centers remain: "
+            f"{empty_lists[:20].tolist()}"
+        )
+
+    print(
+        f"[stage 2 validation] "
+        f"fine_centers={actual_total} "
+        f"empty_lists=0"
+    )
+
+    print("[stage 2] fit KMeans inside each IVF list")
+    global_centers = fit_fine_kmeans_streaming(
+        model=model,
+        ctx=ctx,
+        ivf_centers=ivf_centers,
+        fine_centers=fine_centers,
+        offsets=offsets,
+        batch_size=batch_size,
+        device=device,
+        args=args,
+    )
+
+    print("[stage 2] final assignment")
+    vq_ids, ivf_ids = assign_global_ids_streaming(
+        model=model,
+        ctx=ctx,
+        ivf_centers=ivf_centers,
+        fine_centers=global_centers,
+        offsets=offsets,
+        batch_size=batch_size,
+        device=device,
+        k_block=args.k_block,
+    )
+
+    return (
+        global_centers,
+        vq_ids,
+        ivf_centers,
+        ivf_ids,
+        k_per_list,
+        offsets,
+        ivf_counts,
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    # Data
+    ap.add_argument("--dataset", default="roneneldan/TinyStories")
+    ap.add_argument("--dataset_config", default=None)
+    ap.add_argument("--text_col", default="text")
+    ap.add_argument("--tokenizer", default="gpt2")
+    ap.add_argument("--max_samples", type=int, default=20000)
+    ap.add_argument("--seq_len", type=int, default=256)
+    ap.add_argument("--hop", type=int, default=3)
+
+    # Model
+    ap.add_argument("--d_model", type=int, default=256)
+    ap.add_argument("--n_layers", type=int, default=3)
+    ap.add_argument("--center_scale", type=float, default=1.0)
+
+    ap.add_argument(
+        "--recon_epochs",
+        type=int,
+        default=5,
+        help="epochs for GNN/BPE reconstruction pretraining before clustering",
+    )
+    ap.add_argument(
+        "--recon_lr",
+        type=float,
+        default=3e-4,
+        help="learning rate for reconstruction-aware GNN pretraining",
+    )
+    ap.add_argument(
+        "--recon_weight_decay",
+        type=float,
+        default=1e-4,
+    )
+    ap.add_argument(
+        "--decoder_epochs",
+        type=int,
+        default=3,
+        help="epochs for fixed-center VQ-to-BPE decoder training",
+    )
+    ap.add_argument(
+        "--decoder_lr",
+        type=float,
+        default=1e-3,
+    )
+    ap.add_argument(
+        "--decoder_weight_decay",
+        type=float,
+        default=1e-4,
+    )
+    ap.add_argument(
+        "--recon_eval_size",
+        type=int,
+        default=100000,
+        help="maximum number of windows used for reconstruction evaluation",
+    )
+
+    # Global IVF -> KMeans
+    ap.add_argument("--ivf_nlist", type=int, default=128)
+    ap.add_argument(
+        "--ivf_iters",
+        type=int,
+        default=1,
+        help="Number of full streaming passes used to fit coarse IVF",
+    )
+    ap.add_argument("--ivf_batch_size", type=int, default=8192)
+    ap.add_argument("--global_codebook_size", type=int, default=50000)
+    ap.add_argument(
+        "--global_kmeans_iters",
+        type=int,
+        default=5,
+        help="Number of full streaming KMeans passes inside IVF lists",
+    )
+    ap.add_argument("--global_batch_size", type=int, default=8192)
+
+    # Utilities
+    ap.add_argument("--batch_size", type=int, default=1024)
+    ap.add_argument("--k_block", type=int, default=4096)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", default="vqword_global_ivf.pt")
+
+    args = ap.parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[device] {device}")
+
+    tok = AutoTokenizer.from_pretrained(args.tokenizer)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    vocab_size = tok.vocab_size
+    pad_id = tok.pad_token_id
+
+    if args.dataset_config is None:
+        ds = load_dataset(args.dataset, split="train")
+    else:
+        ds = load_dataset(args.dataset, args.dataset_config, split="train")
+
+    print(f"[tokenizer] {args.tokenizer}")
+    print(f"[vocab_size] {vocab_size}")
+
+    all_ctx = []
+    all_tgt = []
+    print("[data] tokenizing")
+    limit = min(args.max_samples, len(ds))
+    for ex in tqdm(ds.select(range(limit))):
+        ids = tok.encode(ex[args.text_col], add_special_tokens=False)[:args.seq_len]
+        if len(ids) < 2:
+            continue
+        ctx, tgt = make_windows(ids, args.hop, pad_id)
+        all_ctx.append(ctx)
+        all_tgt.append(tgt)
+
+    if not all_ctx:
+        raise ValueError("No usable tokenized samples")
+
+    ctx = torch.cat(all_ctx, dim=0)
+    tgt = torch.cat(all_tgt, dim=0)
+    print(f"[data] windows={len(tgt):,} vocab={vocab_size}")
+
+    model = VQWordGNN(
+        vocab_size=vocab_size,
+        d_model=args.d_model,
+        hop=args.hop,
+        n_layers=args.n_layers,
+        center_scale=args.center_scale,
+    ).to(device)
+
+    reconstruction_history = train_reconstruction_encoder(
+        model=model,
+        ctx=ctx,
+        tgt=tgt,
+        epochs=args.recon_epochs,
+        batch_size=args.batch_size,
+        lr=args.recon_lr,
+        weight_decay=args.recon_weight_decay,
+        device=device,
+        eval_size=args.recon_eval_size,
+    )
+
+    model.eval()
+    (
+        global_centers,
+        vq_ids,
+        ivf_centers,
+        ivf_ids,
+        k_per_ivf_list,
+        global_offsets,
+        ivf_counts,
+    ) = fit_global_ivf_then_kmeans_streaming(
+        model=model,
+        ctx=ctx,
+        batch_size=args.batch_size,
+        device=device,
+        args=args,
+    )
+
+    global_vq_vocab_size = int(global_centers.size(0))
+    print(f"[global] vq_vocab_size={global_vq_vocab_size:,}")
+
+
+    discrete_decoder_history = train_discrete_decoder(
+        decoder=model.decoder,
+        centers=global_centers,
+        vq_ids=vq_ids,
+        tgt=tgt,
+        epochs=args.decoder_epochs,
+        batch_size=args.batch_size,
+        lr=args.decoder_lr,
+        weight_decay=args.decoder_weight_decay,
+        device=device,
+        eval_size=args.recon_eval_size,
+    )
+
+    final_decoder_metrics = evaluate_discrete_decoder(
+        decoder=model.decoder,
+        centers=global_centers,
+        vq_ids=vq_ids,
+        tgt=tgt,
+        batch_size=args.batch_size,
+        device=device,
+        max_items=args.recon_eval_size,
+    )
+
+    print(
+        f"[final discrete reconstruction] "
+        f"loss={final_decoder_metrics['loss']:.6f} "
+        f"ppl={final_decoder_metrics['ppl']:.4f} "
+        f"top1={final_decoder_metrics['top1']:.4f} "
+        f"top5={final_decoder_metrics['top5']:.4f}"
+    )
+
+    # ---------------------------------------------------------
+    # Dictionary: VQW ID -> associated BPE ID candidates
+    # ---------------------------------------------------------
+    top_k = 32
+
+    cluster_counter = defaultdict(Counter)
+
+    for bpe_id, vqw_id in zip(tgt.tolist(), vq_ids.tolist()):
+        cluster_counter[int(vqw_id)][int(bpe_id)] += 1
+
+    # 固定長tensor。
+    # AR側で候補集合を高速に引くために使う。
+    candidate_token_ids = torch.full(
+        (global_vq_vocab_size, top_k),
+        -1,
+        dtype=torch.int32,
+    )
+    candidate_token_counts = torch.zeros(
+        (global_vq_vocab_size, top_k),
+        dtype=torch.int64,
+    )
+
+    # 各VQW IDの全出現数
+    vq_total_counts = torch.zeros(
+        global_vq_vocab_size,
+        dtype=torch.int64,
+    )
+
+    # 各VQW IDに対応するBPE ID数
+    vq_candidate_sizes = torch.zeros(
+        global_vq_vocab_size,
+        dtype=torch.int32,
+    )
+
+    # 可変長の完全版。
+    # VQW ID -> [(bpe_id, count), ...]
+    vq_to_bpe_ids = {}
+
+    for vqw_id in range(global_vq_vocab_size):
+        counter = cluster_counter.get(vqw_id)
+
+        if counter is None:
+            vq_to_bpe_ids[vqw_id] = []
+            continue
+
+        ranked = counter.most_common()
+        total_count = sum(count for _, count in ranked)
+
+        vq_total_counts[vqw_id] = total_count
+        vq_candidate_sizes[vqw_id] = len(ranked)
+
+        # 完全な対応一覧
+        vq_to_bpe_ids[vqw_id] = [
+            (int(bpe_id), int(count))
+            for bpe_id, count in ranked
+        ]
+
+        # 上位top_k候補をtensorにも保存
+        for rank, (bpe_id, count) in enumerate(ranked[:top_k]):
+            candidate_token_ids[vqw_id, rank] = int(bpe_id)
+            candidate_token_counts[vqw_id, rank] = int(count)
+
+    used_vq = vq_total_counts > 0
+
+    print(
+        f"[dictionary] covered="
+        f"{int(used_vq.sum())}/{global_vq_vocab_size} "
+        f"mean_bpe_candidates="
+        f"{vq_candidate_sizes[used_vq].float().mean().item():.2f} "
+        f"max_bpe_candidates="
+        f"{int(vq_candidate_sizes.max())}"
+    )
+
+    dictionary = {
+        # 完全版
+        "vq_to_bpe_ids": vq_to_bpe_ids,
+
+        # 高速アクセス用上位候補
+        "candidate_token_ids": candidate_token_ids,
+        "candidate_token_counts": candidate_token_counts,
+
+        # 統計
+        "vq_total_counts": vq_total_counts,
+        "vq_candidate_sizes": vq_candidate_sizes,
+
+        # metadata
+        "top_k": top_k,
+        "vq_vocab_size": global_vq_vocab_size,
+        "vq_pad_id": global_vq_vocab_size,
+        "token_vocab_size": vocab_size,
+        "tokenizer_name": args.tokenizer,
+        "pad_token_id": pad_id,
+        "unk_token_id": tok.unk_token_id,
+        "vocab_type": "byte_bpe",
+        "partitioned": False,
+        "partition_type": "global_ivf_then_kmeans",
+        "id_scheme": "global_ivf_then_local_kmeans",
+        "global_id_min": 0,
+        "global_id_max": global_vq_vocab_size - 1,
+
+        # learned VQ center -> BPE decoder
+        "decoder_state_dict": {
+            key: value.detach().cpu()
+            for key, value in model.decoder.state_dict().items()
+        },
+        "decoder_type": "linear_center_to_bpe",
+        "decoder_metrics": final_decoder_metrics,
+        "reconstruction_history": reconstruction_history,
+        "discrete_decoder_history": discrete_decoder_history,
+    }
+
+    dictionary_out = args.out.replace(".pt", "_dictionary.pt")
+    torch.save(dictionary, dictionary_out)
+    print(f"[save dictionary] {dictionary_out}")
+
+    metrics = compute_cluster_metrics(vq_ids, k_req=global_vq_vocab_size)
+    print(
+        f"[FINAL CLST] N={metrics['N']} "
+        f"K_eff={metrics['K_eff']}/{metrics['K_req']} "
+        f"max_frac={metrics['max_frac']:.4f} "
+        f"top5_frac={metrics['top5_frac']:.4f} "
+        f"H={metrics['entropy']:.4f} "
+        f"ppl={metrics['perplexity']:.2f} "
+        f"singleton_ratio={metrics['singleton_ratio']:.4f}"
+    )
+
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "ivf_centers": ivf_centers,
+            "global_centers": global_centers,
+            "k_per_ivf_list": k_per_ivf_list,
+            "global_offsets": global_offsets,
+            "ivf_counts": ivf_counts,
+            "args": vars(args),
+            "tokenizer_name": args.tokenizer,
+            "pad_token_id": pad_id,
+            "unk_token_id": None,
+            "vocab_type": "byte_bpe",
+            "partitioned": False,
+            "partition_type": "global_ivf_then_kmeans",
+            "vq_vocab_size": global_vq_vocab_size,
+            "id_scheme": "global_ivf_then_local_kmeans",
+            "global_id_min": 0,
+            "global_id_max": global_vq_vocab_size - 1,
+            "decoder_type": "linear_center_to_bpe",
+            "decoder_metrics": final_decoder_metrics,
+            "reconstruction_history": reconstruction_history,
+            "discrete_decoder_history": discrete_decoder_history,
+        },
+        args.out,
+    )
+
+    ids_out = args.out.replace(".pt", "_ids.pt")
+    torch.save(
+        {
+            "vq_ids": vq_ids.to(torch.int32),
+            "tgt": tgt.to(torch.int32),
+            "ivf_ids": ivf_ids.to(torch.int16),
+            "k_per_ivf_list": k_per_ivf_list,
+            "global_offsets": global_offsets,
+            "tokenizer_name": args.tokenizer,
+            "pad_token_id": pad_id,
+            "unk_token_id": None,
+            "vocab_type": "byte_bpe",
+            "partitioned": False,
+            "partition_type": "global_ivf_then_kmeans",
+            "vq_vocab_size": global_vq_vocab_size,
+            "id_scheme": "global_ivf_then_local_kmeans",
+            "global_id_min": 0,
+            "global_id_max": global_vq_vocab_size - 1,
+            "decoder_type": "linear_center_to_bpe",
+            "decoder_metrics": final_decoder_metrics,
+        },
+        ids_out,
+    )
+
+    print(f"[save model] {args.out}")
+    print(f"[save ids] {ids_out}")
+
+
+if __name__ == "__main__":
+    main()
