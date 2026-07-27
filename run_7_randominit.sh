@@ -2,34 +2,24 @@
 set -euo pipefail
 
 # ============================================================
-# Step 7
+# Step 7: VQW[t] -> VQW[t+1] -> fixed decoder -> BPE[t+1]
 #
-# TinyStories:
-#   BPE[t] + VQW[t] → BPE[t+1]
+# The AR Transformer sees only VQW IDs.
+# The learned VQ-center-to-BPE decoder is loaded from the
+# VQWord dictionary and remains frozen during AR training.
 #
-# BPE-only AR checkpointは使用しない。
+# Usage:
+#   export FTP_PASS='...'
+#   bash run_7_vqw_ar.sh 200k 1.0 0
 #
-# 以下をすべてランダム初期化して、ゼロから同時学習する:
-#   tok_emb
-#   vq_emb
-#   pos_emb
-#   Transformer
-#   norm
-#   tok_head
-#   vq_head
-#   input_fusion
+# Optional artifact filename suffix:
+#   export ARTIFACT_SUFFIX='_deconly_dec3'
+#   bash run_7_vqw_ar.sh 200k 1.0 0
 #
-# 目的:
-#   BPE最適化済みcheckpointの恩恵を除き、
-#   ランダム初期値からVQW付与が学習速度・最終精度へ
-#   与える影響を評価する。
-# ============================================================
-
-
-
-
-# ============================================================
-# 環境準備
+# With ARTIFACT_SUFFIX='_deconly_dec3', expected input names are:
+#   wikitext103_vqword_<TAG>_deconly_dec3.pt
+#   wikitext103_vqword_<TAG>_deconly_dec3_dictionary.pt
+#   tinystories_vqword_<TAG>_deconly_dec3_ids.pt
 # ============================================================
 
 apt update
@@ -37,12 +27,8 @@ apt install -y lftp
 
 pip install \
   torch \
-  datasets \
-  transformers \
-  scikit-learn \
   tqdm \
-  numpy \
-  pandas
+  numpy
 
 cd /
 
@@ -53,69 +39,82 @@ fi
 cd /vqword
 git pull
 
-
 # ============================================================
-# FTP設定
-#
-# 実行前:
-#
-#   export FTP_PASS='FTPパスワード'
-#   bash run_7.sh
+# FTP
 # ============================================================
 
 FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
 FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
+# ============================================================
+# Arguments
+# ============================================================
+
+if [ "$#" -ne 3 ]; then
+  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale} {ar_seed}"
+  echo
+  echo "Example:"
+  echo "  $0 200k 1.0 0"
+  echo
+  echo "Optional:"
+  echo "  ARTIFACT_SUFFIX='_deconly_dec3' $0 200k 1.0 0"
+  exit 1
+fi
+
+VQ_CODEBOOK_LABEL="$1"
+CENTER_SCALE_RAW="$2"
+AR_SEED="$3"
+
+CENTER_SCALE="$(
+  python -c '
+import math
+import sys
+
+value = float(sys.argv[1])
+if not math.isfinite(value) or value < 0:
+    raise SystemExit(f"[error] invalid center_scale: {value}")
+print(f"{value:g}")
+' "${CENTER_SCALE_RAW}"
+)"
+
+case "${VQ_CODEBOOK_LABEL}" in
+  25k)  VQ_CODEBOOK_SIZE=25000 ;;
+  50k)  VQ_CODEBOOK_SIZE=50000 ;;
+  100k) VQ_CODEBOOK_SIZE=100000 ;;
+  200k) VQ_CODEBOOK_SIZE=200000 ;;
+  300k) VQ_CODEBOOK_SIZE=300000 ;;
+  *)
+    echo "[error] Unsupported VQ codebook: ${VQ_CODEBOOK_LABEL}"
+    exit 1
+    ;;
+esac
+
+if ! [[ "${AR_SEED}" =~ ^[0-9]+$ ]]; then
+  echo "[error] ar_seed must be a non-negative integer: ${AR_SEED}"
+  exit 1
+fi
 
 # ============================================================
-# VQWord・BPE設定
+# Tokenizer / VQ settings
 # ============================================================
 
 BPE_VOCAB_LABEL=50257
 BPE_VOCAB_SIZE=50257
 
-if [ "$#" -ne 5 ]; then
-    echo "Usage: $0 {25k|50k|100k|200k} {center_scale} {input_vq_weight} {ar_seed} {vqw_loss_weight}"
-    echo "Example: $0 100k 0.3 1.0 0 0.0"
-    exit 1
-fi
-
-VQ_CODEBOOK_LABEL="$1"
-CENTER_SCALE="$2"
-INPUT_VQ_WEIGHT="$3"
-AR_SEED="$4"
-AUX_LAMBDA="$5"
-
-case "${VQ_CODEBOOK_LABEL}" in
-    25k)
-        VQ_CODEBOOK_SIZE=25000
-        ;;
-    50k)
-        VQ_CODEBOOK_SIZE=50000
-        ;;
-    100k)
-        VQ_CODEBOOK_SIZE=100000
-        ;;
-    200k)
-        VQ_CODEBOOK_SIZE=200000
-        ;;
-    *)
-        echo "Unsupported VQ vocabulary: ${VQ_CODEBOOK_LABEL}"
-        exit 1
-        ;;
-esac
-
 HOP=20
 IVF_NLIST=256
-
 DISCRETIZATION_SEED=0
 
+# This suffix must exactly match the filenames produced by:
+#   1. train_vqword_decoder_only.py
+#   2. TinyStories VQ-ID assignment
+#
+# Keep empty only when those artifacts use the legacy base TAG.
+ARTIFACT_SUFFIX="${ARTIFACT_SUFFIX:-}"
 
 # ============================================================
-# ARモデル設定
-#
-# Step 6とモデル構造を一致させる。
+# AR settings
 # ============================================================
 
 D_MODEL=256
@@ -126,79 +125,95 @@ DROPOUT=0.1
 EPOCHS=30
 BATCH_SIZE=16
 LR=3e-4
+WEIGHT_DECAY=1e-4
+MAX_LEN=512
+
+# Start with pure VQW->VQW training.
+PIPELINE_BPE_LOSS_WEIGHT="${PIPELINE_BPE_LOSS_WEIGHT:-0}"
+PIPELINE_TOPK="${PIPELINE_TOPK:-8}"
+PIPELINE_BPE_MAX_TOKENS="${PIPELINE_BPE_MAX_TOKENS:-512}"
 
 # ============================================================
-# ファイル名
+# Filenames
 # ============================================================
-TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
-DATA="tinystories_vqword_${TAG}_ids.pt"
+
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+ARTIFACT_TAG="${BASE_TAG}${ARTIFACT_SUFFIX}"
+
+DATA="${DATA_FILE:-tinystories_vqword_${ARTIFACT_TAG}_ids.pt}"
+CODEBOOK="${CODEBOOK_FILE:-wikitext103_vqword_${ARTIFACT_TAG}.pt}"
+DICTIONARY="${DICTIONARY_FILE:-wikitext103_vqword_${ARTIFACT_TAG}_dictionary.pt}"
+
 DATA_PATH="/vqword/${DATA}"
+CODEBOOK_PATH="/vqword/${CODEBOOK}"
+DICTIONARY_PATH="/vqword/${DICTIONARY}"
 
+AR_SCRIPT="/vqword/ar_vqw_to_vqw_to_bpe.py"
 
-# Step 7の実行名
-RUN="ar_bpeplusvqw2bpe_concatresidual_${TAG}_arseed${AR_SEED}_vqin${INPUT_VQ_WEIGHT}_aux${AUX_LAMBDA}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_vqw2vqw2bpe_${ARTIFACT_TAG}_arseed${AR_SEED}_pipebpe${PIPELINE_BPE_LOSS_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
 
-BEST_PATH="/vqword/${RUN}.pt"
-LAST_PATH="/vqword/${RUN}_last.pt"
+FINAL_PATH="/vqword/${RUN}.pt"
+BEST_PATH="/vqword/${RUN}_best.pt"
 LOG_PATH="/vqword/${RUN}.log"
 
-
 # ============================================================
-# 設定表示
+# Configuration
 # ============================================================
 
 echo "============================================================"
 echo "[configuration]"
-echo "task                  = TinyStories BPE + VQW to BPE"
-echo "initialization        = random (all parameters)"
-echo "init source           = none"
-echo "BPE vocabulary label  = ${BPE_VOCAB_LABEL}"
-echo "BPE vocabulary size   = ${BPE_VOCAB_SIZE}"
-echo "VQW codebook label    = ${VQ_CODEBOOK_LABEL}"
-echo "VQW codebook size     = ${VQ_CODEBOOK_SIZE}"
-echo "VQW context           = left-only"
-echo "VQW hop               = ${HOP}"
-echo "center scale          = ${CENTER_SCALE}"
-echo "IVF nlist             = ${IVF_NLIST}"
-echo "discretization seed   = ${DISCRETIZATION_SEED}"
-echo "AR seed               = ${AR_SEED}"
-echo "d_model               = ${D_MODEL}"
-echo "n_layers              = ${N_LAYERS}"
-echo "n_heads               = ${N_HEADS}"
-echo "dropout               = ${DROPOUT}"
-echo "epochs                = ${EPOCHS}"
-echo "batch size            = ${BATCH_SIZE}"
-echo "learning rate         = ${LR}"
-echo "input VQ weight      = ${INPUT_VQ_WEIGHT}"
-echo "aux lambda            = ${AUX_LAMBDA}"
-echo "tag                   = ${TAG}"
-echo "data                  = ${DATA}"
-echo "run                   = ${RUN}"
+echo "task                    = VQW[t] -> VQW[t+1] -> fixed decoder -> BPE[t+1]"
+echo "AR input                = VQW only"
+echo "AR target               = next VQW"
+echo "decoder                 = pretrained and frozen"
+echo "BPE vocabulary          = ${BPE_VOCAB_SIZE}"
+echo "VQW codebook            = ${VQ_CODEBOOK_SIZE}"
+echo "center scale            = ${CENTER_SCALE}"
+echo "hop                     = ${HOP}"
+echo "IVF nlist               = ${IVF_NLIST}"
+echo "discretization seed     = ${DISCRETIZATION_SEED}"
+echo "AR seed                 = ${AR_SEED}"
+echo "artifact suffix         = '${ARTIFACT_SUFFIX}'"
+echo "data                    = ${DATA}"
+echo "codebook                = ${CODEBOOK}"
+echo "dictionary/decoder      = ${DICTIONARY}"
+echo "d_model                 = ${D_MODEL}"
+echo "layers / heads          = ${N_LAYERS} / ${N_HEADS}"
+echo "epochs                  = ${EPOCHS}"
+echo "batch size              = ${BATCH_SIZE}"
+echo "learning rate           = ${LR}"
+echo "pipeline BPE loss weight= ${PIPELINE_BPE_LOSS_WEIGHT}"
+echo "run                     = ${RUN}"
 echo "============================================================"
 
-
-
-
 # ============================================================
-# 既存ファイルを削除
+# Required script
 # ============================================================
 
-rm -f "${DATA_PATH}"
-rm -f "${BEST_PATH}"
-rm -f "${LAST_PATH}"
-rm -f "${LOG_PATH}"
-
+if [ ! -f "${AR_SCRIPT}" ]; then
+  echo "[error] Missing AR script:"
+  echo "        ${AR_SCRIPT}"
+  exit 1
+fi
 
 # ============================================================
-# FTPから入力データを取得
-#
-# DATA:
-#   FTPルート
-#
+# Clean local inputs/outputs
+# ============================================================
+
+rm -f \
+  "${DATA_PATH}" \
+  "${CODEBOOK_PATH}" \
+  "${DICTIONARY_PATH}" \
+  "${FINAL_PATH}" \
+  "${BEST_PATH}" \
+  "${LOG_PATH}"
+
+# ============================================================
+# Download TinyStories IDs, VQ codebook, learned decoder
+# ============================================================
 
 echo "============================================================"
 echo "[download input files]"
-echo "DATA         = ${DATA}"
 echo "============================================================"
 
 lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
@@ -207,241 +222,206 @@ set net:max-retries 5
 set net:timeout 30
 set cmd:fail-exit yes
 
-get "${DATA}" \
-  -o "${DATA_PATH}"
-
+get "${DATA}" -o "${DATA_PATH}"
+get "${CODEBOOK}" -o "${CODEBOOK_PATH}"
+get "${DICTIONARY}" -o "${DICTIONARY_PATH}"
 
 bye
 EOF
 
+for path in \
+  "${DATA_PATH}" \
+  "${CODEBOOK_PATH}" \
+  "${DICTIONARY_PATH}"
+do
+  if [ ! -s "${path}" ]; then
+    echo "[error] Missing or empty input file:"
+    echo "        ${path}"
+    exit 1
+  fi
+done
+
+ls -lh \
+  "${DATA_PATH}" \
+  "${CODEBOOK_PATH}" \
+  "${DICTIONARY_PATH}"
 
 # ============================================================
-# ダウンロード確認
-# ============================================================
-
-if [ ! -f "${DATA_PATH}" ]; then
-  echo "[error] Data file was not downloaded:"
-  echo "        ${DATA_PATH}"
-  exit 1
-fi
-
-
-echo "============================================================"
-echo "[downloaded files]"
-echo "============================================================"
-
-ls -lh "${DATA_PATH}"
-
-
-# ============================================================
-# 入力データの整合性確認
+# Cross-file verification
+#
+# Especially important:
+#   dictionary must contain the TRAINED decoder_state_dict.
 # ============================================================
 
 python - <<PY
 import torch
 
 data_path = "${DATA_PATH}"
+codebook_path = "${CODEBOOK_PATH}"
+dictionary_path = "${DICTIONARY_PATH}"
 
-expected_token_vocab_size = ${BPE_VOCAB_SIZE}
-expected_vq_vocab_size = ${VQ_CODEBOOK_SIZE}
+expected_token_vocab = ${BPE_VOCAB_SIZE}
+expected_vq_vocab = ${VQ_CODEBOOK_SIZE}
+expected_center_dim = ${D_MODEL}
 
+data = torch.load(data_path, map_location="cpu", weights_only=False)
+codebook = torch.load(codebook_path, map_location="cpu", weights_only=False)
+dictionary = torch.load(dictionary_path, map_location="cpu", weights_only=False)
 
-
-# ============================================================
-# データ確認
-# ============================================================
-
-data = torch.load(
-    data_path,
-    map_location="cpu",
-    weights_only=False,
-)
-
-print("============================================================")
-print("[data verification]")
-print("path:", data_path)
-print("keys:", list(data.keys()))
-
-required_data_keys = {
+required_data = {
     "samples",
     "token_ids_flat",
     "vq_ids_flat",
     "vq_vocab_size",
 }
-
-missing = sorted(required_data_keys - set(data.keys()))
-
+missing = sorted(required_data - set(data))
 if missing:
+    raise KeyError(f"Missing data keys: {missing}")
+
+if "global_centers" not in codebook:
+    raise KeyError("Codebook does not contain global_centers")
+
+if "decoder_state_dict" not in dictionary:
     raise KeyError(
-        f"Required data keys are missing: {missing}. "
-        f"Available keys: {list(data.keys())}"
+        "Dictionary does not contain decoder_state_dict. "
+        "This is probably the old dictionary, not the decoder-trained file."
     )
 
-samples = data["samples"]
+if dictionary.get("decoder_type") != "linear_center_to_bpe":
+    raise ValueError(
+        "Unexpected decoder_type: "
+        f"{dictionary.get('decoder_type')!r}"
+    )
+
 token_ids = data["token_ids_flat"].long().reshape(-1)
 vq_ids = data["vq_ids_flat"].long().reshape(-1)
+centers = codebook["global_centers"].float()
+decoder = dictionary["decoder_state_dict"]
 
-data_vq_vocab_size = int(data["vq_vocab_size"])
-
-if len(samples) == 0:
-    raise ValueError("samples is empty")
-
-if token_ids.numel() == 0:
-    raise ValueError("token_ids_flat is empty")
-
-if vq_ids.numel() == 0:
-    raise ValueError("vq_ids_flat is empty")
+data_vq_vocab = int(data["vq_vocab_size"])
+dict_vq_vocab = int(dictionary["vq_vocab_size"])
+center_vq_vocab, center_dim = map(int, centers.shape)
 
 if token_ids.numel() != vq_ids.numel():
     raise ValueError(
-        "Token/VQ length mismatch: "
-        f"token={token_ids.numel():,}, "
-        f"vq={vq_ids.numel():,}"
+        f"Token/VQ length mismatch: "
+        f"{token_ids.numel():,} vs {vq_ids.numel():,}"
     )
 
-token_min = int(token_ids.min())
-token_max = int(token_ids.max())
-
-vq_min = int(vq_ids.min())
-vq_max = int(vq_ids.max())
-
-print("samples:", f"{len(samples):,}")
-print("token count:", f"{token_ids.numel():,}")
-print("VQ count:", f"{vq_ids.numel():,}")
-
-print("token min/max:", token_min, token_max)
-print("VQ min/max:", vq_min, vq_max)
-
-print(
-    "used BPE IDs:",
-    f"{torch.unique(token_ids).numel():,}",
-)
-
-print(
-    "used VQ IDs:",
-    f"{torch.unique(vq_ids).numel():,}",
-)
-
-print(
-    "data vq_vocab_size:",
-    f"{data_vq_vocab_size:,}",
-)
-
-if token_min < 0:
+if data_vq_vocab != expected_vq_vocab:
     raise ValueError(
-        f"Negative BPE ID found: {token_min}"
+        f"Data VQ vocab mismatch: "
+        f"expected={expected_vq_vocab:,}, actual={data_vq_vocab:,}"
     )
 
-if token_max >= expected_token_vocab_size:
+if dict_vq_vocab != expected_vq_vocab:
     raise ValueError(
-        "BPE ID out of range: "
-        f"max={token_max:,}, "
-        f"vocab_size={expected_token_vocab_size:,}"
+        f"Dictionary VQ vocab mismatch: "
+        f"expected={expected_vq_vocab:,}, actual={dict_vq_vocab:,}"
     )
 
-if vq_min < 0:
+if center_vq_vocab != expected_vq_vocab:
     raise ValueError(
-        f"Negative VQ ID found: {vq_min}"
+        f"Codebook VQ vocab mismatch: "
+        f"expected={expected_vq_vocab:,}, actual={center_vq_vocab:,}"
     )
 
-if data_vq_vocab_size != expected_vq_vocab_size:
+if center_dim != expected_center_dim:
     raise ValueError(
-        "Data VQ vocabulary mismatch: "
-        f"expected={expected_vq_vocab_size:,}, "
-        f"actual={data_vq_vocab_size:,}"
+        f"Center dimension mismatch: "
+        f"expected={expected_center_dim}, actual={center_dim}"
     )
 
-if vq_max >= data_vq_vocab_size:
-    raise ValueError(
-        "VQ ID out of range: "
-        f"max={vq_max:,}, "
-        f"vq_vocab_size={data_vq_vocab_size:,}"
-    )
+weight = decoder.get("weight")
+bias = decoder.get("bias")
 
-first_sample = samples[0]
-
-if "start" not in first_sample or "end" not in first_sample:
+if weight is None or bias is None:
     raise KeyError(
-        "Current ar.py requires samples containing "
-        "'start' and 'end'. "
-        f"First sample keys: {list(first_sample.keys())}"
+        f"Decoder state must contain weight and bias; "
+        f"keys={list(decoder)}"
     )
 
-print("first sample keys:", list(first_sample.keys()))
-print("tokenizer:", data.get("tokenizer"))
-print("source VQ checkpoint:", data.get("ckpt"))
+if tuple(weight.shape) != (expected_token_vocab, center_dim):
+    raise ValueError(
+        f"Decoder weight shape mismatch: "
+        f"expected={(expected_token_vocab, center_dim)}, "
+        f"actual={tuple(weight.shape)}"
+    )
 
+if tuple(bias.shape) != (expected_token_vocab,):
+    raise ValueError(
+        f"Decoder bias shape mismatch: "
+        f"expected={(expected_token_vocab,)}, "
+        f"actual={tuple(bias.shape)}"
+    )
 
+if int(token_ids.min()) < 0 or int(token_ids.max()) >= expected_token_vocab:
+    raise ValueError(
+        f"BPE IDs out of range: "
+        f"min={int(token_ids.min())}, max={int(token_ids.max())}"
+    )
+
+if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= expected_vq_vocab:
+    raise ValueError(
+        f"VQ IDs out of range: "
+        f"min={int(vq_ids.min())}, max={int(vq_ids.max())}"
+    )
+
+print("============================================================")
+print("[input verification OK]")
+print("samples:", f"{len(data['samples']):,}")
+print("tokens:", f"{token_ids.numel():,}")
+print("used BPE IDs:", f"{torch.unique(token_ids).numel():,}")
+print("used VQ IDs:", f"{torch.unique(vq_ids).numel():,}")
+print("centers:", tuple(centers.shape))
+print("decoder weight:", tuple(weight.shape))
+print("decoder metrics:", dictionary.get("decoder_metrics"))
 print("============================================================")
 PY
 
-
 # ============================================================
-# BPE + VQW → BPE training from random initialization
-#
-# 入力:
-#   BPE[t] + VQW[t]
-#
-# 主正解:
-#   BPE[t+1]
-#
-# 補助正解:
-#   VQW[t+1]
-#
-#
-# --mode finetune:
-#   transformed VQWとBPEをconcatし、
-#   input_fusionでd_modelへ戻した残差をBPEへ加える
-#
-# freezeは行わず、モデル全体をゼロから学習する。
+# Train VQW -> VQW; decode predicted VQW with frozen decoder
 # ============================================================
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "============================================================"
-echo "[start BPE + VQW to BPE training from random initialization]"
-echo "input        = BPE[t] + VQW[t]"
-echo "main target  = BPE[t+1]"
-echo "aux target   = VQW[t+1]"
-echo "init source  = none (random initialization)"
-echo "data         = ${DATA_PATH}"
-echo "run          = ${RUN}"
+echo "[start VQW autoregressive training]"
+echo "input       = VQW[t]"
+echo "target      = VQW[t+1]"
+echo "evaluation  = predicted VQW -> frozen decoder -> BPE[t+1]"
 echo "============================================================"
 
-python ar.py \
-  --mode finetune \
+python "${AR_SCRIPT}" \
   --data "${DATA_PATH}" \
-  --token_vocab_size "${BPE_VOCAB_SIZE}" \
-  --vq_vocab_size "${VQ_CODEBOOK_SIZE}" \
-  --main_target tok \
-  --input_vq_weight "${INPUT_VQ_WEIGHT}" \
-  --aux_lambda "${AUX_LAMBDA}" \
-  --epochs "${EPOCHS}" \
+  --dictionary "${DICTIONARY_PATH}" \
+  --codebook "${CODEBOOK_PATH}" \
   --batch_size "${BATCH_SIZE}" \
+  --epochs "${EPOCHS}" \
+  --lr "${LR}" \
+  --weight_decay "${WEIGHT_DECAY}" \
   --d_model "${D_MODEL}" \
   --n_layers "${N_LAYERS}" \
   --n_heads "${N_HEADS}" \
   --dropout "${DROPOUT}" \
-  --lr "${LR}" \
+  --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
-  --out "${BEST_PATH}" \
+  --pipeline_bpe_loss_weight "${PIPELINE_BPE_LOSS_WEIGHT}" \
+  --pipeline_topk "${PIPELINE_TOPK}" \
+  --pipeline_bpe_max_tokens "${PIPELINE_BPE_MAX_TOKENS}" \
+  --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 
-
 # ============================================================
-# 生成物確認
+# Generated outputs
 # ============================================================
-
-echo "============================================================"
-echo "[generated files]"
-echo "============================================================"
 
 for path in \
+  "${FINAL_PATH}" \
   "${BEST_PATH}" \
-  "${LAST_PATH}" \
   "${LOG_PATH}"
 do
-  if [ ! -f "${path}" ]; then
+  if [ ! -s "${path}" ]; then
     echo "[error] Expected output was not generated:"
     echo "        ${path}"
     exit 1
@@ -449,28 +429,22 @@ do
 done
 
 ls -lh \
+  "${FINAL_PATH}" \
   "${BEST_PATH}" \
-  "${LAST_PATH}" \
   "${LOG_PATH}"
 
-
 # ============================================================
-# 評価ログ表示
+# Summary
 # ============================================================
 
 echo "============================================================"
-echo "[evaluation summary]"
+echo "[evaluation lines]"
 echo "============================================================"
 
 grep -E \
-  "\[eval\]|\[save\]|\[loss-weight\]" \
+  "\[epoch [0-9]+\]|\[save best\]|\[save final\]" \
   "${LOG_PATH}" \
   || true
-
-
-# ============================================================
-# 最良 test_tok_ppl を抽出
-# ============================================================
 
 python - <<PY
 import re
@@ -478,258 +452,117 @@ import re
 log_path = "${LOG_PATH}"
 
 pattern = re.compile(
-    r"\[eval\]\s+"
-    r"ep=(\d+).*?"
-    r"test_tok_ppl=([0-9.]+)"
+    r"\[epoch\s+(\d+)\]\s+"
+    r"valid_vq_ppl=([0-9.]+)\s+"
+    r"valid_vq_acc=([0-9.]+)\s+"
+    r"valid_bpe_top1=([0-9.]+)\s+"
+    r"test_vq_ppl=([0-9.]+)\s+"
+    r"test_bpe_top1=([0-9.]+)\s+"
+    r"oracle_bpe_top1=([0-9.]+)"
 )
 
-results = []
-
-with open(
-    log_path,
-    "r",
-    encoding="utf-8",
-    errors="replace",
-) as f:
+rows = []
+with open(log_path, "r", encoding="utf-8", errors="replace") as f:
     for line in f:
-        match = pattern.search(line)
-
-        if match:
-            epoch = int(match.group(1))
-            test_tok_ppl = float(match.group(2))
-            results.append(
-                (epoch, test_tok_ppl)
-            )
+        m = pattern.search(line)
+        if m:
+            rows.append({
+                "epoch": int(m.group(1)),
+                "valid_vq_ppl": float(m.group(2)),
+                "valid_vq_acc": float(m.group(3)),
+                "valid_bpe_top1": float(m.group(4)),
+                "test_vq_ppl": float(m.group(5)),
+                "test_bpe_top1": float(m.group(6)),
+                "oracle_bpe_top1": float(m.group(7)),
+            })
 
 print("============================================================")
-print("[test token perplexity]")
+print("[AR summary]")
 
-if not results:
-    print("No test_tok_ppl entries found")
+if not rows:
+    print("No epoch result lines found")
 else:
-    best_epoch, best_ppl = min(
-        results,
-        key=lambda item: item[1],
-    )
-
-    print("lowest test_tok_ppl epoch:", best_epoch)
-    print("lowest test_tok_ppl:", best_ppl)
-    print("------------------------------------------------------------")
-
-    for epoch, ppl in results:
-        marker = (
-            " <-- lowest test PPL"
-            if epoch == best_epoch
-            else ""
-        )
-
-        print(
-            f"ep={epoch:02d} "
-            f"test_tok_ppl={ppl:.4f}"
-            f"{marker}"
-        )
+    best = min(rows, key=lambda x: x["valid_vq_ppl"])
+    print("best epoch by valid VQ PPL:", best["epoch"])
+    print("valid VQ PPL:", best["valid_vq_ppl"])
+    print("valid VQ accuracy:", best["valid_vq_acc"])
+    print("test VQ PPL:", best["test_vq_ppl"])
+    print("test pipeline BPE top1:", best["test_bpe_top1"])
+    print("oracle decoder BPE top1:", best["oracle_bpe_top1"])
 
 print("============================================================")
 PY
 
-
 # ============================================================
-# 出力checkpoint確認
+# Checkpoints
 # ============================================================
 
 python - <<PY
 import torch
 
-paths = [
-    "${BEST_PATH}",
-    "${LAST_PATH}",
-]
+for path in ["${BEST_PATH}", "${FINAL_PATH}"]:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
-expected_token_vocab_size = ${BPE_VOCAB_SIZE}
-expected_vq_vocab_size = ${VQ_CODEBOOK_SIZE}
-expected_d_model = ${D_MODEL}
+    required = {
+        "model",
+        "args",
+        "history",
+        "vq_vocab_size",
+        "vq_pad_id",
+        "token_vocab_size",
+        "decoder_frozen",
+        "decoder_source",
+        "codebook_source",
+    }
+    missing = sorted(required - set(ckpt))
+    if missing:
+        raise KeyError(f"{path}: missing checkpoint keys: {missing}")
 
-for path in paths:
-    checkpoint = torch.load(
-        path,
-        map_location="cpu",
-        weights_only=False,
-    )
+    model = ckpt["model"]
+    required_model = {
+        "vq_emb.weight",
+        "pos_emb.weight",
+        "vq_head.weight",
+        "vq_head.bias",
+    }
+    missing_model = sorted(required_model - set(model))
+    if missing_model:
+        raise KeyError(f"{path}: missing model keys: {missing_model}")
+
+    forbidden_model = {
+        "tok_emb.weight",
+        "tok_head.weight",
+        "input_fusion.weight",
+    }
+    present_forbidden = sorted(forbidden_model & set(model))
+    if present_forbidden:
+        raise ValueError(
+            f"{path}: old BPE/fusion parameters remain: "
+            f"{present_forbidden}"
+        )
+
+    if ckpt["decoder_frozen"] is not True:
+        raise ValueError(f"{path}: decoder_frozen is not True")
 
     print("============================================================")
-    print("[output checkpoint verification]")
+    print("[checkpoint OK]")
     print("path:", path)
-    print("keys:", list(checkpoint.keys()))
+    print("vq_vocab_size:", ckpt["vq_vocab_size"])
+    print("token_vocab_size:", ckpt["token_vocab_size"])
+    print("decoder source:", ckpt["decoder_source"])
+    print("codebook source:", ckpt["codebook_source"])
+    print("last valid:", ckpt.get("last_valid"))
+    print("last test:", ckpt.get("last_test"))
 
-    if "model" not in checkpoint:
-        raise KeyError(
-            f"Checkpoint does not contain model: {path}"
-        )
-
-    model = checkpoint["model"]
-
-    required_keys = [
-        "tok_emb.weight",
-        "vq_emb.weight",
-        "tok_fusion_norm.weight",
-        "tok_fusion_norm.bias",
-        "vq_fusion_norm.weight",
-        "vq_fusion_norm.bias",
-        "vq_projection.0.weight",
-        "vq_projection.0.bias",
-        "vq_projection.2.weight",
-        "vq_projection.2.bias",
-        "input_fusion.weight",
-        "input_fusion.bias",
-        "tok_head.weight",
-        "vq_head.weight",
-    ]
-
-    for key in required_keys:
-        if key not in model:
-            raise KeyError(
-                f"Output checkpoint does not contain: {key}"
-            )
-
-    tok_emb_shape = tuple(
-        model["tok_emb.weight"].shape
-    )
-
-    vq_emb_shape = tuple(
-        model["vq_emb.weight"].shape
-    )
-
-    projection0_shape = tuple(
-        model["vq_projection.0.weight"].shape
-    )
-
-    projection2_shape = tuple(
-        model["vq_projection.2.weight"].shape
-    )
-
-    fusion_shape = tuple(
-        model["input_fusion.weight"].shape
-    )
-
-    print("vq_projection.0 shape:", projection0_shape)
-    print("vq_projection.2 shape:", projection2_shape)
-    print("input_fusion shape:", fusion_shape)
-
-    tok_head_shape = tuple(
-        model["tok_head.weight"].shape
-    )
-
-    vq_head_shape = tuple(
-        model["vq_head.weight"].shape
-    )
-
-    print("tok_emb shape:", tok_emb_shape)
-    print("vq_emb shape:", vq_emb_shape)
-    print("vq_projection.0 shape:", projection0_shape)
-    print("vq_projection.2 shape:", projection2_shape)
-    print("input_fusion shape:", fusion_shape)
-    print("tok_head shape:", tok_head_shape)
-    print("vq_head shape:", vq_head_shape)
-
-    actual_token_vocab_size = int(
-        model["tok_emb.weight"].shape[0]
-    )
-
-    actual_vq_vocab_size = int(
-        model["vq_emb.weight"].shape[0]
-    )
-
-    if actual_token_vocab_size != expected_token_vocab_size:
-        raise ValueError(
-            "Output BPE vocabulary mismatch: "
-            f"expected={expected_token_vocab_size:,}, "
-            f"actual={actual_token_vocab_size:,}"
-        )
-
-    # ar.pyはpadding IDを追加する可能性があるため、
-    # VQ embeddingはcodebook size以上であることを確認する。
-    if actual_vq_vocab_size < expected_vq_vocab_size:
-        raise ValueError(
-            "Output VQ vocabulary is too small: "
-            f"expected at least={expected_vq_vocab_size:,}, "
-            f"actual={actual_vq_vocab_size:,}"
-        )
-
-    if int(model["tok_emb.weight"].shape[1]) != expected_d_model:
-        raise ValueError(
-            "Output tok_emb d_model mismatch"
-        )
-
-    if projection0_shape != (
-        expected_d_model,
-        expected_d_model,
-    ):
-        raise ValueError(
-            f"Unexpected vq_projection.0 shape: {projection0_shape}"
-        )
-
-    if projection2_shape != (
-        expected_d_model,
-        expected_d_model,
-    ):
-        raise ValueError(
-            f"Unexpected vq_projection.2 shape: {projection2_shape}"
-        )
-
-    if fusion_shape != (
-        expected_d_model,
-        2 * expected_d_model,
-    ):
-        raise ValueError(
-            f"Unexpected input_fusion shape: {fusion_shape}"
-        )
-
-    args = checkpoint.get("args", {})
-
-    print("epoch:", checkpoint.get("epoch"))
-    print("valid_loss:", checkpoint.get("valid_loss"))
-    print("test_loss:", checkpoint.get("test_loss"))
-    print("token_vocab_size:", checkpoint.get("token_vocab_size"))
-    print("vq_vocab_size:", checkpoint.get("vq_vocab_size"))
-
-    print("mode:", args.get("mode"))
-    print("init_source:", args.get("init_source"))
-    print("init_from:", args.get("init_from"))
-    print("token_only:", args.get("token_only"))
-    print("vq_only:", args.get("vq_only"))
-    print("main_target:", args.get("main_target"))
-    print("aux_lambda:", args.get("aux_lambda"))
-
-    if args:
-        if args.get("mode") != "finetune":
-            raise ValueError(
-                f"Unexpected output mode: {args.get('mode')}"
-            )
-
-
-        if args.get("token_only", False):
-            raise ValueError(
-                "Output is unexpectedly token_only"
-            )
-
-        if args.get("vq_only", False):
-            raise ValueError(
-                "Output is unexpectedly vq_only"
-            )
-
-print("============================================================")
-print("[check] output checkpoints OK")
 print("============================================================")
 PY
 
-
 # ============================================================
-# FTPへアップロード
+# Upload outputs
 # ============================================================
 
 echo "============================================================"
-echo "[upload files]"
-echo "run = ${RUN}"
+echo "[upload outputs]"
 echo "============================================================"
 
 lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
@@ -740,34 +573,20 @@ set cmd:fail-exit yes
 
 cd vqword_logs
 
-put "${BEST_PATH}" \
-  -o "${RUN}.pt"
-
-put "${LAST_PATH}" \
-  -o "${RUN}_last.pt"
-
-put "${LOG_PATH}" \
-  -o "${RUN}.log"
+put "${BEST_PATH}" -o "${RUN}_best.pt"
+put "${FINAL_PATH}" -o "${RUN}.pt"
+put "${LOG_PATH}" -o "${RUN}.log"
 
 bye
 EOF
 
-
-# ============================================================
-# 完了表示
-# ============================================================
-
 echo "============================================================"
 echo "[completed]"
-echo "TASK           = TinyStories BPE + VQW to BPE"
-echo "INIT SOURCE    = none (random initialization)"
-echo "BPE vocabulary = ${BPE_VOCAB_SIZE}"
-echo "VQW codebook   = ${VQ_CODEBOOK_LABEL}"
-echo "VQ context     = left ${HOP}"
-echo "AR seed        = ${AR_SEED}"
-echo "AUX lambda     = ${AUX_LAMBDA}"
-echo "DATA           = ${DATA}"
-echo "BEST           = vqword_logs/${RUN}.pt"
-echo "LAST           = vqword_logs/${RUN}_last.pt"
-echo "LOG            = vqword_logs/${RUN}.log"
+echo "TASK       = VQW -> VQW -> frozen decoder -> BPE"
+echo "DATA       = ${DATA}"
+echo "CODEBOOK   = ${CODEBOOK}"
+echo "DICTIONARY = ${DICTIONARY}"
+echo "BEST       = vqword_logs/${RUN}_best.pt"
+echo "FINAL      = vqword_logs/${RUN}.pt"
+echo "LOG        = vqword_logs/${RUN}.log"
 echo "============================================================"
