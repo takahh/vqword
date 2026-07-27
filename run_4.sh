@@ -33,6 +33,7 @@ git pull
 # ============================================================
 
 BPE_VOCAB_LABEL=50257
+DISCRETIZATION_SEED=0
 
 # ============================================================
 # 使用方法
@@ -96,7 +97,7 @@ K_BLOCK=4096
 
 DECODER_EPOCHS=3
 
-BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed0"
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 VQ_TAG="${BASE_TAG}_deconly_dec${DECODER_EPOCHS}"
 
 BPE_ARCHIVE="bpe_wikitext103_50257.tar.gz"
@@ -126,7 +127,7 @@ echo "BPE tokenizer        = ${BPE_ARCHIVE}"
 echo "VQ checkpoint        = ${VQ_CKPT}"
 echo "VQ codebook label    = ${VQ_CODEBOOK_LABEL}"
 echo "VQ codebook size     = ${VQ_CODEBOOK_SIZE}"
-echo "VQ seed              = ${VQ_SEED}"
+echo "VQ seed              = ${DISCRETIZATION_SEED}"
 echo "context              = left ${HOP}"
 echo "TinyStories samples  = ${MAX_SAMPLES}"
 echo "sequence length      = ${SEQ_LEN}"
@@ -445,7 +446,7 @@ echo "[completed]"
 echo "VQ checkpoint = ${VQ_CKPT}"
 echo "VQ vocab label = ${VQ_CODEBOOK_LABEL}"
 echo "VQ vocab size  = ${VQ_CODEBOOK_SIZE}"
-echo "VQ seed        = ${VQ_SEED}"
+echo "VQ seed              = ${DISCRETIZATION_SEED}"
 echo "BPE tokenizer = ${BPE_ARCHIVE}"
 echo "TinyStories   = ${MAX_SAMPLES} samples"
 echo "output        = ${OUT}"
