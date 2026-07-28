@@ -440,6 +440,10 @@ def evaluate(model, loader, centers, decoder, device):
         "pipeline_bpe_hard_ppl": math.exp(min(pipe_ce, 20.0)),
         "pipeline_bpe_top1": total_pipe_top1 / max(total_count, 1),
         "pipeline_bpe_top5": total_pipe_top5 / max(total_count, 1),
+        "marginal_bpe_topk": 32,
+        "marginal_bpe_loss": marginal_ce,
+        "marginal_bpe_ppl": math.exp(min(marginal_ce, 20.0)),
+        "marginal_bpe_count": total_marginal_count,
         # Upper bound imposed by tokenizer+decoder reconstruction quality.
         "oracle_bpe_loss": oracle_ce,
         "oracle_bpe_ppl": math.exp(min(oracle_ce, 20.0)),
@@ -685,10 +689,12 @@ def main():
             f"[epoch {epoch}] "
             f"valid_vq_ppl={valid_metrics['vq_ppl']:.4f} "
             f"valid_vq_acc={valid_metrics['vq_acc']:.4f} "
-            f"valid_bpe_ppl={valid_metrics['pipeline_bpe_hard_ppl']:.4f} "
+            f"valid_hard_bpe_ppl={valid_metrics['pipeline_bpe_hard_ppl']:.4f} "
+            f"valid_marginal_bpe_ppl={valid_metrics['marginal_bpe_ppl']:.4f} "  
             f"valid_bpe_top1={valid_metrics['pipeline_bpe_top1']:.4f} "
             f"test_vq_ppl={test_metrics['vq_ppl']:.4f} "
-            f"test_bpe_ppl={test_metrics['pipeline_bpe_hard_ppl']:.4f} "
+            f"test_hard_bpe_ppl={test_metrics['pipeline_bpe_hard_ppl']:.4f} "
+            f"test_marginal_bpe_ppl={test_metrics['marginal_bpe_ppl']:.4f} "
             f"test_bpe_top1={test_metrics['pipeline_bpe_top1']:.4f} "
             f"oracle_bpe_ppl={test_metrics['oracle_bpe_ppl']:.4f} "
             f"oracle_bpe_top1={test_metrics['oracle_bpe_top1']:.4f}"
