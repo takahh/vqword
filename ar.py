@@ -451,7 +451,7 @@ def evaluate(model, loader, centers, decoder, device):
         vq_logits = model(
             vq_in,
             tok_in,
-            key_padding_mask=...
+            key_padding_mask=~attention_mask,
         )
         vq_loss = F.cross_entropy(
             vq_logits.reshape(-1, vq_logits.size(-1)),
