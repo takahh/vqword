@@ -401,12 +401,19 @@ def main():
     data = torch.load(args.data, map_location="cpu", weights_only=False)
     samples, token_ids_flat, vq_ids_flat = normalize_data_format(data)
 
-    token_vocab_size = int(
-        data.get(
-            "token_vocab_size",
-            int(token_ids_flat.max().item()) + 1,
-        )
+    dictionary_preview = torch.load(
+        args.dictionary,
+        map_location="cpu",
+        weights_only=False,
     )
+
+    decoder_state = dictionary_preview.get("decoder_state_dict")
+    if decoder_state is None:
+        raise KeyError("dictionary does not contain decoder_state_dict")
+
+    token_vocab_size = int(decoder_state["weight"].shape[0])
+
+    print(f"[token vocab size] {token_vocab_size}")
 
     codebook_raw = torch.load(
         args.codebook,
