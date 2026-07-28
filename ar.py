@@ -303,6 +303,16 @@ def evaluate(model, loader, centers, decoder, device):
             true_bpe,
             reduction="sum",
         )
+        ce_each = F.cross_entropy(
+            pred_bpe_logits,
+            true_bpe,
+            reduction="none",
+        )
+
+        print("mean =", ce_each.mean().item())
+        print("median =", ce_each.median().item())
+        print("max =", ce_each.max().item())
+        print("top1 =", pred_bpe_logits.argmax(1).eq(true_bpe).float().mean().item())
         pipe_topk = pred_bpe_logits.topk(
             min(5, pred_bpe_logits.size(-1)),
             dim=-1,
