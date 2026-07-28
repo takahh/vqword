@@ -399,8 +399,8 @@ def evaluate(model, loader, centers, decoder, device):
             tok_y=tok_y,
             centers=centers,
             decoder=decoder,
-            topk=32,
-            max_tokens=2048,
+            topk=8,
+            max_tokens=64,
         )
 
         total_marginal_bpe_loss += marginal_loss_sum
