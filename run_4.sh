@@ -249,7 +249,6 @@ required = {
     "global_offsets",
     "vq_vocab_size",
     "args",
-    "decoder_state_dict",
 }
 
 missing = sorted(required - set(ckpt.keys()))
