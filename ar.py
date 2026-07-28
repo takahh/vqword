@@ -591,9 +591,12 @@ def main():
             f"[epoch {epoch}] "
             f"valid_vq_ppl={valid_metrics['vq_ppl']:.4f} "
             f"valid_vq_acc={valid_metrics['vq_acc']:.4f} "
+            f"valid_bpe_ppl={valid_metrics['pipeline_bpe_hard_ppl']:.4f} "
             f"valid_bpe_top1={valid_metrics['pipeline_bpe_top1']:.4f} "
             f"test_vq_ppl={test_metrics['vq_ppl']:.4f} "
+            f"test_bpe_ppl={test_metrics['pipeline_bpe_hard_ppl']:.4f} "
             f"test_bpe_top1={test_metrics['pipeline_bpe_top1']:.4f} "
+            f"oracle_bpe_ppl={test_metrics['oracle_bpe_ppl']:.4f} "
             f"oracle_bpe_top1={test_metrics['oracle_bpe_top1']:.4f}"
         )
 
