@@ -147,7 +147,7 @@ DATA_PATH="/vqword/${DATA}"
 CODEBOOK_PATH="/vqword/${CODEBOOK}"
 DICTIONARY_PATH="/vqword/${DICTIONARY}"
 
-AR_SCRIPT="/vqword/ar_vqw_to_vqw_to_bpe.py"
+AR_SCRIPT="/vqword/ar.py"
 
 RUN="ar_vqw2vqw2bpe_${ARTIFACT_TAG}_arseed${AR_SEED}_pipebpe${PIPELINE_BPE_LOSS_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
 
