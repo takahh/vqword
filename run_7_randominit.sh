@@ -42,7 +42,7 @@ git pull
 # ============================================================
 # FTP
 # ============================================================
-
+export FTP_PASS="Squat201k"
 FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
 FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
