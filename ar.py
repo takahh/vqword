@@ -209,6 +209,75 @@ def decode_vq_ids(vq_ids, centers, decoder):
     unique_logits = decoder(centers[unique_ids])
     return unique_logits[inverse].reshape(*vq_ids.shape, -1)
 
+@torch.no_grad()
+def topk_marginal_bpe_nll(
+    vq_logits,
+    tok_y,
+    centers,
+    decoder,
+    topk=32,
+    max_tokens=2048,
+):
+    """
+    Approximate:
+        P(BPE=y | context)
+        = sum_v P(v | context) P(y | v)
+
+    using only the top-k VQ candidates.
+
+    Returns:
+        summed NLL
+        token count
+    """
+    flat_vq_logits = vq_logits.reshape(-1, vq_logits.size(-1))
+    flat_tok_y = tok_y.reshape(-1)
+
+    valid = flat_tok_y.ne(-100)
+    flat_vq_logits = flat_vq_logits[valid]
+    flat_tok_y = flat_tok_y[valid]
+
+    if flat_tok_y.numel() == 0:
+        return 0.0, 0
+
+    if max_tokens > 0 and flat_tok_y.numel() > max_tokens:
+        chosen = torch.randperm(
+            flat_tok_y.numel(),
+            device=flat_tok_y.device,
+        )[:max_tokens]
+
+        flat_vq_logits = flat_vq_logits[chosen]
+        flat_tok_y = flat_tok_y[chosen]
+
+    k = min(int(topk), flat_vq_logits.size(-1))
+
+    # 全VQ語彙に対する正規化を維持したままtop-kを取る
+    all_log_p_vq = F.log_softmax(flat_vq_logits, dim=-1)
+    top_log_p_vq, top_ids = all_log_p_vq.topk(k, dim=-1)
+
+    # [N, K, D]
+    selected_centers = centers[top_ids]
+
+    # [N, K, token_vocab]
+    bpe_logits = decoder(selected_centers)
+    log_p_bpe = F.log_softmax(bpe_logits, dim=-1)
+
+    # 各VQ候補について、正解BPEだけ取り出す
+    target_index = flat_tok_y[:, None, None].expand(-1, k, 1)
+
+    target_log_p_bpe = log_p_bpe.gather(
+        dim=-1,
+        index=target_index,
+    ).squeeze(-1)
+
+    # log sum_v P(v|context) P(y|v)
+    target_log_prob = torch.logsumexp(
+        top_log_p_vq + target_log_p_bpe,
+        dim=-1,
+    )
+
+    nll_sum = -target_log_prob.sum()
+
+    return float(nll_sum.item()), int(flat_tok_y.numel())
 
 def topk_pipeline_bpe_loss(
     vq_logits,
@@ -264,6 +333,8 @@ def evaluate(model, loader, centers, decoder, device):
     total_pipe_bpe_loss = 0.0
     total_pipe_top1 = 0
     total_pipe_top5 = 0
+    total_marginal_bpe_loss = 0.0
+    total_marginal_count = 0
 
     total_oracle_bpe_loss = 0.0
     total_oracle_top1 = 0
@@ -323,7 +394,17 @@ def evaluate(model, loader, centers, decoder, device):
         total_pipe_top5 += int(
             pipe_topk.eq(true_bpe[:, None]).any(dim=1).sum().item()
         )
+        marginal_loss_sum, marginal_count = topk_marginal_bpe_nll(
+            vq_logits=vq_logits,
+            tok_y=tok_y,
+            centers=centers,
+            decoder=decoder,
+            topk=32,
+            max_tokens=2048,
+        )
 
+        total_marginal_bpe_loss += marginal_loss_sum
+        total_marginal_count += marginal_count
         oracle_bpe_logits = decode_vq_ids(vq_y[valid], centers, decoder)
         oracle_loss = F.cross_entropy(
             oracle_bpe_logits,
@@ -345,6 +426,9 @@ def evaluate(model, loader, centers, decoder, device):
 
     vq_ce = total_vq_loss / max(total_count, 1)
     pipe_ce = total_pipe_bpe_loss / max(total_count, 1)
+    marginal_ce = (
+            total_marginal_bpe_loss / max(total_marginal_count, 1)
+    )
     oracle_ce = total_oracle_bpe_loss / max(total_count, 1)
 
     return {
