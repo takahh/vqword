@@ -160,7 +160,7 @@ LOG_PATH="/vqword/${RUN}.log"
 
 echo "============================================================"
 echo "[configuration]"
-echo "task                    = VQW[t] -> VQW[t+1] -> fixed decoder -> BPE[t+1]"
+echo "task                   =  concat(VQW[t], α·BPE[t]) -> VQW[t+1] -> fixed decoder -> BPE[t+1]"
 echo "AR input                = VQW only"
 echo "AR target               = next VQW"
 echo "decoder                 = pretrained and frozen"
