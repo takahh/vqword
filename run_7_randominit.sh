@@ -136,9 +136,8 @@ PIPELINE_BPE_MAX_TOKENS="${PIPELINE_BPE_MAX_TOKENS:-512}"
 # ============================================================
 # Filenames
 # ============================================================
-
-BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
-ARTIFACT_TAG="${BASE_TAG}${ARTIFACT_SUFFIX}"
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_recon5_dec3_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+ARTIFACT_TAG="${BASE_TAG}"
 
 DATA="${DATA_FILE:-tinystories_vqword_${ARTIFACT_TAG}_ids.pt}"
 CODEBOOK="${CODEBOOK_FILE:-wikitext103_vqword_${ARTIFACT_TAG}.pt}"
