@@ -51,10 +51,10 @@ class VQARDataset(Dataset):
 
         return {
             "vq_in": vq[:-1],
+            "tok_in": tok[:-1],
             "vq_y": vq[1:],
             "tok_y": tok[1:],
         }
-
 
 def normalize_data_format(data):
     raw_samples = data["samples"]
@@ -101,43 +101,93 @@ def normalize_data_format(data):
     raise ValueError(f"Unsupported sample format: {list(first.keys())}")
 
 
-def collate(batch, vq_pad_id):
+def collate(batch, vq_pad_id, tok_pad_id):
     max_len = max(item["vq_in"].numel() for item in batch)
     batch_size = len(batch)
 
-    vq_in = torch.full((batch_size, max_len), vq_pad_id, dtype=torch.long)
-    vq_y = torch.full((batch_size, max_len), -100, dtype=torch.long)
-    tok_y = torch.full((batch_size, max_len), -100, dtype=torch.long)
+    vq_in = torch.full(
+        (batch_size, max_len),
+        vq_pad_id,
+        dtype=torch.long,
+    )
+
+    tok_in = torch.full(
+        (batch_size, max_len),
+        tok_pad_id,
+        dtype=torch.long,
+    )
+
+    vq_y = torch.full(
+        (batch_size, max_len),
+        -100,
+        dtype=torch.long,
+    )
+
+    tok_y = torch.full(
+        (batch_size, max_len),
+        -100,
+        dtype=torch.long,
+    )
 
     for i, item in enumerate(batch):
         n = item["vq_in"].numel()
+
         vq_in[i, :n] = item["vq_in"]
+        tok_in[i, :n] = item["tok_in"]
         vq_y[i, :n] = item["vq_y"]
         tok_y[i, :n] = item["tok_y"]
 
     attention_mask = vq_in.ne(vq_pad_id)
-    return vq_in, vq_y, tok_y, attention_mask
 
+    return (
+        vq_in,
+        tok_in,
+        vq_y,
+        tok_y,
+        attention_mask,
+    )
 
 class VQAutoregressiveLM(nn.Module):
     def __init__(
-        self,
-        vq_vocab_size,
-        d_model=256,
-        n_layers=6,
-        n_heads=8,
-        dropout=0.1,
-        max_len=512,
+            self,
+            vq_vocab_size,
+            token_vocab_size,
+            bpe_input_weight=0.01,
+            d_model=256,
+            n_layers=6,
+            n_heads=8,
+            dropout=0.1,
+            max_len=512,
     ):
         super().__init__()
+
         self.vq_vocab_size = int(vq_vocab_size)
+        self.token_vocab_size = int(token_vocab_size)
+
         self.vq_pad_id = self.vq_vocab_size
+        self.tok_pad_id = self.token_vocab_size
+
+        self.bpe_input_weight = float(bpe_input_weight)
 
         self.vq_emb = nn.Embedding(
             self.vq_vocab_size + 1,
             d_model,
             padding_idx=self.vq_pad_id,
         )
+        self.tok_emb = nn.Embedding(
+            self.token_vocab_size + 1,
+            d_model,
+            padding_idx=self.tok_pad_id,
+        )
+
+        self.fusion = nn.Linear(
+            d_model * 2,
+            d_model,
+        )
+        with torch.no_grad():
+            self.fusion.weight.zero_()
+            self.fusion.weight[:, :d_model].copy_(torch.eye(d_model))
+            self.fusion.bias.zero_()
         self.pos_emb = nn.Embedding(max_len, d_model)
 
         layer = nn.TransformerEncoderLayer(
@@ -152,10 +202,49 @@ class VQAutoregressiveLM(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.vq_head = nn.Linear(d_model, self.vq_vocab_size)
 
-    def forward(self, vq_in, key_padding_mask=None):
+        self.fusion = nn.Linear(d_model * 2, d_model)
+        self.alpha = 0.01
+
+    def forward(
+            self,
+            vq_in,
+            tok_in,
+            key_padding_mask=None,
+    ):
+        if vq_in.shape != tok_in.shape:
+            raise ValueError(
+                f"Shape mismatch: "
+                f"vq_in={tuple(vq_in.shape)}, "
+                f"tok_in={tuple(tok_in.shape)}"
+            )
+
         batch_size, seq_len = vq_in.shape
-        pos = torch.arange(seq_len, device=vq_in.device)[None, :]
-        h = self.vq_emb(vq_in) + self.pos_emb(pos)
+
+        pos = torch.arange(
+            seq_len,
+            device=vq_in.device,
+        )[None, :]
+
+        # [B, T, D]
+        vq_h = self.vq_emb(vq_in)
+
+        # [B, T, D]
+        tok_h = self.tok_emb(tok_in)
+
+        # BPEを小さい係数で補助情報として使う
+        tok_h = self.bpe_input_weight * tok_h
+
+        # [B, T, 2D]
+        fused = torch.cat(
+            [vq_h, tok_h],
+            dim=-1,
+        )
+
+        # [B, T, D]
+        h = self.fusion(fused)
+
+        # 位置埋め込み
+        h = h + self.pos_emb(pos)
 
         causal_mask = torch.triu(
             torch.ones(
@@ -172,7 +261,9 @@ class VQAutoregressiveLM(nn.Module):
             mask=causal_mask,
             src_key_padding_mask=key_padding_mask,
         )
+
         h = self.norm(h)
+
         return self.vq_head(h)
 
 
@@ -340,7 +431,13 @@ def evaluate(model, loader, centers, decoder, device):
     total_oracle_top1 = 0
     total_oracle_top5 = 0
 
-    for vq_in, vq_y, tok_y, attention_mask in tqdm(
+    for (
+            vq_in,
+            tok_in,
+            vq_y,
+            tok_y,
+            attention_mask,
+    ) in tqdm(
         loader,
         desc="[eval]",
         leave=False,
@@ -348,10 +445,14 @@ def evaluate(model, loader, centers, decoder, device):
         vq_in = vq_in.to(device)
         vq_y = vq_y.to(device)
         tok_y = tok_y.to(device)
+        tok_in = tok_in.to(device)
         attention_mask = attention_mask.to(device)
 
-        vq_logits = model(vq_in, key_padding_mask=~attention_mask)
-
+        vq_logits = model(
+            vq_in,
+            tok_in,
+            key_padding_mask=...
+        )
         vq_loss = F.cross_entropy(
             vq_logits.reshape(-1, vq_logits.size(-1)),
             vq_y.reshape(-1),
@@ -460,7 +561,12 @@ def main():
     ap.add_argument("--dictionary", required=True)
     ap.add_argument("--codebook", required=True)
     ap.add_argument("--out", default="ar_vqw_to_vqw_to_bpe.pt")
-
+    ap.add_argument(
+        "--bpe_input_weight",
+        type=float,
+        default=0.01,
+        help="scale applied to BPE embedding before concatenation",
+    )
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -582,13 +688,18 @@ def main():
     )
 
     vq_pad_id = vq_vocab_size
+    tok_pad_id = token_vocab_size
 
     def make_loader(dataset, shuffle):
         return DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=shuffle,
-            collate_fn=lambda b: collate(b, vq_pad_id),
+            collate_fn=lambda b: collate(
+                b,
+                vq_pad_id,
+                tok_pad_id,
+            ),
         )
 
     train_loader = make_loader(train_ds, True)
@@ -597,6 +708,8 @@ def main():
 
     model = VQAutoregressiveLM(
         vq_vocab_size=vq_vocab_size,
+        token_vocab_size=token_vocab_size,
+        bpe_input_weight=args.bpe_input_weight,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -621,15 +734,26 @@ def main():
 
         pbar = tqdm(train_loader, desc=f"[train] epoch {epoch}/{args.epochs}")
 
-        for vq_in, vq_y, tok_y, attention_mask in pbar:
+        for (
+                vq_in,
+                tok_in,
+                vq_y,
+                tok_y,
+                attention_mask,
+        ) in pbar:
             vq_in = vq_in.to(device)
+            tok_in = tok_in.to(device)
             vq_y = vq_y.to(device)
             tok_y = tok_y.to(device)
             attention_mask = attention_mask.to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
-            vq_logits = model(vq_in, key_padding_mask=~attention_mask)
+            vq_logits = model(
+                vq_in,
+                tok_in,
+                key_padding_mask=~attention_mask,
+            )
             vq_loss = F.cross_entropy(
                 vq_logits.reshape(-1, vq_logits.size(-1)),
                 vq_y.reshape(-1),
