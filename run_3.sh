@@ -43,24 +43,26 @@ BPE_VOCAB_SIZE=50257
 #
 # $1: VQW codebook size
 # $2: center scale
+# $3: HOP
 #
 # 例:
-#   bash run_vqword.sh 100k 0.1
+#   bash run_vqword.sh 200k 0.0 50
+#   bash run_vqword.sh 200k 0.0 75
 # ============================================================
 
-if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale}"
+if [ "$#" -ne 3 ]; then
+  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale} {hop}"
   echo
   echo "Examples:"
-  echo "  $0 100k 0.0"
-  echo "  $0 100k 0.1"
-  echo "  $0 100k 0.3"
-  echo "  $0 100k 1.0"
+  echo "  $0 200k 0.0 20"
+  echo "  $0 200k 0.0 50"
+  echo "  $0 200k 0.0 75"
   exit 1
 fi
 
 CB_SIZE="$1"
 CENTER_SCALE_RAW="$2"
+HOP_RAW="$3"
 
 CENTER_SCALE="$(
   python -c '
@@ -86,6 +88,27 @@ if value < 0:
 
 print(f"{value:g}")
 ' "${CENTER_SCALE_RAW}"
+)"
+HOP="$(
+  python -c '
+import sys
+
+raw = sys.argv[1]
+
+try:
+    value = int(raw)
+except ValueError:
+    raise SystemExit(
+        f"[error] hop must be an integer: {raw}"
+    )
+
+if value <= 0:
+    raise SystemExit(
+        f"[error] hop must be greater than 0: {value}"
+    )
+
+print(value)
+' "${HOP_RAW}"
 )"
 
 case "${CB_SIZE}" in
@@ -114,13 +137,12 @@ case "${CB_SIZE}" in
     VQ_CODEBOOK_SIZE=300000
     ;;
 
-  *)
-    echo "Usage: $0 {25k|50k|100k|200k|300k}"
-    exit 1
-    ;;
-esac
+*)
+  echo "[error] Invalid codebook size: ${CB_SIZE}"
+  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale} {hop}"
+  exit 1
+  ;;
 
-HOP=20
 IVF_NLIST=256
 SEED=0
 
