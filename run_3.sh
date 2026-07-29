@@ -282,7 +282,7 @@ echo "============================================================"
 
 DECODER_EPOCHS=3
 
-python train_vqword_decoder_only.py \
+python train_vqword_reconstruct.py \
   --dataset Salesforce/wikitext \
   --dataset_config wikitext-103-raw-v1 \
   --text_col text \
