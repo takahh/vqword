@@ -142,6 +142,7 @@ case "${CB_SIZE}" in
   echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale} {hop}"
   exit 1
   ;;
+esac
 
 IVF_NLIST=256
 SEED=0
