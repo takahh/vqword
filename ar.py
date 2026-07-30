@@ -432,10 +432,16 @@ def evaluate(
     total_pipe_bpe_loss = 0.0
     total_pipe_top1 = 0
     total_pipe_top5 = 0
-    total_marginal_bpe_loss = 0.0
-    total_marginal_count = 0
+
+    total_marginal_bpe_loss = {
+        int(k): 0.0 for k in marginal_topks
+    }
+    total_marginal_count = {
+        int(k): 0 for k in marginal_topks
+    }
 
     total_oracle_bpe_loss = 0.0
+
     total_oracle_top1 = 0
     total_oracle_top5 = 0
 
@@ -507,12 +513,6 @@ def evaluate(
             total_marginal_bpe_loss[int(marginal_k)] += marginal_loss_sum
             total_marginal_count[int(marginal_k)] += marginal_count
 
-        total_marginal_bpe_loss = {
-            int(k): 0.0 for k in marginal_topks
-        }
-        total_marginal_count = {
-            int(k): 0 for k in marginal_topks
-        }
         oracle_bpe_logits = decode_vq_ids(vq_y[valid], centers, decoder)
         oracle_loss = F.cross_entropy(
             oracle_bpe_logits,
@@ -559,9 +559,6 @@ def evaluate(
             for k in marginal_topks
         },
 
-        "marginal_bpe_count": total_marginal_count,
-        "marginal_bpe_loss": marginal_ce,
-        "marginal_bpe_ppl": math.exp(min(marginal_ce, 20.0)),
         "marginal_bpe_count": total_marginal_count,
         # Upper bound imposed by tokenizer+decoder reconstruction quality.
         "oracle_bpe_loss": oracle_ce,
@@ -850,7 +847,7 @@ def main():
             f"valid_vq_ppl={valid_metrics['vq_ppl']:.4f} "
             f"valid_vq_acc={valid_metrics['vq_acc']:.4f} "
             f"valid_hard_bpe_ppl={valid_metrics['pipeline_bpe_hard_ppl']:.4f} "
-            f"valid_marginal_bpe_ppl={valid_metrics['marginal_bpe_ppl']:.4f} "  
+            f"valid_marginal_bpe_ppl={valid_metrics['marginal_bpe_ppl']} "
             f"valid_bpe_top1={valid_metrics['pipeline_bpe_top1']:.4f} "
             f"test_vq_ppl={test_metrics['vq_ppl']:.4f} "
             f"test_hard_bpe_ppl={test_metrics['pipeline_bpe_hard_ppl']:.4f} "
