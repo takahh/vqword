@@ -128,7 +128,8 @@ MAX_LEN=512
 
 # Start with pure VQW->VQW training.
 PIPELINE_BPE_LOSS_WEIGHT="${PIPELINE_BPE_LOSS_WEIGHT:-0}"
-PIPELINE_TOPK="${PIPELINE_TOPK:-8}"
+#PIPELINE_TOPK="${PIPELINE_TOPK:-8}"
+PIPELINE_TOPK=128
 PIPELINE_BPE_MAX_TOKENS="${PIPELINE_BPE_MAX_TOKENS:-512}"
 
 # ============================================================
