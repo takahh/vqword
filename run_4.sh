@@ -35,47 +35,21 @@ git pull
 BPE_VOCAB_LABEL=50257
 DISCRETIZATION_SEED=0
 
-# ============================================================
-# 使用方法
-#
-#   bash assign_tinystories_vqword.sh 25k
-#   bash assign_tinystories_vqword.sh 50k
-#   bash assign_tinystories_vqword.sh 100k
-#   bash assign_tinystories_vqword.sh 200k
-#
-# 25k / 50k / 100k:
-#   checkpoint名に _seed0 が付く
-#
-# 200k:
-#   既存ファイルとの互換性のため _seed0 なし
-# ============================================================
-
-
-if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale}"
-  echo "Example: $0 100k 0.3"
-  exit 1
-fi
-
 VQ_CODEBOOK_LABEL="$1"
 CENTER_SCALE="$2"
 
 case "${VQ_CODEBOOK_LABEL}" in
     25k)
         VQ_CODEBOOK_SIZE=25000
-        DATA_SEED_SUFFIX="_seed${DISCRETIZATION_SEED}"
         ;;
     50k)
         VQ_CODEBOOK_SIZE=50000
-        DATA_SEED_SUFFIX="_seed${DISCRETIZATION_SEED}"
         ;;
     100k)
         VQ_CODEBOOK_SIZE=100000
-        DATA_SEED_SUFFIX="_seed${DISCRETIZATION_SEED}"
         ;;
     200k)
         VQ_CODEBOOK_SIZE=200000
-        DATA_SEED_SUFFIX="_seed${DISCRETIZATION_SEED}"
         ;;
     *)
         echo "Unsupported VQ vocabulary: ${VQ_CODEBOOK_LABEL}"
@@ -83,21 +57,23 @@ case "${VQ_CODEBOOK_LABEL}" in
         ;;
 esac
 
-HOP=20
+# ============================================================
+# 75 HOP / decoder-only checkpoint
+# ============================================================
+
+HOP=75
 IVF_NLIST=256
+DECODER_EPOCHS=3
+MODEL_VARIANT="deconly"
 
 MAX_SAMPLES=20000
 SEQ_LEN=256
 BATCH_SIZE=512
 K_BLOCK=4096
 
-# ============================================================
-# ファイル名
-# ============================================================
-DECODER_EPOCHS=3
-RECON_EPOCHS=5
+# checkpoint名と完全に一致させる
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center1_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 
-BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center1_recon${RECON_EPOCHS}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 VQ_TAG="${BASE_TAG}"
 
 BPE_ARCHIVE="bpe_wikitext103_50257.tar.gz"
@@ -106,8 +82,6 @@ TOKENIZER_DIR="/vqword/bpe_wikitext103_50257"
 VQ_CKPT="wikitext103_vqword_${VQ_TAG}.pt"
 VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
 
-# 出力には必ずVQ vocab sizeを含める
-# seedも含めて、どのtokenizerから作ったか明確にする
 OUT="tinystories_vqword_${VQ_TAG}_ids.pt"
 OUT_PATH="/vqword/${OUT}"
 
