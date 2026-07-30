@@ -410,6 +410,8 @@ python "${AR_SCRIPT}" \
   --pipeline_topk "${PIPELINE_TOPK}" \
   --pipeline_bpe_max_tokens "${PIPELINE_BPE_MAX_TOKENS}" \
   --out "${FINAL_PATH}" \
+  --marginal_topks 1 8 32 128 \
+  --marginal_max_tokens 0 \
   2>&1 | tee "${LOG_PATH}"
 
 # ============================================================
