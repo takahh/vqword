@@ -345,30 +345,44 @@ def topk_marginal_bpe_nll(
     all_log_p_vq = F.log_softmax(flat_vq_logits, dim=-1)
     top_log_p_vq, top_ids = all_log_p_vq.topk(k, dim=-1)
 
-    # [N, K, D]
-    selected_centers = centers[top_ids]
+    # トークン方向に分割して、巨大な [N, K, BPE_vocab] を作らない
+    chunk_size = 256
+    total_nll = 0.0
+    total_count = 0
 
-    # [N, K, token_vocab]
-    bpe_logits = decoder(selected_centers)
-    log_p_bpe = F.log_softmax(bpe_logits, dim=-1)
+    for start in range(0, flat_tok_y.numel(), chunk_size):
+        end = min(start + chunk_size, flat_tok_y.numel())
 
-    # 各VQ候補について、正解BPEだけ取り出す
-    target_index = flat_tok_y[:, None, None].expand(-1, k, 1)
+        chunk_top_ids = top_ids[start:end]
+        chunk_top_log_p_vq = top_log_p_vq[start:end]
+        chunk_targets = flat_tok_y[start:end]
 
-    target_log_p_bpe = log_p_bpe.gather(
-        dim=-1,
-        index=target_index,
-    ).squeeze(-1)
+        # [chunk, K, D]
+        selected_centers = centers[chunk_top_ids]
 
-    # log sum_v P(v|context) P(y|v)
-    target_log_prob = torch.logsumexp(
-        top_log_p_vq + target_log_p_bpe,
-        dim=-1,
-    )
+        # [chunk, K, BPE_vocab]
+        bpe_logits = decoder(selected_centers)
+        log_p_bpe = F.log_softmax(bpe_logits, dim=-1)
 
-    nll_sum = -target_log_prob.sum()
+        # [chunk, K, 1]
+        target_index = chunk_targets[:, None, None].expand(-1, k, 1)
 
-    return float(nll_sum.item()), int(flat_tok_y.numel())
+        # [chunk, K]
+        target_log_p_bpe = log_p_bpe.gather(
+            dim=-1,
+            index=target_index,
+        ).squeeze(-1)
+
+        # [chunk]
+        target_log_prob = torch.logsumexp(
+            chunk_top_log_p_vq + target_log_p_bpe,
+            dim=-1,
+        )
+
+        total_nll += float((-target_log_prob.sum()).item())
+        total_count += int(chunk_targets.numel())
+
+    return total_nll, total_count
 
 def topk_pipeline_bpe_loss(
     vq_logits,
