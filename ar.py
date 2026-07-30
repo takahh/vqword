@@ -414,7 +414,15 @@ def topk_pipeline_bpe_loss(
 
 
 @torch.no_grad()
-def evaluate(model, loader, centers, decoder, device):
+def evaluate(
+        model,
+        loader,
+        centers,
+        decoder,
+        device,
+        marginal_topks=(1, 8, 32, 128),
+        marginal_max_tokens=0,
+):
     model.eval()
 
     total_vq_loss = 0.0
@@ -486,17 +494,25 @@ def evaluate(model, loader, centers, decoder, device):
         total_pipe_top5 += int(
             pipe_topk.eq(true_bpe[:, None]).any(dim=1).sum().item()
         )
-        marginal_loss_sum, marginal_count = topk_marginal_bpe_nll(
-            vq_logits=vq_logits,
-            tok_y=tok_y,
-            centers=centers,
-            decoder=decoder,
-            topk=8,
-            max_tokens=64,
-        )
+        for marginal_k in marginal_topks:
+            marginal_loss_sum, marginal_count = topk_marginal_bpe_nll(
+                vq_logits=vq_logits,
+                tok_y=tok_y,
+                centers=centers,
+                decoder=decoder,
+                topk=marginal_k,
+                max_tokens=marginal_max_tokens,
+            )
 
-        total_marginal_bpe_loss += marginal_loss_sum
-        total_marginal_count += marginal_count
+            total_marginal_bpe_loss[int(marginal_k)] += marginal_loss_sum
+            total_marginal_count[int(marginal_k)] += marginal_count
+
+        total_marginal_bpe_loss = {
+            int(k): 0.0 for k in marginal_topks
+        }
+        total_marginal_count = {
+            int(k): 0 for k in marginal_topks
+        }
         oracle_bpe_logits = decode_vq_ids(vq_y[valid], centers, decoder)
         oracle_loss = F.cross_entropy(
             oracle_bpe_logits,
@@ -518,9 +534,13 @@ def evaluate(model, loader, centers, decoder, device):
 
     vq_ce = total_vq_loss / max(total_count, 1)
     pipe_ce = total_pipe_bpe_loss / max(total_count, 1)
-    marginal_ce = (
-            total_marginal_bpe_loss / max(total_marginal_count, 1)
-    )
+    marginal_ce = {
+        int(k): (
+                total_marginal_bpe_loss[int(k)]
+                / max(total_marginal_count[int(k)], 1)
+        )
+        for k in marginal_topks
+    }
     oracle_ce = total_oracle_bpe_loss / max(total_count, 1)
 
     return {
@@ -532,7 +552,14 @@ def evaluate(model, loader, centers, decoder, device):
         "pipeline_bpe_hard_ppl": math.exp(min(pipe_ce, 20.0)),
         "pipeline_bpe_top1": total_pipe_top1 / max(total_count, 1),
         "pipeline_bpe_top5": total_pipe_top5 / max(total_count, 1),
-        "marginal_bpe_topk": 32,
+        "marginal_bpe_loss": marginal_ce,
+
+        "marginal_bpe_ppl": {
+            int(k): math.exp(min(marginal_ce[int(k)], 20.0))
+            for k in marginal_topks
+        },
+
+        "marginal_bpe_count": total_marginal_count,
         "marginal_bpe_loss": marginal_ce,
         "marginal_bpe_ppl": math.exp(min(marginal_ce, 20.0)),
         "marginal_bpe_count": total_marginal_count,
@@ -557,6 +584,20 @@ def main():
         type=float,
         default=0.01,
         help="scale applied to BPE embedding before concatenation",
+    )
+    ap.add_argument(
+        "--marginal_topks",
+        type=int,
+        nargs="+",
+        default=[1, 8, 32, 128],
+        help="top-k values used for marginalized BPE evaluation",
+    )
+
+    ap.add_argument(
+        "--marginal_max_tokens",
+        type=int,
+        default=0,
+        help="maximum evaluated positions per batch; 0 means all valid positions",
     )
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=20)
@@ -784,6 +825,8 @@ def main():
             centers,
             decoder,
             device,
+            marginal_topks=args.marginal_topks,
+            marginal_max_tokens=args.marginal_max_tokens,
         )
         test_metrics = evaluate(
             model,
@@ -791,6 +834,8 @@ def main():
             centers,
             decoder,
             device,
+            marginal_topks=args.marginal_topks,
+            marginal_max_tokens=args.marginal_max_tokens,
         )
 
         row = {
