@@ -121,7 +121,7 @@ TOKENIZER_DIR="/vqword/bpe_wikitext103_${BPE_VOCAB_LABEL}"
 
 # This Python file must implement bilateral windows:
 #   [i-hop, ..., i-1, i, i+1, ..., i+hop]
-TRAIN_SCRIPT="${TRAIN_SCRIPT:-train_vqword_multihop.py}"
+TRAIN_SCRIPT="train_vqword_reconstruct.py"
 TRAIN_SCRIPT_PATH="/vqword/${TRAIN_SCRIPT}"
 
 FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
