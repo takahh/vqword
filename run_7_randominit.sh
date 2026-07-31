@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # ============================================================
-# Step 7: VQW[t] -> VQW[t+1] -> fixed decoder -> BPE[t+1]
+# Step 7: VQW[t] + alpha * BPE[t] -> VQW[t+1]
+#         -> fixed decoder -> BPE[t+1]
 #
-# The AR Transformer sees only VQW IDs.
+# VQW is the primary input and target.
+# BPE[t] is used only as auxiliary input.
 # The learned VQ-center-to-BPE decoder is loaded from the
 # VQWord dictionary and remains frozen during AR training.
 #
@@ -126,7 +128,11 @@ LR=3e-4
 WEIGHT_DECAY=1e-4
 MAX_LEN=512
 
-# Start with pure VQW->VQW training.
+# Auxiliary BPE input strength.
+# 0 = VQW-only baseline; recommended first trial = 0.01
+BPE_INPUT_WEIGHT="${BPE_INPUT_WEIGHT:-0.01}"
+
+# Keep the training target as next VQW.
 PIPELINE_BPE_LOSS_WEIGHT="${PIPELINE_BPE_LOSS_WEIGHT:-0}"
 #PIPELINE_TOPK="${PIPELINE_TOPK:-8}"
 PIPELINE_TOPK=128
@@ -150,7 +156,7 @@ DICTIONARY_PATH="/vqword/${DICTIONARY}"
 
 AR_SCRIPT="/vqword/ar.py"
 
-RUN="ar_vqw2vqw2bpe_${ARTIFACT_TAG}_arseed${AR_SEED}_pipebpe${PIPELINE_BPE_LOSS_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_vqw_bpeaux2vqw2bpe_${ARTIFACT_TAG}_arseed${AR_SEED}_bpein${BPE_INPUT_WEIGHT}_pipebpe${PIPELINE_BPE_LOSS_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
@@ -163,7 +169,9 @@ LOG_PATH="/vqword/${RUN}.log"
 echo "============================================================"
 echo "[configuration]"
 echo "task                   =  concat(VQW[t], α·BPE[t]) -> VQW[t+1] -> fixed decoder -> BPE[t+1]"
-echo "AR input                = VQW only"
+echo "AR primary input        = VQW[t]"
+echo "AR auxiliary input      = BPE[t]"
+echo "BPE input weight        = ${BPE_INPUT_WEIGHT}"
 echo "AR target               = next VQW"
 echo "decoder                 = pretrained and frozen"
 echo "BPE vocabulary          = ${BPE_VOCAB_SIZE}"
@@ -387,7 +395,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "============================================================"
 echo "[start VQW autoregressive training]"
-echo "input       = VQW[t]"
+echo "input       = VQW[t] + ${BPE_INPUT_WEIGHT} * BPE[t]"
 echo "target      = VQW[t+1]"
 echo "evaluation  = predicted VQW -> frozen decoder -> BPE[t+1]"
 echo "============================================================"
@@ -406,6 +414,7 @@ python "${AR_SCRIPT}" \
   --dropout "${DROPOUT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
+  --bpe_input_weight "${BPE_INPUT_WEIGHT}" \
   --pipeline_bpe_loss_weight "${PIPELINE_BPE_LOSS_WEIGHT}" \
   --pipeline_topk "${PIPELINE_TOPK}" \
   --pipeline_bpe_max_tokens "${PIPELINE_BPE_MAX_TOKENS}" \
@@ -523,6 +532,8 @@ for path in ["${BEST_PATH}", "${FINAL_PATH}"]:
     model = ckpt["model"]
     required_model = {
         "vq_emb.weight",
+        "tok_emb.weight",
+        "bpe_proj.weight",
         "pos_emb.weight",
         "vq_head.weight",
         "vq_head.bias",
@@ -532,9 +543,10 @@ for path in ["${BEST_PATH}", "${FINAL_PATH}"]:
         raise KeyError(f"{path}: missing model keys: {missing_model}")
 
     forbidden_model = {
-        "tok_emb.weight",
         "tok_head.weight",
         "input_fusion.weight",
+        "fusion.weight",
+        "fusion.bias",
     }
     present_forbidden = sorted(forbidden_model & set(model))
     if present_forbidden:
@@ -584,7 +596,7 @@ EOF
 
 echo "============================================================"
 echo "[completed]"
-echo "TASK       = VQW -> VQW -> frozen decoder -> BPE"
+echo "TASK       = VQW + BPE auxiliary -> VQW -> frozen decoder -> BPE"
 echo "DATA       = ${DATA}"
 echo "CODEBOOK   = ${CODEBOOK}"
 echo "DICTIONARY = ${DICTIONARY}"
