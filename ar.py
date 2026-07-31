@@ -148,6 +148,16 @@ def collate(batch, vq_pad_id, tok_pad_id):
     )
 
 class VQAutoregressiveLM(nn.Module):
+    """
+    VQW is the primary autoregressive input and prediction target.
+    The current BPE token is used only as an auxiliary input.
+
+    At position t:
+        input  = VQW[t] + alpha * BPE_projection(BPE[t])
+        target = VQW[t+1]
+
+    Setting --bpe_input_weight 0 gives the exact VQW-only input path.
+    """
     def __init__(
             self,
             vq_vocab_size,
@@ -163,10 +173,8 @@ class VQAutoregressiveLM(nn.Module):
 
         self.vq_vocab_size = int(vq_vocab_size)
         self.token_vocab_size = int(token_vocab_size)
-
         self.vq_pad_id = self.vq_vocab_size
         self.tok_pad_id = self.token_vocab_size
-
         self.bpe_input_weight = float(bpe_input_weight)
 
         self.vq_emb = nn.Embedding(
@@ -180,14 +188,12 @@ class VQAutoregressiveLM(nn.Module):
             padding_idx=self.tok_pad_id,
         )
 
-        self.fusion = nn.Linear(
-            d_model * 2,
-            d_model,
-        )
+        # BPE is an auxiliary residual path.  Identity initialization makes
+        # its initial scale directly interpretable through bpe_input_weight.
+        self.bpe_proj = nn.Linear(d_model, d_model, bias=False)
         with torch.no_grad():
-            self.fusion.weight.zero_()
-            self.fusion.weight[:, :d_model].copy_(torch.eye(d_model))
-            self.fusion.bias.zero_()
+            self.bpe_proj.weight.copy_(torch.eye(d_model))
+
         self.pos_emb = nn.Embedding(max_len, d_model)
 
         layer = nn.TransformerEncoderLayer(
@@ -202,9 +208,6 @@ class VQAutoregressiveLM(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.vq_head = nn.Linear(d_model, self.vq_vocab_size)
 
-        self.fusion = nn.Linear(d_model * 2, d_model)
-        self.alpha = 0.01
-
     def forward(
             self,
             vq_in,
@@ -213,37 +216,27 @@ class VQAutoregressiveLM(nn.Module):
     ):
         if vq_in.shape != tok_in.shape:
             raise ValueError(
-                f"Shape mismatch: "
-                f"vq_in={tuple(vq_in.shape)}, "
+                f"Shape mismatch: vq_in={tuple(vq_in.shape)}, "
                 f"tok_in={tuple(tok_in.shape)}"
             )
 
-        batch_size, seq_len = vq_in.shape
+        _, seq_len = vq_in.shape
+        if seq_len > self.pos_emb.num_embeddings:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds max_len "
+                f"{self.pos_emb.num_embeddings}"
+            )
 
-        pos = torch.arange(
-            seq_len,
-            device=vq_in.device,
-        )[None, :]
+        pos = torch.arange(seq_len, device=vq_in.device)[None, :]
 
-        # [B, T, D]
+        # Primary logical-token path.
         vq_h = self.vq_emb(vq_in)
 
-        # [B, T, D]
-        tok_h = self.tok_emb(tok_in)
+        # Auxiliary physical-token path.
+        bpe_h = self.bpe_proj(self.tok_emb(tok_in))
 
-        # BPEを小さい係数で補助情報として使う
-        tok_h = self.bpe_input_weight * tok_h
-
-        # [B, T, 2D]
-        fused = torch.cat(
-            [vq_h, tok_h],
-            dim=-1,
-        )
-
-        # [B, T, D]
-        h = self.fusion(fused)
-
-        # 位置埋め込み
+        # alpha=0 is exactly the VQW-only input representation.
+        h = vq_h + self.bpe_input_weight * bpe_h
         h = h + self.pos_emb(pos)
 
         causal_mask = torch.triu(
@@ -261,9 +254,7 @@ class VQAutoregressiveLM(nn.Module):
             mask=causal_mask,
             src_key_padding_mask=key_padding_mask,
         )
-
         h = self.norm(h)
-
         return self.vq_head(h)
 
 
@@ -661,6 +652,7 @@ def main():
     token_vocab_size = int(decoder_state["weight"].shape[0])
 
     print(f"[token vocab size] {token_vocab_size}")
+    print(f"[BPE auxiliary input weight] {args.bpe_input_weight}")
 
     codebook_raw = torch.load(
         args.codebook,
