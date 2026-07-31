@@ -1,6 +1,19 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
+
+# ============================================================
+# WikiText-103 multi-HOP VQWord generation
+#
+# Generate 10 independent bilateral-context tokenizers:
+#   hop=1, 2, ..., 10
+#
+# Usage:
+#   FTP_PASS='...' bash run_vqword_multihop_wikitext.sh 100k 0.0
+#
+# Arguments:
+#   $1: VQW codebook size: 25k|50k|100k|200k|300k
+#   $2: center scale
+# ============================================================
 
 apt update
 apt install -y lftp
@@ -22,47 +35,16 @@ fi
 cd /vqword
 git pull
 
-# ============================================================
-# Step4: WikiText-103でVQWord tokenizer作成
-#
-# BPE tokenizer:
-#   bpe_wikitext103_50257.tar.gz
-#
-# VQW:
-#   left 20
-#   center_scale = 0
-#   codebook = 200k
-# ============================================================
-FTP_PASS='Squat#201k'
-# BPEは固定
-BPE_VOCAB_LABEL=50257
-BPE_VOCAB_SIZE=50257
-
-# ============================================================
-# 実行引数
-#
-# $1: VQW codebook size
-# $2: center scale
-# $3: HOP
-#
-# 例:
-#   bash run_vqword.sh 200k 0.0 50
-#   bash run_vqword.sh 200k 0.0 75
-# ============================================================
-
-if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale} {hop}"
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale}"
   echo
-  echo "Examples:"
-  echo "  $0 200k 0.0 20"
-  echo "  $0 200k 0.0 50"
-  echo "  $0 200k 0.0 75"
+  echo "Example:"
+  echo "  FTP_PASS='your-password' $0 100k 0.0"
   exit 1
 fi
 
 CB_SIZE="$1"
 CENTER_SCALE_RAW="$2"
-HOP_RAW="$3"
 
 CENTER_SCALE="$(
   python -c '
@@ -89,170 +71,103 @@ if value < 0:
 print(f"{value:g}")
 ' "${CENTER_SCALE_RAW}"
 )"
-HOP="$(
-  python -c '
-import sys
-
-raw = sys.argv[1]
-
-try:
-    value = int(raw)
-except ValueError:
-    raise SystemExit(
-        f"[error] hop must be an integer: {raw}"
-    )
-
-if value <= 0:
-    raise SystemExit(
-        f"[error] hop must be greater than 0: {value}"
-    )
-
-print(value)
-' "${HOP_RAW}"
-)"
 
 case "${CB_SIZE}" in
   25k)
     VQ_CODEBOOK_LABEL=25k
     VQ_CODEBOOK_SIZE=25000
     ;;
-
   50k)
     VQ_CODEBOOK_LABEL=50k
     VQ_CODEBOOK_SIZE=50000
     ;;
-
   100k)
     VQ_CODEBOOK_LABEL=100k
     VQ_CODEBOOK_SIZE=100000
     ;;
-
   200k)
     VQ_CODEBOOK_LABEL=200k
     VQ_CODEBOOK_SIZE=200000
     ;;
-
   300k)
     VQ_CODEBOOK_LABEL=300k
     VQ_CODEBOOK_SIZE=300000
     ;;
-
-*)
-  echo "[error] Invalid codebook size: ${CB_SIZE}"
-  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale} {hop}"
-  exit 1
-  ;;
+  *)
+    echo "[error] Invalid codebook size: ${CB_SIZE}"
+    echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale}"
+    exit 1
+    ;;
 esac
+
+# ============================================================
+# Fixed configuration
+# ============================================================
+BPE_VOCAB_LABEL=50257
+BPE_VOCAB_SIZE=50257
 
 IVF_NLIST=256
 SEED=0
-
 D_MODEL=256
 N_LAYERS=3
+DECODER_EPOCHS=3
 
-# ============================================================
-# ファイル名
-# ============================================================
+HOP_MIN=1
+HOP_MAX=10
+
 BPE_ARCHIVE="bpe_wikitext103_${BPE_VOCAB_LABEL}.tar.gz"
 BPE_ARCHIVE_PATH="/vqword/${BPE_ARCHIVE}"
-
 TOKENIZER_DIR="/vqword/bpe_wikitext103_${BPE_VOCAB_LABEL}"
-TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center${CENTER_SCALE}_deconly_dec3_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}"
 
-OUT="wikitext103_vqword_${TAG}.pt"
-DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
-IDS="wikitext103_vqword_${TAG}_ids.pt"
-
-OUT_PATH="/vqword/${OUT}"
-DICTIONARY_PATH="/vqword/${DICTIONARY}"
-IDS_PATH="/vqword/${IDS}"
-
-# ============================================================
-# FTP設定
-# ============================================================
+# This Python file must implement bilateral windows:
+#   [i-hop, ..., i-1, i, i+1, ..., i+hop]
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-train_vqword_multihop.py}"
+TRAIN_SCRIPT_PATH="/vqword/${TRAIN_SCRIPT}"
 
 FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
 FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
-echo "============================================================"
-echo "[configuration]"
-echo "BPE vocabulary       = ${BPE_VOCAB_SIZE}"
-echo "BPE archive          = ${BPE_ARCHIVE}"
-echo "tokenizer directory  = ${TOKENIZER_DIR}"
-echo "VQW codebook         = ${VQ_CODEBOOK_SIZE}"
-echo "context              = left-only"
-echo "hop                  = ${HOP}"
-echo "center scale         = ${CENTER_SCALE}"
-echo "IVF nlist            = ${IVF_NLIST}"
-echo "seed                 = ${SEED}"
-echo "output               = ${OUT}"
-echo "dictionary           = ${DICTIONARY}"
-echo "ids                  = ${IDS}"
-echo "============================================================"
+if [ ! -f "${TRAIN_SCRIPT_PATH}" ]; then
+  echo "[error] Bilateral multi-HOP training script was not found:"
+  echo "        ${TRAIN_SCRIPT_PATH}"
+  echo
+  echo "Set TRAIN_SCRIPT to the correct filename, for example:"
+  echo "  TRAIN_SCRIPT=vqword_multihop_discretize.py FTP_PASS='...' $0 ${CB_SIZE} ${CENTER_SCALE}"
+  exit 1
+fi
 
 # ============================================================
-# BPE tokenizer archiveをFTPから取得
+# Download and verify BPE tokenizer
 # ============================================================
-
 rm -f "${BPE_ARCHIVE_PATH}"
 
-lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
 set cmd:fail-exit yes
-
-get "${BPE_ARCHIVE}" \
-  -o "${BPE_ARCHIVE_PATH}"
-
+get "${BPE_ARCHIVE}" -o "${BPE_ARCHIVE_PATH}"
 bye
-EOF
-
-echo "============================================================"
-echo "[downloaded BPE tokenizer archive]"
-ls -lh "${BPE_ARCHIVE_PATH}"
-echo "============================================================"
-
-# ============================================================
-# tokenizerを展開
-# ============================================================
+EOF_LFTP
 
 rm -rf "${TOKENIZER_DIR}"
-
 tar -xzf "${BPE_ARCHIVE_PATH}" -C /vqword
-
-echo "============================================================"
-echo "[extracted tokenizer]"
-echo "directory = ${TOKENIZER_DIR}"
-echo "============================================================"
 
 if [ ! -d "${TOKENIZER_DIR}" ]; then
   echo "[error] tokenizer directory was not created:"
   echo "        ${TOKENIZER_DIR}"
-  echo
-  echo "[archive contents]"
   tar -tzf "${BPE_ARCHIVE_PATH}" | head -50
   exit 1
 fi
 
-# AutoTokenizerが最低限必要とするファイルを確認
-for file in \
-  tokenizer.json \
-  tokenizer_config.json
-do
+for file in tokenizer.json tokenizer_config.json; do
   if [ ! -f "${TOKENIZER_DIR}/${file}" ]; then
     echo "[error] Missing tokenizer file:"
     echo "        ${TOKENIZER_DIR}/${file}"
     exit 1
   fi
 done
-
-ls -lh "${TOKENIZER_DIR}"
-
-# ============================================================
-# tokenizerの語彙数を検証
-# ============================================================
 
 python - <<PY
 from transformers import AutoTokenizer
@@ -288,139 +203,127 @@ print("============================================================")
 PY
 
 # ============================================================
-# WikiText-103でVQWord tokenizerを作成
-#
-# 注意:
-# 現在のtrain_vqword.pyは、Step2のBPE IDファイルを読まず、
-# WikiText-103をここで再取得・再tokenizeする。
+# Run bilateral discretization independently for hop 1..10
 # ============================================================
+MANIFEST="/vqword/wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral_hops01-10_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}_manifest.tsv"
+printf "hop\tmodel\tdictionary\tids\n" > "${MANIFEST}"
 
-echo "============================================================"
-echo "[train VQWord]"
-echo "dataset    = WikiText-103"
-echo "tokenizer  = ${TOKENIZER_DIR}"
-echo "context    = past ${HOP} tokens + center"
-echo "codebook   = ${VQ_CODEBOOK_SIZE}"
-echo "============================================================"
+for HOP in $(seq "${HOP_MIN}" "${HOP_MAX}"); do
+  HOP_PADDED="$(printf '%02d' "${HOP}")"
 
-DECODER_EPOCHS=3
+  TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP_PADDED}_center${CENTER_SCALE}_deconly_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}"
 
-python train_vqword_reconstruct.py \
-  --dataset Salesforce/wikitext \
-  --dataset_config wikitext-103-raw-v1 \
-  --text_col text \
-  --tokenizer "${TOKENIZER_DIR}" \
-  --max_samples 1000000 \
-  --seq_len 256 \
-  --hop "${HOP}" \
-  --d_model "${D_MODEL}" \
-  --n_layers "${N_LAYERS}" \
-  --center_scale "${CENTER_SCALE}" \
-  --decoder_epochs "${DECODER_EPOCHS}" \
-  --decoder_lr 1e-3 \
-  --decoder_weight_decay 1e-4 \
-  --decoder_eval_size 100000 \
-  --ivf_nlist "${IVF_NLIST}" \
-  --ivf_iters 1 \
-  --ivf_batch_size 8192 \
-  --global_codebook_size "${VQ_CODEBOOK_SIZE}" \
-  --global_kmeans_iters 5 \
-  --global_batch_size 8192 \
-  --batch_size 1024 \
-  --k_block 4096 \
-  --seed "${SEED}" \
-  --out "${OUT_PATH}"
+  OUT="wikitext103_vqword_${TAG}.pt"
+  DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
+  IDS="wikitext103_vqword_${TAG}_ids.pt"
 
-# ============================================================
-# 生成物を確認
-# ============================================================
+  OUT_PATH="/vqword/${OUT}"
+  DICTIONARY_PATH="/vqword/${DICTIONARY}"
+  IDS_PATH="/vqword/${IDS}"
 
-echo "============================================================"
-echo "[generated files]"
-echo "============================================================"
+  echo "============================================================"
+  echo "[train VQWord]"
+  echo "dataset              = WikiText-103"
+  echo "tokenizer            = ${TOKENIZER_DIR}"
+  echo "context              = bilateral"
+  echo "hop                  = ${HOP} left + ${HOP} right"
+  echo "context width        = $((2 * HOP + 1))"
+  echo "center scale         = ${CENTER_SCALE}"
+  echo "VQW codebook         = ${VQ_CODEBOOK_SIZE}"
+  echo "output               = ${OUT}"
+  echo "============================================================"
 
-for path in \
-  "${OUT_PATH}" \
-  "${DICTIONARY_PATH}" \
-  "${IDS_PATH}"
-do
-  if [ ! -f "${path}" ]; then
-    echo "[error] Expected output was not generated:"
-    echo "        ${path}"
-    exit 1
-  fi
+  python "${TRAIN_SCRIPT_PATH}" \
+    --dataset Salesforce/wikitext \
+    --dataset_config wikitext-103-raw-v1 \
+    --text_col text \
+    --tokenizer "${TOKENIZER_DIR}" \
+    --max_samples 1000000 \
+    --seq_len 256 \
+    --hop "${HOP}" \
+    --d_model "${D_MODEL}" \
+    --n_layers "${N_LAYERS}" \
+    --center_scale "${CENTER_SCALE}" \
+    --decoder_epochs "${DECODER_EPOCHS}" \
+    --decoder_lr 1e-3 \
+    --decoder_weight_decay 1e-4 \
+    --decoder_eval_size 100000 \
+    --ivf_nlist "${IVF_NLIST}" \
+    --ivf_iters 1 \
+    --ivf_batch_size 8192 \
+    --global_codebook_size "${VQ_CODEBOOK_SIZE}" \
+    --global_kmeans_iters 5 \
+    --global_batch_size 8192 \
+    --batch_size 1024 \
+    --k_block 4096 \
+    --seed "${SEED}" \
+    --out "${OUT_PATH}"
+
+  for path in "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"; do
+    if [ ! -f "${path}" ]; then
+      echo "[error] Expected output was not generated:"
+      echo "        ${path}"
+      exit 1
+    fi
+  done
+
+  ls -lh "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"
+
+  # Upload model and dictionary.
+  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
+set ftp:ssl-allow no
+set net:max-retries 5
+set net:timeout 30
+set cmd:fail-exit yes
+put "${OUT_PATH}" -o "${OUT}"
+put "${DICTIONARY_PATH}" -o "${DICTIONARY}"
+bye
+EOF_LFTP
+
+  # Split and upload the potentially large ID file.
+  rm -f "${IDS_PATH}.part"*
+  split -b 450M -d -a 3 "${IDS_PATH}" "${IDS_PATH}.part"
+
+  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
+set ftp:ssl-allow no
+set net:max-retries 5
+set net:timeout 30
+set cmd:fail-exit yes
+mput "${IDS_PATH}.part"*
+bye
+EOF_LFTP
+
+  printf "%s\t%s\t%s\t%s\n" \
+    "${HOP}" \
+    "${OUT}" \
+    "${DICTIONARY}" \
+    "${IDS}" \
+    >> "${MANIFEST}"
+
+  echo "============================================================"
+  echo "[completed hop ${HOP}]"
+  echo "model      = ${OUT}"
+  echo "dictionary = ${DICTIONARY}"
+  echo "IDs        = ${IDS}"
+  echo "============================================================"
 done
 
-ls -lh \
-  "${OUT_PATH}" \
-  "${DICTIONARY_PATH}" \
-  "${IDS_PATH}"
-
-# ============================================================
-# コードブックと辞書をFTPへアップロード
-# ============================================================
-
-echo "============================================================"
-echo "[upload codebook and dictionary]"
-echo "============================================================"
-
-lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+# Upload manifest after all 10 runs succeed.
+MANIFEST_NAME="$(basename "${MANIFEST}")"
+lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
 set cmd:fail-exit yes
-
-put "${OUT_PATH}" \
-  -o "${OUT}"
-
-put "${DICTIONARY_PATH}" \
-  -o "${DICTIONARY}"
-
+put "${MANIFEST}" -o "${MANIFEST_NAME}"
 bye
-EOF
-
-# ============================================================
-# WikiText VQW IDファイルを分割してアップロード
-# ============================================================
+EOF_LFTP
 
 echo "============================================================"
-echo "[split WikiText-103 VQW ID file]"
-echo "============================================================"
-
-rm -f "${IDS_PATH}.part"*
-
-split \
-  -b 450M \
-  -d \
-  -a 3 \
-  "${IDS_PATH}" \
-  "${IDS_PATH}.part"
-
-ls -lh "${IDS_PATH}.part"*
-
-echo "============================================================"
-echo "[upload split ID files]"
-echo "============================================================"
-
-lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
-set ftp:ssl-allow no
-set net:max-retries 5
-set net:timeout 30
-set cmd:fail-exit yes
-
-mput "${IDS_PATH}.part"*
-
-bye
-EOF
-
-echo "============================================================"
-echo "[completed]"
-echo "BPE tokenizer = ${BPE_ARCHIVE}"
-echo "BPE vocabulary = ${BPE_VOCAB_SIZE}"
-echo "VQW codebook = ${VQ_CODEBOOK_SIZE}"
-echo "context = left ${HOP}"
-echo "seed = ${SEED}"
-echo "codebook = ${OUT}"
-echo "dictionary = ${DICTIONARY}"
-echo "IDs = ${IDS}"
+echo "[all multi-HOP runs completed]"
+echo "HOP range       = ${HOP_MIN}..${HOP_MAX}"
+echo "context         = bilateral"
+echo "center scale    = ${CENTER_SCALE}"
+echo "VQW codebook    = ${VQ_CODEBOOK_SIZE}"
+echo "manifest        = ${MANIFEST}"
 echo "============================================================"
