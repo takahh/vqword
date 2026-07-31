@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -69,8 +73,8 @@ class VQWordGNN(nn.Module):
         super().__init__()
         self.hop = hop
 
-        # 過去hop個 + 現在位置
-        self.seq_len = hop + 1
+        # 両側hop個 + 現在位置
+        self.seq_len = 2 * hop + 1
         self.center_idx = hop
         self.center_scale = center_scale
 
@@ -297,17 +301,23 @@ def assign_blockwise(z, centers, k_block=4096):
 
 
 def make_windows(token_ids, hop, pad_id):
+    """Create bilateral windows [i-hop, ..., i, ..., i+hop].
+
+    The target is always the physical BPE token at the center position.
+    Padding is applied independently to the left and right document edges.
+    """
     ids = torch.tensor(token_ids, dtype=torch.long)
 
-    # 左側だけpaddingする
-    padded = F.pad(ids, (hop, 0), value=pad_id)
+    # 両側をpaddingする
+    padded = F.pad(ids, (hop, hop), value=pad_id)
 
     ctx = []
     tgt = []
+    width = 2 * hop + 1
 
     for i in range(len(ids)):
-        # 過去hop個 + 現在位置
-        ctx.append(padded[i:i + hop + 1])
+        # 左hop個 + 現在位置 + 右hop個
+        ctx.append(padded[i:i + width])
         tgt.append(ids[i])
 
     return torch.stack(ctx), torch.tensor(tgt, dtype=torch.long)
@@ -901,7 +911,14 @@ def main():
     ap.add_argument("--tokenizer", default="gpt2")
     ap.add_argument("--max_samples", type=int, default=20000)
     ap.add_argument("--seq_len", type=int, default=256)
-    ap.add_argument("--hop", type=int, default=3)
+    ap.add_argument("--hop", type=int, default=10)
+    ap.add_argument(
+        "--all_hops",
+        action="store_true",
+        help="run bilateral discretization independently for hop=1..max_hop",
+    )
+    ap.add_argument("--min_hop", type=int, default=1)
+    ap.add_argument("--max_hop", type=int, default=10)
 
     # Model
     ap.add_argument("--d_model", type=int, default=256)
@@ -956,6 +973,74 @@ def main():
     ap.add_argument("--out", default="vqword_global_ivf.pt")
 
     args = ap.parse_args()
+
+    # Parent launcher: execute ten fully independent discretization runs.
+    # Each child saves model/dictionary/ID data with a hop-specific filename.
+    if args.all_hops:
+        if args.min_hop < 1 or args.max_hop < args.min_hop:
+            raise ValueError(
+                f"invalid hop range: min_hop={args.min_hop}, max_hop={args.max_hop}"
+            )
+
+        base_out = Path(args.out)
+        suffix = base_out.suffix or ".pt"
+        stem = base_out.stem if base_out.suffix else base_out.name
+        parent = base_out.parent
+        parent.mkdir(parents=True, exist_ok=True)
+
+        # Remove launcher-only and single-hop/output arguments from argv.
+        raw = sys.argv[1:]
+        cleaned = []
+        skip_next = False
+        value_options = {"--hop", "--min_hop", "--max_hop", "--out"}
+        for item in raw:
+            if skip_next:
+                skip_next = False
+                continue
+            if item == "--all_hops":
+                continue
+            if item in value_options:
+                skip_next = True
+                continue
+            if any(item.startswith(opt + "=") for opt in value_options):
+                continue
+            cleaned.append(item)
+
+        manifest = {
+            "type": "bilateral_multihop_discretization",
+            "min_hop": int(args.min_hop),
+            "max_hop": int(args.max_hop),
+            "runs": {},
+        }
+
+        for hop in range(args.min_hop, args.max_hop + 1):
+            hop_out = parent / f"{stem}_bilateral_hop{hop:02d}{suffix}"
+            cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                *cleaned,
+                "--hop",
+                str(hop),
+                "--out",
+                str(hop_out),
+            ]
+            print("=" * 80)
+            print(f"[multi-hop launcher] bilateral hop={hop}")
+            print(f"[multi-hop launcher] out={hop_out}")
+            print("=" * 80)
+            subprocess.run(cmd, check=True)
+
+            manifest["runs"][str(hop)] = {
+                "model": str(hop_out),
+                "dictionary": str(hop_out).replace(".pt", "_dictionary.pt"),
+                "ids": str(hop_out).replace(".pt", "_ids.pt"),
+            }
+
+        manifest_out = parent / f"{stem}_bilateral_hops_{args.min_hop:02d}_{args.max_hop:02d}_manifest.json"
+        manifest_out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        print(f"[multi-hop launcher] manifest={manifest_out}")
+        return
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -1154,6 +1239,9 @@ def main():
         "vocab_type": "byte_bpe",
         "partitioned": False,
         "partition_type": "global_ivf_then_kmeans",
+        "context_type": "bilateral",
+        "hop": int(args.hop),
+        "context_width": int(2 * args.hop + 1),
         "id_scheme": "global_ivf_then_local_kmeans",
         "global_id_min": 0,
         "global_id_max": global_vq_vocab_size - 1,
@@ -1199,6 +1287,9 @@ def main():
             "vocab_type": "byte_bpe",
             "partitioned": False,
             "partition_type": "global_ivf_then_kmeans",
+            "context_type": "bilateral",
+            "hop": int(args.hop),
+            "context_width": int(2 * args.hop + 1),
             "vq_vocab_size": global_vq_vocab_size,
             "id_scheme": "global_ivf_then_local_kmeans",
             "global_id_min": 0,
@@ -1225,6 +1316,9 @@ def main():
             "vocab_type": "byte_bpe",
             "partitioned": False,
             "partition_type": "global_ivf_then_kmeans",
+            "context_type": "bilateral",
+            "hop": int(args.hop),
+            "context_width": int(2 * args.hop + 1),
             "vq_vocab_size": global_vq_vocab_size,
             "id_scheme": "global_ivf_then_local_kmeans",
             "global_id_min": 0,
