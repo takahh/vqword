@@ -35,16 +35,27 @@ fi
 cd /vqword
 git pull
 
-if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale}"
+if [ "$#" -ne 3 ]; then
+  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale} {hop}"
   echo
   echo "Example:"
-  echo "  FTP_PASS='your-password' $0 100k 0.0"
+  echo "  FTP_PASS='your-password' $0 100k 0.0 5"
   exit 1
 fi
 
 CB_SIZE="$1"
 CENTER_SCALE_RAW="$2"
+HOP="$3"
+
+if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
+  echo "[error] HOP must be an integer: ${HOP}"
+  exit 1
+fi
+
+if (( HOP < 1 || HOP > 10 )); then
+  echo "[error] HOP must be between 1 and 10: ${HOP}"
+  exit 1
+fi
 
 CENTER_SCALE="$(
   python -c '
@@ -111,9 +122,6 @@ SEED=0
 D_MODEL=256
 N_LAYERS=3
 DECODER_EPOCHS=3
-
-HOP_MIN=1
-HOP_MAX=10
 
 BPE_ARCHIVE="bpe_wikitext103_${BPE_VOCAB_LABEL}.tar.gz"
 BPE_ARCHIVE_PATH="/vqword/${BPE_ARCHIVE}"
@@ -205,12 +213,16 @@ PY
 # ============================================================
 # Run bilateral discretization independently for hop 1..10
 # ============================================================
-MANIFEST="/vqword/wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral_hops01-10_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}_manifest.tsv"
+
+HOP_PADDED="$(printf '%02d' "${HOP}")"
+
+MANIFEST="/vqword/wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral${HOP_PADDED}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}_manifest.tsv"
 printf "hop\tmodel\tdictionary\tids\n" > "${MANIFEST}"
 
 for HOP in $(seq "${HOP_MIN}" "${HOP_MAX}"); do
-  HOP_PADDED="$(printf '%02d' "${HOP}")"
+HOP_PADDED="$(printf '%02d' "${HOP}")"
 
+{
   TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP_PADDED}_center${CENTER_SCALE}_deconly_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}"
 
   OUT="wikitext103_vqword_${TAG}.pt"
@@ -265,7 +277,7 @@ for HOP in $(seq "${HOP_MIN}" "${HOP_MAX}"); do
       echo "        ${path}"
       exit 1
     fi
-  done
+  }
 
   ls -lh "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"
 
@@ -320,7 +332,8 @@ bye
 EOF_LFTP
 
 echo "============================================================"
-echo "[all multi-HOP runs completed]"
+echo "[single HOP run completed]"
+echo "HOP             = ${HOP}"
 echo "HOP range       = ${HOP_MIN}..${HOP_MAX}"
 echo "context         = bilateral"
 echo "center scale    = ${CENTER_SCALE}"
