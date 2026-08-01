@@ -208,9 +208,8 @@ if tok.vocab_size != expected_vocab_size:
 print("[check] OK")
 print("============================================================")
 PY
-
 # ============================================================
-# Run bilateral discretization independently for hop 1..10
+# Run one bilateral discretization for the specified HOP
 # ============================================================
 
 HOP_PADDED="$(printf '%02d' "${HOP}")"
@@ -218,70 +217,66 @@ HOP_PADDED="$(printf '%02d' "${HOP}")"
 MANIFEST="/vqword/wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral${HOP_PADDED}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}_manifest.tsv"
 printf "hop\tmodel\tdictionary\tids\n" > "${MANIFEST}"
 
-for HOP in $(seq "${HOP_MIN}" "${HOP_MAX}"); do
-HOP_PADDED="$(printf '%02d' "${HOP}")"
+TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP_PADDED}_center${CENTER_SCALE}_deconly_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}"
 
-{
-  TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP_PADDED}_center${CENTER_SCALE}_deconly_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${SEED}"
+OUT="wikitext103_vqword_${TAG}.pt"
+DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
+IDS="wikitext103_vqword_${TAG}_ids.pt"
 
-  OUT="wikitext103_vqword_${TAG}.pt"
-  DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
-  IDS="wikitext103_vqword_${TAG}_ids.pt"
+OUT_PATH="/vqword/${OUT}"
+DICTIONARY_PATH="/vqword/${DICTIONARY}"
+IDS_PATH="/vqword/${IDS}"
 
-  OUT_PATH="/vqword/${OUT}"
-  DICTIONARY_PATH="/vqword/${DICTIONARY}"
-  IDS_PATH="/vqword/${IDS}"
+echo "============================================================"
+echo "[train VQWord]"
+echo "dataset              = WikiText-103"
+echo "tokenizer            = ${TOKENIZER_DIR}"
+echo "context              = bilateral"
+echo "hop                  = ${HOP} left + ${HOP} right"
+echo "context width        = $((2 * HOP + 1))"
+echo "center scale         = ${CENTER_SCALE}"
+echo "VQW codebook         = ${VQ_CODEBOOK_SIZE}"
+echo "output               = ${OUT}"
+echo "============================================================"
 
-  echo "============================================================"
-  echo "[train VQWord]"
-  echo "dataset              = WikiText-103"
-  echo "tokenizer            = ${TOKENIZER_DIR}"
-  echo "context              = bilateral"
-  echo "hop                  = ${HOP} left + ${HOP} right"
-  echo "context width        = $((2 * HOP + 1))"
-  echo "center scale         = ${CENTER_SCALE}"
-  echo "VQW codebook         = ${VQ_CODEBOOK_SIZE}"
-  echo "output               = ${OUT}"
-  echo "============================================================"
+python "${TRAIN_SCRIPT_PATH}" \
+  --dataset Salesforce/wikitext \
+  --dataset_config wikitext-103-raw-v1 \
+  --text_col text \
+  --tokenizer "${TOKENIZER_DIR}" \
+  --max_samples 1000000 \
+  --seq_len 256 \
+  --hop "${HOP}" \
+  --d_model "${D_MODEL}" \
+  --n_layers "${N_LAYERS}" \
+  --center_scale "${CENTER_SCALE}" \
+  --decoder_epochs "${DECODER_EPOCHS}" \
+  --decoder_lr 1e-3 \
+  --decoder_weight_decay 1e-4 \
+  --decoder_eval_size 100000 \
+  --ivf_nlist "${IVF_NLIST}" \
+  --ivf_iters 1 \
+  --ivf_batch_size 8192 \
+  --global_codebook_size "${VQ_CODEBOOK_SIZE}" \
+  --global_kmeans_iters 5 \
+  --global_batch_size 8192 \
+  --batch_size 1024 \
+  --k_block 4096 \
+  --seed "${SEED}" \
+  --out "${OUT_PATH}"
 
-  python "${TRAIN_SCRIPT_PATH}" \
-    --dataset Salesforce/wikitext \
-    --dataset_config wikitext-103-raw-v1 \
-    --text_col text \
-    --tokenizer "${TOKENIZER_DIR}" \
-    --max_samples 1000000 \
-    --seq_len 256 \
-    --hop "${HOP}" \
-    --d_model "${D_MODEL}" \
-    --n_layers "${N_LAYERS}" \
-    --center_scale "${CENTER_SCALE}" \
-    --decoder_epochs "${DECODER_EPOCHS}" \
-    --decoder_lr 1e-3 \
-    --decoder_weight_decay 1e-4 \
-    --decoder_eval_size 100000 \
-    --ivf_nlist "${IVF_NLIST}" \
-    --ivf_iters 1 \
-    --ivf_batch_size 8192 \
-    --global_codebook_size "${VQ_CODEBOOK_SIZE}" \
-    --global_kmeans_iters 5 \
-    --global_batch_size 8192 \
-    --batch_size 1024 \
-    --k_block 4096 \
-    --seed "${SEED}" \
-    --out "${OUT_PATH}"
+for path in "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"; do
+  if [ ! -f "${path}" ]; then
+    echo "[error] Expected output was not generated:"
+    echo "        ${path}"
+    exit 1
+  fi
+done
 
-  for path in "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"; do
-    if [ ! -f "${path}" ]; then
-      echo "[error] Expected output was not generated:"
-      echo "        ${path}"
-      exit 1
-    fi
-  }
+ls -lh "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"
 
-  ls -lh "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"
-
-  # Upload model and dictionary.
-  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
+# Upload model and dictionary.
+lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
@@ -291,11 +286,11 @@ put "${DICTIONARY_PATH}" -o "${DICTIONARY}"
 bye
 EOF_LFTP
 
-  # Split and upload the potentially large ID file.
-  rm -f "${IDS_PATH}.part"*
-  split -b 450M -d -a 3 "${IDS_PATH}" "${IDS_PATH}.part"
+# Split and upload the potentially large ID file.
+rm -f "${IDS_PATH}.part"*
+split -b 450M -d -a 3 "${IDS_PATH}" "${IDS_PATH}.part"
 
-  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
+lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
@@ -304,23 +299,22 @@ mput "${IDS_PATH}.part"*
 bye
 EOF_LFTP
 
-  printf "%s\t%s\t%s\t%s\n" \
-    "${HOP}" \
-    "${OUT}" \
-    "${DICTIONARY}" \
-    "${IDS}" \
-    >> "${MANIFEST}"
+printf "%s\t%s\t%s\t%s\n" \
+  "${HOP}" \
+  "${OUT}" \
+  "${DICTIONARY}" \
+  "${IDS}" \
+  >> "${MANIFEST}"
 
-  echo "============================================================"
-  echo "[completed hop ${HOP}]"
-  echo "model      = ${OUT}"
-  echo "dictionary = ${DICTIONARY}"
-  echo "IDs        = ${IDS}"
-  echo "============================================================"
-done
+echo "============================================================"
+echo "[completed hop ${HOP}]"
+echo "model      = ${OUT}"
+echo "dictionary = ${DICTIONARY}"
+echo "IDs        = ${IDS}"
+echo "============================================================"
 
-# Upload manifest after all 10 runs succeed.
 MANIFEST_NAME="$(basename "${MANIFEST}")"
+
 lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
 set ftp:ssl-allow no
 set net:max-retries 5
@@ -333,7 +327,7 @@ EOF_LFTP
 echo "============================================================"
 echo "[single HOP run completed]"
 echo "HOP             = ${HOP}"
-echo "HOP range       = ${HOP_MIN}..${HOP_MAX}"
+echo "context width   = $((2 * HOP + 1))"
 echo "context         = bilateral"
 echo "center scale    = ${CENTER_SCALE}"
 echo "VQW codebook    = ${VQ_CODEBOOK_SIZE}"
