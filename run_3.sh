@@ -46,14 +46,13 @@ fi
 CB_SIZE="$1"
 CENTER_SCALE_RAW="$2"
 HOP="$3"
-
 if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
   echo "[error] HOP must be an integer: ${HOP}"
   exit 1
 fi
 
-if (( HOP < 1 || HOP > 10 )); then
-  echo "[error] HOP must be between 1 and 10: ${HOP}"
+if (( HOP < 0 || HOP > 10 )); then
+  echo "[error] HOP must be between 0 and 10: ${HOP}"
   exit 1
 fi
 
