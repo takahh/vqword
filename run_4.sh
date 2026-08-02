@@ -22,46 +22,14 @@ cd /vqword
 git pull
 
 # ============================================================
-# Step4: TinyStoriesにVQWord IDを付与
-#
-# 入力:
-#   1. WikiText-103で作成したBPE tokenizer
-#   2. WikiText-103で作成したVQWord tokenizer/checkpoint
-#
-# 出力:
-#   TinyStoriesのBPE ID + VQWord ID
+# 共通設定
 # ============================================================
 
 BPE_VOCAB_LABEL=50257
+VQ_CODEBOOK_LABEL=100k
+VQ_CODEBOOK_SIZE=100000
 DISCRETIZATION_SEED=0
 
-VQ_CODEBOOK_LABEL="$1"
-CENTER_SCALE="$2"
-
-case "${VQ_CODEBOOK_LABEL}" in
-    25k)
-        VQ_CODEBOOK_SIZE=25000
-        ;;
-    50k)
-        VQ_CODEBOOK_SIZE=50000
-        ;;
-    100k)
-        VQ_CODEBOOK_SIZE=100000
-        ;;
-    200k)
-        VQ_CODEBOOK_SIZE=200000
-        ;;
-    *)
-        echo "Unsupported VQ vocabulary: ${VQ_CODEBOOK_LABEL}"
-        exit 1
-        ;;
-esac
-
-# ============================================================
-# 75 HOP / decoder-only checkpoint
-# ============================================================
-
-HOP=75
 IVF_NLIST=256
 DECODER_EPOCHS=3
 MODEL_VARIANT="deconly"
@@ -71,60 +39,23 @@ SEQ_LEN=256
 BATCH_SIZE=512
 K_BLOCK=4096
 
-# checkpoint名と完全に一致させる
-BASE_TAG="bpe${BPE_VOCAB_LABEL}_left${HOP}_center1_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
-
-VQ_TAG="${BASE_TAG}"
-
 BPE_ARCHIVE="bpe_wikitext103_50257.tar.gz"
 TOKENIZER_DIR="/vqword/bpe_wikitext103_50257"
-
-VQ_CKPT="wikitext103_vqword_${VQ_TAG}.pt"
-VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
-
-OUT="tinystories_vqword_${VQ_TAG}_ids.pt"
-OUT_PATH="/vqword/${OUT}"
-
 ASSIGN_SCRIPT="/vqword/assign_vqword_ids.py"
-
-# ============================================================
-# FTP設定
-# ============================================================
 
 FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
 FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
-echo "============================================================"
-echo "[configuration]"
-echo "BPE tokenizer        = ${BPE_ARCHIVE}"
-echo "VQ checkpoint        = ${VQ_CKPT}"
-echo "VQ codebook label    = ${VQ_CODEBOOK_LABEL}"
-echo "VQ codebook size     = ${VQ_CODEBOOK_SIZE}"
-echo "VQ seed              = ${DISCRETIZATION_SEED}"
-echo "context              = left ${HOP}"
-echo "TinyStories samples  = ${MAX_SAMPLES}"
-echo "sequence length      = ${SEQ_LEN}"
-echo "batch size           = ${BATCH_SIZE}"
-echo "output               = ${OUT}"
-echo "center scale        = ${CENTER_SCALE}"
-echo "============================================================"
-
 # ============================================================
-# 古いファイルを削除
+# BPE tokenizerを一度だけ取得・展開
 # ============================================================
 
 rm -f "/vqword/${BPE_ARCHIVE}"
-rm -f "${VQ_CKPT_PATH}"
-rm -f "${OUT_PATH}"
 rm -rf "${TOKENIZER_DIR}"
 
-# ============================================================
-# BPE tokenizerとVQWord checkpointをFTPから取得
-# ============================================================
-
 echo "============================================================"
-echo "[download files from FTP]"
+echo "[download BPE tokenizer]"
 echo "============================================================"
 
 lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
@@ -136,44 +67,16 @@ set cmd:fail-exit yes
 get "${BPE_ARCHIVE}" \
   -o "/vqword/${BPE_ARCHIVE}"
 
-get "${VQ_CKPT}" \
-  -o "${VQ_CKPT_PATH}"
-
 bye
 EOF
-
-echo "============================================================"
-echo "[downloaded files]"
-echo "============================================================"
-
-ls -lh \
-  "/vqword/${BPE_ARCHIVE}" \
-  "${VQ_CKPT_PATH}"
-
-# ============================================================
-# BPE tokenizerを展開
-# ============================================================
-
-echo "============================================================"
-echo "[extract BPE tokenizer]"
-echo "============================================================"
 
 tar -xzf "/vqword/${BPE_ARCHIVE}" -C /vqword
 
 if [ ! -d "${TOKENIZER_DIR}" ]; then
   echo "[error] Tokenizer directory was not created:"
   echo "        ${TOKENIZER_DIR}"
-  echo
-  echo "[archive contents]"
-  tar -tzf "/vqword/${BPE_ARCHIVE}" | head -50
   exit 1
 fi
-
-ls -lh "${TOKENIZER_DIR}"
-
-# ============================================================
-# 必要ファイルを確認
-# ============================================================
 
 if [ ! -f "${ASSIGN_SCRIPT}" ]; then
   echo "[error] Assignment script was not found:"
@@ -181,40 +84,70 @@ if [ ! -f "${ASSIGN_SCRIPT}" ]; then
   exit 1
 fi
 
-if [ ! -f "${VQ_CKPT_PATH}" ]; then
-  echo "[error] VQWord checkpoint was not found:"
-  echo "        ${VQ_CKPT_PATH}"
-  exit 1
-fi
+# ============================================================
+# HOP 0〜10
+# ============================================================
 
-python - <<PY
+for HOP in $(seq 0 10); do
+  HOP2=$(printf "%02d" "${HOP}")
+
+  BASE_TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center0_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+
+  VQ_CKPT="wikitext103_vqword_${BASE_TAG}.pt"
+  VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
+
+  OUT="tinystories_vqword_${BASE_TAG}_ids.pt"
+  OUT_PATH="/vqword/${OUT}"
+
+  echo
+  echo "============================================================"
+  echo "[HOP ${HOP}]"
+  echo "checkpoint = ${VQ_CKPT}"
+  echo "output     = ${OUT}"
+  echo "============================================================"
+
+  rm -f "${VQ_CKPT_PATH}"
+  rm -f "${OUT_PATH}"
+  rm -f "${OUT_PATH}.part"*
+
+  # ----------------------------------------------------------
+  # checkpoint取得
+  # ----------------------------------------------------------
+
+  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+set ftp:ssl-allow no
+set net:max-retries 5
+set net:timeout 30
+set cmd:fail-exit yes
+
+get "${VQ_CKPT}" \
+  -o "${VQ_CKPT_PATH}"
+
+bye
+EOF
+
+  if [ ! -f "${VQ_CKPT_PATH}" ]; then
+    echo "[error] checkpoint not found: ${VQ_CKPT_PATH}"
+    exit 1
+  fi
+
+  # ----------------------------------------------------------
+  # checkpoint確認
+  # ----------------------------------------------------------
+
+  python - <<PY
 import torch
-from transformers import AutoTokenizer
 
-tokenizer_path = "${TOKENIZER_DIR}"
-checkpoint_path = "${VQ_CKPT_PATH}"
-
-print("============================================================")
-print("[input verification]")
-
-tok = AutoTokenizer.from_pretrained(tokenizer_path)
-
-print("tokenizer:", tokenizer_path)
-print("vocab_size:", tok.vocab_size)
-print("len(tokenizer):", len(tok))
-print("pad_token_id:", tok.pad_token_id)
-print("unk_token_id:", tok.unk_token_id)
+path = "${VQ_CKPT_PATH}"
+expected_hop = int("${HOP}")
+expected_vq_vocab = int("${VQ_CODEBOOK_SIZE}")
+expected_bpe_vocab = int("${BPE_VOCAB_LABEL}")
 
 ckpt = torch.load(
-    checkpoint_path,
+    path,
     map_location="cpu",
     weights_only=False,
 )
-
-print("checkpoint:", checkpoint_path)
-print("checkpoint keys:", list(ckpt.keys()))
-print("vq_vocab_size:", ckpt.get("vq_vocab_size"))
-print("tokenizer_name:", ckpt.get("tokenizer_name"))
 
 required = {
     "model",
@@ -226,81 +159,64 @@ required = {
 }
 
 missing = sorted(required - set(ckpt.keys()))
-
 if missing:
-    raise ValueError(
-        f"Missing checkpoint keys: {missing}"
-    )
+    raise ValueError(f"Missing checkpoint keys: {missing}")
 
-expected_vq_vocab_size = int("${VQ_CODEBOOK_SIZE}")
-expected_bpe_vocab_size = int("${BPE_VOCAB_LABEL}")
-
-actual_vq_vocab_size = int(ckpt["vq_vocab_size"])
-
-if actual_vq_vocab_size != expected_vq_vocab_size:
-    raise ValueError(
-        "VQ vocabulary mismatch: "
-        f"expected={expected_vq_vocab_size:,}, "
-        f"actual={actual_vq_vocab_size:,}"
-    )
-
-model_vocab_size = int(
+args = ckpt["args"]
+actual_hop = int(args["hop"])
+actual_vq_vocab = int(ckpt["vq_vocab_size"])
+actual_bpe_vocab = int(
     ckpt["model"]["tok_emb.weight"].shape[0]
 )
 
-if model_vocab_size != expected_bpe_vocab_size:
+if actual_hop != expected_hop:
     raise ValueError(
-        "BPE vocabulary mismatch: "
-        f"expected={expected_bpe_vocab_size:,}, "
-        f"actual={model_vocab_size:,}"
+        f"HOP mismatch: expected={expected_hop}, actual={actual_hop}"
     )
 
-print("[check] OK")
-print("============================================================")
+if actual_vq_vocab != expected_vq_vocab:
+    raise ValueError(
+        f"VQ vocab mismatch: expected={expected_vq_vocab}, "
+        f"actual={actual_vq_vocab}"
+    )
+
+if actual_bpe_vocab != expected_bpe_vocab:
+    raise ValueError(
+        f"BPE vocab mismatch: expected={expected_bpe_vocab}, "
+        f"actual={actual_bpe_vocab}"
+    )
+
+print("[checkpoint check] OK")
+print("hop:", actual_hop)
+print("vq_vocab_size:", actual_vq_vocab)
+print("bpe_vocab_size:", actual_bpe_vocab)
 PY
 
-# ============================================================
-# TinyStoriesにVQWord IDを付与
-#
-# TinyStoriesはPython内部のload_dataset()で取得される
-# ============================================================
+  # ----------------------------------------------------------
+  # TinyStories ID付与
+  # ----------------------------------------------------------
 
-echo "============================================================"
-echo "[assign VQWord IDs to TinyStories]"
-echo "============================================================"
+  python "${ASSIGN_SCRIPT}" \
+    --ckpt "${VQ_CKPT_PATH}" \
+    --dataset roneneldan/TinyStories \
+    --split train \
+    --text_col text \
+    --max_samples "${MAX_SAMPLES}" \
+    --seq_len "${SEQ_LEN}" \
+    --batch_size "${BATCH_SIZE}" \
+    --k_block "${K_BLOCK}" \
+    --tokenizer "${TOKENIZER_DIR}" \
+    --out "${OUT_PATH}"
 
-python "${ASSIGN_SCRIPT}" \
-  --ckpt "${VQ_CKPT_PATH}" \
-  --dataset roneneldan/TinyStories \
-  --split train \
-  --text_col text \
-  --max_samples "${MAX_SAMPLES}" \
-  --seq_len "${SEQ_LEN}" \
-  --batch_size "${BATCH_SIZE}" \
-  --k_block "${K_BLOCK}" \
-  --tokenizer "${TOKENIZER_DIR}" \
-  --out "${OUT_PATH}"
+  # ----------------------------------------------------------
+  # 出力確認
+  # ----------------------------------------------------------
 
-# ============================================================
-# 出力を確認
-# ============================================================
-
-if [ ! -f "${OUT_PATH}" ]; then
-  echo "[error] Output file was not created:"
-  echo "        ${OUT_PATH}"
-  exit 1
-fi
-
-echo "============================================================"
-echo "[generated file]"
-echo "============================================================"
-
-ls -lh "${OUT_PATH}"
-
-python - <<PY
+  python - <<PY
 import torch
 
 path = "${OUT_PATH}"
+expected_hop = int("${HOP}")
 
 data = torch.load(
     path,
@@ -308,73 +224,55 @@ data = torch.load(
     weights_only=False,
 )
 
-print("============================================================")
-print("[output verification]")
-print("path:", path)
-print("keys:", list(data.keys()))
-
 required = {
     "samples",
     "vq_ids_flat",
     "token_ids_flat",
     "vq_vocab_size",
     "vq_pad_id",
+    "hop",
 }
 
 missing = sorted(required - set(data.keys()))
-
 if missing:
-    raise ValueError(
-        f"Missing output keys: {missing}"
-    )
+    raise ValueError(f"Missing output keys: {missing}")
 
 token_ids = data["token_ids_flat"].long().reshape(-1)
 vq_ids = data["vq_ids_flat"].long().reshape(-1)
 
-print("samples:", f"{len(data['samples']):,}")
-print("token IDs:", f"{token_ids.numel():,}")
-print("VQWord IDs:", f"{vq_ids.numel():,}")
-print("token min/max:", int(token_ids.min()), int(token_ids.max()))
-print("VQWord min/max:", int(vq_ids.min()), int(vq_ids.max()))
-print("vq_vocab_size:", data["vq_vocab_size"])
-print("vq_pad_id:", data["vq_pad_id"])
-print("hop:", data.get("hop"))
-print("tokenizer:", data.get("tokenizer"))
-print("checkpoint:", data.get("ckpt"))
-
 if token_ids.numel() != vq_ids.numel():
     raise ValueError(
-        "Token/VQWord length mismatch: "
-        f"token={token_ids.numel():,}, "
-        f"vq={vq_ids.numel():,}"
+        f"Length mismatch: token={token_ids.numel()}, "
+        f"vq={vq_ids.numel()}"
     )
 
-if int(vq_ids.max()) >= int(data["vq_vocab_size"]):
+if int(data["hop"]) != expected_hop:
     raise ValueError(
-        "VQWord ID is out of range: "
-        f"max={int(vq_ids.max()):,}, "
-        f"vocab={int(data['vq_vocab_size']):,}"
+        f"Output HOP mismatch: expected={expected_hop}, "
+        f"actual={data['hop']}"
     )
 
-print("[check] OK")
-print("============================================================")
+if vq_ids.numel() and int(vq_ids.max()) >= int(data["vq_vocab_size"]):
+    raise ValueError(
+        f"VQ ID out of range: max={int(vq_ids.max())}, "
+        f"vocab={int(data['vq_vocab_size'])}"
+    )
+
+print("[output check] OK")
+print("samples:", len(data["samples"]))
+print("tokens:", token_ids.numel())
+print("hop:", data["hop"])
+print("vq min/max:", int(vq_ids.min()), int(vq_ids.max()))
 PY
 
-# ============================================================
-# FTPへアップロード
-# ============================================================
+  # ----------------------------------------------------------
+  # FTPアップロード
+  # ----------------------------------------------------------
 
-echo "============================================================"
-echo "[upload output]"
-echo "============================================================"
+  FILE_SIZE=$(stat -c%s "${OUT_PATH}")
 
-FILE_SIZE=$(stat -c%s "${OUT_PATH}")
-
-# Lolipopの単一ファイル上限を考慮し、
-# 1.8GB未満ならそのまま、超える場合は450MBずつに分割
-if [ "${FILE_SIZE}" -lt 1800000000 ]; then
-
-  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+  if [ "${FILE_SIZE}" -lt 1800000000 ]; then
+    lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
@@ -385,23 +283,15 @@ put "${OUT_PATH}" \
 
 bye
 EOF
+  else
+    split \
+      -b 450M \
+      -d \
+      -a 3 \
+      "${OUT_PATH}" \
+      "${OUT_PATH}.part"
 
-else
-
-  echo "[note] Output is large; splitting before upload"
-
-  rm -f "${OUT_PATH}.part"*
-
-  split \
-    -b 450M \
-    -d \
-    -a 3 \
-    "${OUT_PATH}" \
-    "${OUT_PATH}.part"
-
-  ls -lh "${OUT_PATH}.part"*
-
-  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+    lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
@@ -411,16 +301,15 @@ mput "${OUT_PATH}.part"*
 
 bye
 EOF
+  fi
 
-fi
+  echo "[completed HOP ${HOP}] ${OUT}"
 
+  # 次のHOP用に巨大checkpointだけ削除
+  rm -f "${VQ_CKPT_PATH}"
+done
+
+echo
 echo "============================================================"
-echo "[completed]"
-echo "VQ checkpoint = ${VQ_CKPT}"
-echo "VQ vocab label = ${VQ_CODEBOOK_LABEL}"
-echo "VQ vocab size  = ${VQ_CODEBOOK_SIZE}"
-echo "VQ seed              = ${DISCRETIZATION_SEED}"
-echo "BPE tokenizer = ${BPE_ARCHIVE}"
-echo "TinyStories   = ${MAX_SAMPLES} samples"
-echo "output        = ${OUT}"
+echo "[all HOP 0-10 completed]"
 echo "============================================================"
