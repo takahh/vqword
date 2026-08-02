@@ -145,6 +145,15 @@ def main():
         n_layers=int(cargs["n_layers"]),
         center_scale=float(cargs.get("center_scale", 1.0)),
     ).to(device)
+
+    ckpt_pos_shape = ckpt["model"]["pos_emb.weight"].shape
+
+    if model.pos_emb.weight.shape != ckpt_pos_shape:
+        model.pos_emb = torch.nn.Embedding(
+            ckpt_pos_shape[0],
+            ckpt_pos_shape[1],
+        ).to(device)
+
     model.load_state_dict(ckpt["model"])
     model.eval()
 
