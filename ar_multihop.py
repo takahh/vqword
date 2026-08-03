@@ -874,6 +874,23 @@ def main():
         token_vocab_size=token_vocab_size,
         device=device,
     )
+    # --------------------------------------------------
+    # sanity check
+    # --------------------------------------------------
+    print("==================================================")
+    print("[oracle decoder sanity check]")
+
+    ids = hop_vq_ids_flat[10][:100000].to(device)
+    target = token_ids_flat[:100000].to(device)
+
+    with torch.no_grad():
+        logits = decoder(centers[ids])
+        loss = F.cross_entropy(logits, target)
+        top1 = (logits.argmax(dim=-1) == target).float().mean()
+
+    print(f"oracle ppl  = {math.exp(loss.item()):.4f}")
+    print(f"oracle top1 = {top1.item():.4f}")
+    print("==================================================")
 
     dictionary_vq_size = int(
         dictionary_raw.get("vq_vocab_size", vq_vocab_size)
