@@ -229,6 +229,11 @@ echo "[download HOP0-10 TinyStories ID files]"
 echo "============================================================"
 
 for HOP in $(seq 0 10); do
+  if [ -s "${HOP_DATA_PATHS[HOP]}" ]; then
+    echo "[reuse data HOP${HOP}] ${HOP_DATA_PATHS[HOP]}"
+    continue
+  fi
+
   echo "[download data HOP${HOP}] ${HOP_DATA_FILES[HOP]}"
 
   lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
