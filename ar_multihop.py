@@ -1100,6 +1100,11 @@ def main():
         }
         history.append(row)
 
+        marginal_text = " ".join(
+            f"@{k}={test_metrics['marginal_bpe_ppl'][int(k)]:.2f}"
+            for k in args.marginal_topks
+        )
+
         print(
             f"[epoch {epoch}] "
             f"valid_vq_ppl={valid_metrics['vq_ppl']:.4f} "
@@ -1109,15 +1114,11 @@ def main():
             f"valid_bpe_top1={valid_metrics['pipeline_bpe_top1']:.4f} "
             f"test_vq_ppl={test_metrics['vq_ppl']:.4f} "
             f"test_hard_bpe_ppl={test_metrics['pipeline_bpe_hard_ppl']:.4f} "
-            f"test_marginal_ppl@1={test_metrics['marginal_bpe_ppl'][1]:.2f} "
-            f"@8={test_metrics['marginal_bpe_ppl'][8]:.2f} "
-            f"@32={test_metrics['marginal_bpe_ppl'][32]:.2f} "
-            f"@128={test_metrics['marginal_bpe_ppl'][128]:.2f} "
+            f"test_marginal_ppl {marginal_text} "
             f"test_bpe_top1={test_metrics['pipeline_bpe_top1']:.4f} "
             f"oracle_bpe_ppl={test_metrics['oracle_bpe_ppl']:.4f} "
             f"oracle_bpe_top1={test_metrics['oracle_bpe_top1']:.4f}"
         )
-
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
