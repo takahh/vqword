@@ -258,6 +258,11 @@ echo "[download HOP0-10 codebooks]"
 echo "============================================================"
 
 for HOP in $(seq 0 10); do
+  if [ -s "${HOP_CODEBOOK_PATHS[HOP]}" ]; then
+    echo "[reuse codebook HOP${HOP}] ${HOP_CODEBOOK_PATHS[HOP]}"
+    continue
+  fi
+
   echo "[download codebook HOP${HOP}] ${HOP_CODEBOOK_FILES[HOP]}"
 
   lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
@@ -280,8 +285,12 @@ done
 echo "============================================================"
 echo "[download HOP10 decoder dictionary]"
 echo "============================================================"
+if [ -s "${DICTIONARY_PATH}" ]; then
+  echo "[reuse dictionary] ${DICTIONARY_PATH}"
+else
+  echo "[download dictionary] ${DICTIONARY}"
 
-lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 60
@@ -292,6 +301,7 @@ get "${DICTIONARY}" \
 
 bye
 EOF
+fi
 
 # ============================================================
 # Verify downloaded files exist
