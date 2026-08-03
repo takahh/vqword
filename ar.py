@@ -22,6 +22,365 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
+class MultiHopVQARDataset(Dataset):
+    def __init__(
+        self,
+        samples,
+        token_ids_flat,
+        hop_vq_ids_flat,
+        vq_pad_id,
+        max_len=512,
+        target_hop=10,
+    ):
+        if len(hop_vq_ids_flat) != 11:
+            raise ValueError("Exactly 11 HOP ID tensors are required")
+
+        self.samples = []
+        self.token_ids_flat = token_ids_flat
+        self.hop_vq_ids_flat = hop_vq_ids_flat
+        self.vq_pad_id = int(vq_pad_id)
+        self.max_len = int(max_len)
+        self.target_hop = int(target_hop)
+
+        for sample in samples:
+            start = int(sample["start"])
+            end = int(sample["end"])
+            length = end - start
+
+            if 2 <= length <= self.max_len + 1:
+                self.samples.append((start, end))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        start, end = self.samples[index]
+        length = end - start
+
+        # 予測対象はローカル位置 1 ... length-1
+        target_positions = torch.arange(1, length)
+
+        # [L-1, 11]
+        vq_context = torch.full(
+            (length - 1, 11),
+            self.vq_pad_id,
+            dtype=torch.long,
+        )
+
+        # 有効HOPを表すマスク
+        hop_valid = torch.zeros(
+            (length - 1, 11),
+            dtype=torch.bool,
+        )
+
+        for hop in range(11):
+            # target t に対して source = t-hop-1
+            source_positions = target_positions - hop - 1
+            valid = source_positions >= 0
+
+            if valid.any():
+                global_source = start + source_positions[valid]
+
+                vq_context[valid, hop] = (
+                    self.hop_vq_ids_flat[hop][global_source]
+                )
+                hop_valid[valid, hop] = True
+
+        # BPE補助入力には直前の物理トークンを使用
+        tok_in = self.token_ids_flat[
+            start:end - 1
+        ].long()
+
+        # 出力はHOP10 VQW
+        vq_y = self.hop_vq_ids_flat[self.target_hop][
+            start + 1:end
+        ].long()
+
+        # 最終BPE評価ターゲット
+        tok_y = self.token_ids_flat[
+            start + 1:end
+        ].long()
+
+        return {
+            "vq_context": vq_context,
+            "hop_valid": hop_valid,
+            "tok_in": tok_in,
+            "vq_y": vq_y,
+            "tok_y": tok_y,
+        }
+
+def collate_multihop(
+    batch,
+    vq_pad_id,
+    tok_pad_id,
+):
+    batch_size = len(batch)
+    max_len = max(
+        item["vq_context"].size(0)
+        for item in batch
+    )
+
+    vq_context = torch.full(
+        (batch_size, max_len, 11),
+        vq_pad_id,
+        dtype=torch.long,
+    )
+
+    hop_valid = torch.zeros(
+        (batch_size, max_len, 11),
+        dtype=torch.bool,
+    )
+
+    tok_in = torch.full(
+        (batch_size, max_len),
+        tok_pad_id,
+        dtype=torch.long,
+    )
+
+    vq_y = torch.full(
+        (batch_size, max_len),
+        -100,
+        dtype=torch.long,
+    )
+
+    tok_y = torch.full(
+        (batch_size, max_len),
+        -100,
+        dtype=torch.long,
+    )
+
+    attention_mask = torch.zeros(
+        (batch_size, max_len),
+        dtype=torch.bool,
+    )
+
+    for batch_index, item in enumerate(batch):
+        n = item["vq_context"].size(0)
+
+        vq_context[batch_index, :n] = item["vq_context"]
+        hop_valid[batch_index, :n] = item["hop_valid"]
+        tok_in[batch_index, :n] = item["tok_in"]
+        vq_y[batch_index, :n] = item["vq_y"]
+        tok_y[batch_index, :n] = item["tok_y"]
+        attention_mask[batch_index, :n] = True
+
+    return (
+        vq_context,
+        hop_valid,
+        tok_in,
+        vq_y,
+        tok_y,
+        attention_mask,
+    )
+
+class FrozenCenterEmbedding(nn.Module):
+    def __init__(self, centers):
+        super().__init__()
+
+        centers = F.normalize(
+            centers.float(),
+            dim=-1,
+        )
+
+        zero = torch.zeros(
+            1,
+            centers.size(1),
+            dtype=centers.dtype,
+        )
+
+        weight = torch.cat(
+            [centers, zero],
+            dim=0,
+        )
+
+        self.embedding = nn.Embedding.from_pretrained(
+            weight,
+            freeze=True,
+            padding_idx=centers.size(0),
+        )
+
+    def forward(self, ids):
+        return self.embedding(ids)
+
+class MultiHopVQAutoregressiveLM(nn.Module):
+    def __init__(
+        self,
+        hop_centers,
+        target_vq_vocab_size,
+        token_vocab_size,
+        bpe_input_weight=0.01,
+        d_model=256,
+        n_layers=6,
+        n_heads=8,
+        dropout=0.1,
+        max_len=512,
+    ):
+        super().__init__()
+
+        if len(hop_centers) != 11:
+            raise ValueError("Expected 11 center matrices")
+
+        self.num_hops = 11
+        self.d_model = int(d_model)
+        self.target_vq_vocab_size = int(target_vq_vocab_size)
+        self.token_vocab_size = int(token_vocab_size)
+
+        self.vq_pad_id = self.target_vq_vocab_size
+        self.tok_pad_id = self.token_vocab_size
+        self.bpe_input_weight = float(bpe_input_weight)
+
+        # HOPごとの固定center lookup
+        self.center_embeddings = nn.ModuleList([
+            FrozenCenterEmbedding(centers)
+            for centers in hop_centers
+        ])
+
+        # HOPごとの座標系をARの共通空間へ変換
+        self.hop_projections = nn.ModuleList([
+            nn.Linear(
+                centers.size(1),
+                d_model,
+                bias=False,
+            )
+            for centers in hop_centers
+        ])
+
+        # HOPごとの重要度
+        self.hop_gates = nn.Parameter(
+            torch.zeros(self.num_hops)
+        )
+
+        self.context_norm = nn.LayerNorm(d_model)
+
+        self.tok_emb = nn.Embedding(
+            token_vocab_size + 1,
+            d_model,
+            padding_idx=self.tok_pad_id,
+        )
+
+        self.bpe_proj = nn.Linear(
+            d_model,
+            d_model,
+            bias=False,
+        )
+
+        with torch.no_grad():
+            self.bpe_proj.weight.copy_(
+                torch.eye(d_model)
+            )
+
+        self.pos_emb = nn.Embedding(
+            max_len,
+            d_model,
+        )
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            layer,
+            num_layers=n_layers,
+        )
+
+        self.norm = nn.LayerNorm(d_model)
+
+        self.vq_head = nn.Linear(
+            d_model,
+            target_vq_vocab_size,
+        )
+
+    def forward(
+        self,
+        vq_context,
+        hop_valid,
+        tok_in,
+        key_padding_mask=None,
+    ):
+        # vq_context: [B, L, 11]
+        batch_size, seq_len, num_hops = vq_context.shape
+
+        if num_hops != self.num_hops:
+            raise ValueError(
+                f"Expected {self.num_hops} HOPs, got {num_hops}"
+            )
+
+        context_h = torch.zeros(
+            batch_size,
+            seq_len,
+            self.d_model,
+            device=vq_context.device,
+            dtype=self.vq_head.weight.dtype,
+        )
+
+        # positive scalar weight
+        gate_values = F.softplus(self.hop_gates)
+
+        valid_count = hop_valid.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1)
+
+        for hop in range(self.num_hops):
+            ids = vq_context[:, :, hop]
+
+            center_h = self.center_embeddings[hop](ids)
+            projected = self.hop_projections[hop](center_h)
+
+            valid = hop_valid[:, :, hop].unsqueeze(-1)
+
+            context_h = context_h + (
+                gate_values[hop]
+                * projected
+                * valid
+            )
+
+        # 入力数が増えるほど大きくならないよう正規化
+        context_h = context_h / valid_count.sqrt()
+        context_h = self.context_norm(context_h)
+
+        # 直前BPEを小さな補助入力として使用
+        bpe_h = self.bpe_proj(
+            self.tok_emb(tok_in)
+        )
+
+        h = (
+            context_h
+            + self.bpe_input_weight * bpe_h
+        )
+
+        pos = torch.arange(
+            seq_len,
+            device=h.device,
+        )[None, :]
+
+        h = h + self.pos_emb(pos)
+
+        causal_mask = torch.triu(
+            torch.ones(
+                seq_len,
+                seq_len,
+                dtype=torch.bool,
+                device=h.device,
+            ),
+            diagonal=1,
+        )
+
+        h = self.transformer(
+            h,
+            mask=causal_mask,
+            src_key_padding_mask=key_padding_mask,
+        )
+
+        h = self.norm(h)
+
+        return self.vq_head(h)
+    
 class VQARDataset(Dataset):
     def __init__(self, samples, token_ids_flat, vq_ids_flat, max_len=512):
         self.samples = []
@@ -601,6 +960,12 @@ def main():
         default=0,
         help="maximum evaluated positions per batch; 0 means all valid positions",
     )
+    ap.add_argument(
+        "--hop_data",
+        nargs=11,
+        required=True,
+        help="HOP0 ... HOP10 TinyStories ID files",
+    )
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -644,6 +1009,47 @@ def main():
         map_location="cpu",
         weights_only=False,
     )
+    hop_data = [
+        torch.load(path, map_location="cpu", weights_only=False)
+        for path in args.hop_data
+    ]
+    reference = hop_data[0]
+
+    samples = reference["samples"]
+    token_ids_flat = reference["token_ids_flat"].long().reshape(-1)
+
+    hop_vq_ids_flat = [
+        data["vq_ids_flat"].long().reshape(-1)
+        for data in hop_data
+    ]
+    for hop, data in enumerate(hop_data):
+        current_tokens = data["token_ids_flat"].long().reshape(-1)
+
+        if not torch.equal(token_ids_flat, current_tokens):
+            raise ValueError(
+                f"HOP{hop}: token_ids_flat does not match HOP0"
+            )
+
+        if len(data["samples"]) != len(samples):
+            raise ValueError(
+                f"HOP{hop}: sample count mismatch"
+            )
+
+        for i, (ref_sample, current_sample) in enumerate(
+                zip(samples, data["samples"])
+        ):
+            for key in ("sample_idx", "start", "end", "length"):
+                if int(ref_sample[key]) != int(current_sample[key]):
+                    raise ValueError(
+                        f"HOP{hop}: sample metadata mismatch "
+                        f"at sample={i}, key={key}"
+                    )
+
+        recorded_hop = int(data.get("hop", -1))
+        if recorded_hop != hop:
+            raise ValueError(
+                f"Expected HOP{hop} file, but metadata says HOP{recorded_hop}"
+            )
 
     decoder_state = dictionary_preview.get("decoder_state_dict")
     if decoder_state is None:
