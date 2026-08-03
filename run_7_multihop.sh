@@ -219,12 +219,6 @@ rm -f \
   "${BEST_PATH}" \
   "${LOG_PATH}"
 
-for HOP in $(seq 0 10); do
-  rm -f "${HOP_DATA_PATHS[HOP]}"
-  rm -f "${HOP_CODEBOOK_PATHS[HOP]}"
-done
-
-rm -f "${DICTIONARY_PATH}"
 
 # ============================================================
 # Download HOP0-10 ID files
