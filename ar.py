@@ -182,6 +182,8 @@ class FrozenCenterEmbedding(nn.Module):
             dim=-1,
         )
 
+        self.padding_idx = int(centers.size(0))
+
         zero = torch.zeros(
             1,
             centers.size(1),
@@ -193,14 +195,20 @@ class FrozenCenterEmbedding(nn.Module):
             dim=0,
         )
 
-        self.embedding = nn.Embedding.from_pretrained(
+        # GPUには移動するが、state_dictには保存しない
+        self.register_buffer(
+            "weight",
             weight,
-            freeze=True,
-            padding_idx=centers.size(0),
+            persistent=False,
         )
 
     def forward(self, ids):
-        return self.embedding(ids)
+        return F.embedding(
+            ids,
+            self.weight,
+            padding_idx=self.padding_idx,
+        )
+
 
 class MultiHopVQAutoregressiveLM(nn.Module):
     def __init__(
@@ -380,7 +388,7 @@ class MultiHopVQAutoregressiveLM(nn.Module):
         h = self.norm(h)
 
         return self.vq_head(h)
-    
+
 class VQARDataset(Dataset):
     def __init__(self, samples, token_ids_flat, vq_ids_flat, max_len=512):
         self.samples = []
@@ -810,7 +818,8 @@ def evaluate(
     total_oracle_top5 = 0
 
     for (
-            vq_in,
+            vq_context,
+            hop_valid,
             tok_in,
             vq_y,
             tok_y,
@@ -820,15 +829,17 @@ def evaluate(
         desc="[eval]",
         leave=False,
     ):
-        vq_in = vq_in.to(device)
+        vq_context = vq_context.to(device)
+        hop_valid = hop_valid.to(device)
+        tok_in = tok_in.to(device)
         vq_y = vq_y.to(device)
         tok_y = tok_y.to(device)
-        tok_in = tok_in.to(device)
         attention_mask = attention_mask.to(device)
 
         vq_logits = model(
-            vq_in,
-            tok_in,
+            vq_context=vq_context,
+            hop_valid=hop_valid,
+            tok_in=tok_in,
             key_padding_mask=~attention_mask,
         )
         vq_loss = F.cross_entropy(
@@ -936,7 +947,6 @@ def evaluate(
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--data", required=True)
     ap.add_argument("--dictionary", required=True)
     ap.add_argument("--codebook", required=True)
     ap.add_argument("--out", default="ar_vqw_to_vqw_to_bpe.pt")
@@ -965,6 +975,12 @@ def main():
         nargs=11,
         required=True,
         help="HOP0 ... HOP10 TinyStories ID files",
+    )
+    ap.add_argument(
+        "--hop_codebooks",
+        nargs=11,
+        required=True,
+        help="HOP0 ... HOP10 codebook checkpoint files",
     )
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=20)
@@ -1001,9 +1017,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {device}")
 
-    data = torch.load(args.data, map_location="cpu", weights_only=False)
-    samples, token_ids_flat, vq_ids_flat = normalize_data_format(data)
-
     dictionary_preview = torch.load(
         args.dictionary,
         map_location="cpu",
@@ -1015,7 +1028,7 @@ def main():
     ]
     reference = hop_data[0]
 
-    samples = reference["samples"]
+    samples = list(reference["samples"])
     token_ids_flat = reference["token_ids_flat"].long().reshape(-1)
 
     hop_vq_ids_flat = [
@@ -1065,6 +1078,12 @@ def main():
         map_location="cpu",
         weights_only=False,
     )
+    codebook_hop = int(codebook_raw.get("args", {}).get("hop", -1))
+
+    if codebook_hop != 10:
+        raise ValueError(
+            f"Output codebook must be HOP10, but got HOP{codebook_hop}"
+        )
     centers_cpu = codebook_raw["global_centers"].float()
     vq_vocab_size = int(centers_cpu.size(0))
     center_dim = int(centers_cpu.size(1))
@@ -1092,8 +1111,28 @@ def main():
             f"codebook={vq_vocab_size}"
         )
 
-    vq_min = int(vq_ids_flat.min().item())
-    vq_max = int(vq_ids_flat.max().item())
+    for hop, ids in enumerate(hop_vq_ids_flat):
+        if ids.numel() != token_ids_flat.numel():
+            raise ValueError(
+                f"HOP{hop}: VQ/token length mismatch: "
+                f"vq={ids.numel():,}, token={token_ids_flat.numel():,}"
+            )
+
+        vq_min = int(ids.min().item())
+        vq_max = int(ids.max().item())
+
+        if vq_min < 0 or vq_max >= vq_vocab_size:
+            raise ValueError(
+                f"HOP{hop}: VQ IDs out of range: "
+                f"min={vq_min}, max={vq_max}, "
+                f"vocab={vq_vocab_size}"
+            )
+
+        print(
+            f"[HOP{hop}] VQ range={vq_min}..{vq_max}, "
+            f"used={torch.unique(ids).numel():,}"
+        )
+
     if vq_min < 0 or vq_max >= vq_vocab_size:
         raise ValueError(
             f"VQ IDs out of range: min={vq_min}, max={vq_max}, "
@@ -1109,23 +1148,34 @@ def main():
     valid_samples = samples[n_train:n_train + n_valid]
     test_samples = samples[n_train + n_valid:]
 
-    train_ds = VQARDataset(
-        train_samples,
-        token_ids_flat,
-        vq_ids_flat,
+    vq_pad_id = vq_vocab_size
+    tok_pad_id = token_vocab_size
+
+    train_ds = MultiHopVQARDataset(
+        samples=train_samples,
+        token_ids_flat=token_ids_flat,
+        hop_vq_ids_flat=hop_vq_ids_flat,
+        vq_pad_id=vq_pad_id,
         max_len=args.max_len,
+        target_hop=10,
     )
-    valid_ds = VQARDataset(
-        valid_samples,
-        token_ids_flat,
-        vq_ids_flat,
+
+    valid_ds = MultiHopVQARDataset(
+        samples=valid_samples,
+        token_ids_flat=token_ids_flat,
+        hop_vq_ids_flat=hop_vq_ids_flat,
+        vq_pad_id=vq_pad_id,
         max_len=args.max_len,
+        target_hop=10,
     )
-    test_ds = VQARDataset(
-        test_samples,
-        token_ids_flat,
-        vq_ids_flat,
+
+    test_ds = MultiHopVQARDataset(
+        samples=test_samples,
+        token_ids_flat=token_ids_flat,
+        hop_vq_ids_flat=hop_vq_ids_flat,
+        vq_pad_id=vq_pad_id,
         max_len=args.max_len,
+        target_hop=10,
     )
 
     vq_pad_id = vq_vocab_size
@@ -1136,19 +1186,45 @@ def main():
             dataset,
             batch_size=args.batch_size,
             shuffle=shuffle,
-            collate_fn=lambda b: collate(
+            collate_fn=lambda b: collate_multihop(
                 b,
                 vq_pad_id,
                 tok_pad_id,
-            ),
+            )
         )
 
     train_loader = make_loader(train_ds, True)
     valid_loader = make_loader(valid_ds, False)
     test_loader = make_loader(test_ds, False)
+    hop_centers = []
 
-    model = VQAutoregressiveLM(
-        vq_vocab_size=vq_vocab_size,
+    for expected_hop, path in enumerate(args.hop_codebooks):
+        raw = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        actual_hop = int(raw["args"]["hop"])
+        if actual_hop != expected_hop:
+            raise ValueError(
+                f"Expected HOP{expected_hop}, "
+                f"but {path} contains HOP{actual_hop}"
+            )
+
+        current_centers = raw["global_centers"].float()
+
+        if tuple(current_centers.shape) != (vq_vocab_size, center_dim):
+            raise ValueError(
+                f"HOP{expected_hop}: center shape mismatch: "
+                f"expected={(vq_vocab_size, center_dim)}, "
+                f"actual={tuple(current_centers.shape)}"
+            )
+        hop_centers.append(current_centers)
+
+    model = MultiHopVQAutoregressiveLM(
+        hop_centers=hop_centers,
+        target_vq_vocab_size=vq_vocab_size,
         token_vocab_size=token_vocab_size,
         bpe_input_weight=args.bpe_input_weight,
         d_model=args.d_model,
@@ -1176,13 +1252,15 @@ def main():
         pbar = tqdm(train_loader, desc=f"[train] epoch {epoch}/{args.epochs}")
 
         for (
-                vq_in,
+                vq_context,
+                hop_valid,
                 tok_in,
                 vq_y,
                 tok_y,
                 attention_mask,
         ) in pbar:
-            vq_in = vq_in.to(device)
+            vq_context = vq_context.to(device)
+            hop_valid = hop_valid.to(device)
             tok_in = tok_in.to(device)
             vq_y = vq_y.to(device)
             tok_y = tok_y.to(device)
@@ -1191,8 +1269,9 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             vq_logits = model(
-                vq_in,
-                tok_in,
+                vq_context=vq_context,
+                hop_valid=hop_valid,
+                tok_in=tok_in,
                 key_padding_mask=~attention_mask,
             )
             vq_loss = F.cross_entropy(
