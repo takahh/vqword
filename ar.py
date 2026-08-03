@@ -469,7 +469,7 @@ def topk_marginal_bpe_nll(
     top_log_p_vq, top_ids = all_log_p_vq.topk(k, dim=-1)
 
     # トークン方向に分割して、巨大な [N, K, BPE_vocab] を作らない
-    chunk_size = 256
+    chunk_size = max(1, min(32, 4096 // k))
     total_nll = 0.0
     total_count = 0
 
@@ -787,6 +787,14 @@ def main():
         map_location="cpu",
         weights_only=False,
     )
+    dictionary_args = dictionary_preview.get("args", {})
+    dictionary_hop = int(dictionary_args.get("hop", -1))
+
+    if dictionary_hop not in (-1, 10):
+        raise ValueError(
+            f"Output dictionary must be HOP10, "
+            f"but got HOP{dictionary_hop}"
+        )
     hop_data = [
         torch.load(path, map_location="cpu", weights_only=False)
         for path in args.hop_data
@@ -896,12 +904,6 @@ def main():
         print(
             f"[HOP{hop}] VQ range={vq_min}..{vq_max}, "
             f"used={torch.unique(ids).numel():,}"
-        )
-
-    if vq_min < 0 or vq_max >= vq_vocab_size:
-        raise ValueError(
-            f"VQ IDs out of range: min={vq_min}, max={vq_max}, "
-            f"vocab={vq_vocab_size}"
         )
 
     random.shuffle(samples)
