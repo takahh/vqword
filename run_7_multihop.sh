@@ -88,7 +88,7 @@ fi
 # ============================================================
 # Shared settings
 # ============================================================
-
+CENTER_SCALE="${CENTER_SCALE:-1}"
 BPE_VOCAB_LABEL=50257
 BPE_VOCAB_SIZE=50257
 
@@ -154,7 +154,7 @@ declare -a HOP_CODEBOOK_PATHS
 for HOP in $(seq 0 10); do
   HOP2=$(printf "%02d" "${HOP}")
 
-  TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center0_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+  TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 
   DATA_FILE="tinystories_vqword_${TAG}_ids.pt"
   CODEBOOK_FILE="wikitext103_vqword_${TAG}.pt"
@@ -166,7 +166,7 @@ for HOP in $(seq 0 10); do
   HOP_CODEBOOK_PATHS[HOP]="/vqword/${CODEBOOK_FILE}"
 done
 
-TARGET_TAG="bpe${BPE_VOCAB_LABEL}_bilateral10_center0_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+TARGET_TAG="bpe${BPE_VOCAB_LABEL}_bilateral10_center${CENTER_SCALE}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 
 TARGET_CODEBOOK="${HOP_CODEBOOK_FILES[10]}"
 TARGET_CODEBOOK_PATH="${HOP_CODEBOOK_PATHS[10]}"
@@ -191,6 +191,7 @@ echo "distance 1              = HOP0"
 echo "distance 2              = HOP1"
 echo "distance 11             = HOP10"
 echo "number of HOP files     = ${NUM_HOPS}"
+echo "center scale           = ${CENTER_SCALE}"
 echo "target HOP              = ${TARGET_HOP}"
 echo "BPE auxiliary weight    = ${BPE_INPUT_WEIGHT}"
 echo "VQ vocabulary           = ${VQ_CODEBOOK_SIZE}"
