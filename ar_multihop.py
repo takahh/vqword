@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-VQW autoregressive language model.
+BPE + SC0VQW autoregressive language model.
 
 Pipeline:
-    VQW input -> causal Transformer -> next-VQW logits
-              -> predicted VQW ID -> fixed trained decoder -> BPE logits
+    input at position t:
+        BPE[t] + alpha * projected(SC0VQW[t])
+    causal Transformer
+    target:
+        BPE[t+1]
 
-The VQ tokenizer, cluster centers, and VQ->BPE decoder are frozen.
-Only the autoregressive VQ model is trained.
+The SC0 VQ codebook centers are frozen. The BPE embedding, VQ projection,
+Transformer, and BPE output head are trained end-to-end.
 """
 
 import argparse
@@ -22,31 +25,23 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
-class MultiHopVQARDataset(Dataset):
-    def __init__(
-        self,
-        samples,
-        token_ids_flat,
-        hop_vq_ids_flat,
-        vq_pad_id,
-        max_len=512,
-        target_hop=10,
-    ):
-        if len(hop_vq_ids_flat) != 11:
-            raise ValueError("Exactly 11 HOP ID tensors are required")
-
+class BPEPlusSC0Dataset(Dataset):
+    def __init__(self, samples, token_ids_flat, vq_ids_flat, max_len=512):
         self.samples = []
-        self.token_ids_flat = token_ids_flat
-        self.hop_vq_ids_flat = hop_vq_ids_flat
-        self.vq_pad_id = int(vq_pad_id)
+        self.token_ids_flat = token_ids_flat.long().reshape(-1)
+        self.vq_ids_flat = vq_ids_flat.long().reshape(-1)
         self.max_len = int(max_len)
-        self.target_hop = int(target_hop)
+
+        if self.token_ids_flat.numel() != self.vq_ids_flat.numel():
+            raise ValueError(
+                f"BPE/VQ length mismatch: {self.token_ids_flat.numel()} vs "
+                f"{self.vq_ids_flat.numel()}"
+            )
 
         for sample in samples:
             start = int(sample["start"])
             end = int(sample["end"])
             length = end - start
-
             if 2 <= length <= self.max_len + 1:
                 self.samples.append((start, end))
 
@@ -55,232 +50,75 @@ class MultiHopVQARDataset(Dataset):
 
     def __getitem__(self, index):
         start, end = self.samples[index]
-        length = end - start
-
-        # 予測対象はローカル位置 1 ... length-1
-        target_positions = torch.arange(1, length)
-
-        # [L-1, 11]
-        vq_context = torch.full(
-            (length - 1, 11),
-            self.vq_pad_id,
-            dtype=torch.long,
-        )
-
-        # 有効HOPを表すマスク
-        hop_valid = torch.zeros(
-            (length - 1, 11),
-            dtype=torch.bool,
-        )
-
-        for hop in range(11):
-            # target t に対して source = t-hop-1
-            source_positions = target_positions - hop - 1
-            valid = source_positions >= 0
-
-            if valid.any():
-                global_source = start + source_positions[valid]
-
-                vq_context[valid, hop] = (
-                    self.hop_vq_ids_flat[hop][global_source]
-                )
-                hop_valid[valid, hop] = True
-
-        # BPE補助入力には直前の物理トークンを使用
-        tok_in = self.token_ids_flat[
-            start:end - 1
-        ].long()
-
-        # 出力はHOP10 VQW
-        vq_y = self.hop_vq_ids_flat[self.target_hop][
-            start + 1:end
-        ].long()
-
-        # 最終BPE評価ターゲット
-        tok_y = self.token_ids_flat[
-            start + 1:end
-        ].long()
-
         return {
-            "vq_context": vq_context,
-            "hop_valid": hop_valid,
-            "tok_in": tok_in,
-            "vq_y": vq_y,
-            "tok_y": tok_y,
+            "tok_in": self.token_ids_flat[start:end - 1],
+            "vq_in": self.vq_ids_flat[start:end - 1],
+            "tok_y": self.token_ids_flat[start + 1:end],
         }
 
-def collate_multihop(
-    batch,
-    vq_pad_id,
-    tok_pad_id,
-):
+
+def collate_batch(batch, tok_pad_id, vq_pad_id):
     batch_size = len(batch)
-    max_len = max(
-        item["vq_context"].size(0)
-        for item in batch
-    )
+    max_len = max(item["tok_in"].numel() for item in batch)
 
-    vq_context = torch.full(
-        (batch_size, max_len, 11),
-        vq_pad_id,
-        dtype=torch.long,
-    )
+    tok_in = torch.full((batch_size, max_len), tok_pad_id, dtype=torch.long)
+    vq_in = torch.full((batch_size, max_len), vq_pad_id, dtype=torch.long)
+    tok_y = torch.full((batch_size, max_len), -100, dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
 
-    hop_valid = torch.zeros(
-        (batch_size, max_len, 11),
-        dtype=torch.bool,
-    )
+    for i, item in enumerate(batch):
+        n = item["tok_in"].numel()
+        tok_in[i, :n] = item["tok_in"]
+        vq_in[i, :n] = item["vq_in"]
+        tok_y[i, :n] = item["tok_y"]
+        attention_mask[i, :n] = True
 
-    tok_in = torch.full(
-        (batch_size, max_len),
-        tok_pad_id,
-        dtype=torch.long,
-    )
+    return tok_in, vq_in, tok_y, attention_mask
 
-    vq_y = torch.full(
-        (batch_size, max_len),
-        -100,
-        dtype=torch.long,
-    )
-
-    tok_y = torch.full(
-        (batch_size, max_len),
-        -100,
-        dtype=torch.long,
-    )
-
-    attention_mask = torch.zeros(
-        (batch_size, max_len),
-        dtype=torch.bool,
-    )
-
-    for batch_index, item in enumerate(batch):
-        n = item["vq_context"].size(0)
-
-        vq_context[batch_index, :n] = item["vq_context"]
-        hop_valid[batch_index, :n] = item["hop_valid"]
-        tok_in[batch_index, :n] = item["tok_in"]
-        vq_y[batch_index, :n] = item["vq_y"]
-        tok_y[batch_index, :n] = item["tok_y"]
-        attention_mask[batch_index, :n] = True
-
-    return (
-        vq_context,
-        hop_valid,
-        tok_in,
-        vq_y,
-        tok_y,
-        attention_mask,
-    )
 
 class FrozenCenterEmbedding(nn.Module):
     def __init__(self, centers):
         super().__init__()
-
-        centers = F.normalize(
-            centers.float(),
-            dim=-1,
-        )
-
+        centers = F.normalize(centers.float(), dim=-1)
         self.padding_idx = int(centers.size(0))
-
-        zero = torch.zeros(
-            1,
-            centers.size(1),
-            dtype=centers.dtype,
-        )
-
-        weight = torch.cat(
-            [centers, zero],
-            dim=0,
-        )
-
-        # GPUには移動するが、state_dictには保存しない
+        zero = torch.zeros(1, centers.size(1), dtype=centers.dtype)
         self.register_buffer(
-            "weight",
-            weight,
-            persistent=False,
+            "weight", torch.cat([centers, zero], dim=0), persistent=False
         )
 
     def forward(self, ids):
-        return F.embedding(
-            ids,
-            self.weight,
-            padding_idx=self.padding_idx,
-        )
+        return F.embedding(ids, self.weight, padding_idx=self.padding_idx)
 
 
-class MultiHopVQAutoregressiveLM(nn.Module):
+class BPEPlusSC0LM(nn.Module):
     def __init__(
         self,
-        hop_centers,
-        target_vq_vocab_size,
+        centers,
         token_vocab_size,
-        bpe_input_weight=0.01,
+        vq_input_weight=0.01,
         d_model=256,
         n_layers=6,
         n_heads=8,
         dropout=0.1,
         max_len=512,
+        tie_weights=False,
     ):
         super().__init__()
-
-        if len(hop_centers) != 11:
-            raise ValueError("Expected 11 center matrices")
-
-        self.num_hops = 11
-        self.d_model = int(d_model)
-        self.target_vq_vocab_size = int(target_vq_vocab_size)
         self.token_vocab_size = int(token_vocab_size)
-
-        self.vq_pad_id = self.target_vq_vocab_size
+        self.vq_vocab_size = int(centers.size(0))
         self.tok_pad_id = self.token_vocab_size
-        self.bpe_input_weight = float(bpe_input_weight)
-
-        # HOPごとの固定center lookup
-        self.center_embeddings = nn.ModuleList([
-            FrozenCenterEmbedding(centers)
-            for centers in hop_centers
-        ])
-
-        # HOPごとの座標系をARの共通空間へ変換
-        self.hop_projections = nn.ModuleList([
-            nn.Linear(
-                centers.size(1),
-                d_model,
-                bias=False,
-            )
-            for centers in hop_centers
-        ])
-
-        # HOPごとの重要度
-        self.hop_gates = nn.Parameter(
-            torch.zeros(self.num_hops)
-        )
-
-        self.context_norm = nn.LayerNorm(d_model)
+        self.vq_pad_id = self.vq_vocab_size
+        self.vq_input_weight = float(vq_input_weight)
 
         self.tok_emb = nn.Embedding(
-            token_vocab_size + 1,
+            self.token_vocab_size + 1,
             d_model,
             padding_idx=self.tok_pad_id,
         )
-
-        self.bpe_proj = nn.Linear(
-            d_model,
-            d_model,
-            bias=False,
-        )
-
-        with torch.no_grad():
-            self.bpe_proj.weight.copy_(
-                torch.eye(d_model)
-            )
-
-        self.pos_emb = nn.Embedding(
-            max_len,
-            d_model,
-        )
+        self.vq_emb = FrozenCenterEmbedding(centers)
+        self.vq_proj = nn.Linear(centers.size(1), d_model, bias=False)
+        self.input_norm = nn.LayerNorm(d_model)
+        self.pos_emb = nn.Embedding(max_len, d_model)
 
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -290,488 +128,104 @@ class MultiHopVQAutoregressiveLM(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-
-        self.transformer = nn.TransformerEncoder(
-            layer,
-            num_layers=n_layers,
-        )
-
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(d_model)
+        self.bpe_head = nn.Linear(d_model, self.token_vocab_size, bias=False)
+        self.bpe_bias = nn.Parameter(torch.zeros(self.token_vocab_size))
 
-        self.vq_head = nn.Linear(
-            d_model,
-            target_vq_vocab_size,
-        )
+        if tie_weights:
+            self.bpe_head.weight = self.tok_emb.weight[:self.token_vocab_size]
 
-    def forward(
-        self,
-        vq_context,
-        hop_valid,
-        tok_in,
-        key_padding_mask=None,
-    ):
-        # vq_context: [B, L, 11]
-        batch_size, seq_len, num_hops = vq_context.shape
-
-        if num_hops != self.num_hops:
+    def forward(self, tok_in, vq_in, key_padding_mask=None):
+        batch_size, seq_len = tok_in.shape
+        if seq_len > self.pos_emb.num_embeddings:
             raise ValueError(
-                f"Expected {self.num_hops} HOPs, got {num_hops}"
+                f"sequence length {seq_len} exceeds max_len "
+                f"{self.pos_emb.num_embeddings}"
             )
 
-        context_h = torch.zeros(
-            batch_size,
-            seq_len,
-            self.d_model,
-            device=vq_context.device,
-            dtype=self.vq_head.weight.dtype,
-        )
+        bpe_h = self.tok_emb(tok_in)
+        vq_h = self.vq_proj(self.vq_emb(vq_in))
+        h = self.input_norm(bpe_h + self.vq_input_weight * vq_h)
 
-        # positive scalar weight
-        gate_values = F.softplus(self.hop_gates)
-
-        valid_count = hop_valid.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1)
-
-        for hop in range(self.num_hops):
-            ids = vq_context[:, :, hop]
-
-            center_h = self.center_embeddings[hop](ids)
-            projected = self.hop_projections[hop](center_h)
-
-            valid = hop_valid[:, :, hop].unsqueeze(-1)
-
-            context_h = context_h + (
-                gate_values[hop]
-                * projected
-                * valid
-            )
-
-        # 入力数が増えるほど大きくならないよう正規化
-        context_h = context_h / valid_count.sqrt()
-        context_h = self.context_norm(context_h)
-
-        # 直前BPEを小さな補助入力として使用
-        bpe_h = self.bpe_proj(
-            self.tok_emb(tok_in)
-        )
-
-        h = (
-            context_h
-            + self.bpe_input_weight * bpe_h
-        )
-
-        pos = torch.arange(
-            seq_len,
-            device=h.device,
-        )[None, :]
-
+        pos = torch.arange(seq_len, device=tok_in.device)[None, :]
         h = h + self.pos_emb(pos)
 
         causal_mask = torch.triu(
-            torch.ones(
-                seq_len,
-                seq_len,
-                dtype=torch.bool,
-                device=h.device,
-            ),
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=h.device),
             diagonal=1,
         )
-
         h = self.transformer(
             h,
             mask=causal_mask,
             src_key_padding_mask=key_padding_mask,
         )
-
         h = self.norm(h)
-
-        return self.vq_head(h)
-
-
-def load_fixed_decoder(dictionary_path, d_model, token_vocab_size, device):
-    raw = torch.load(dictionary_path, map_location="cpu", weights_only=False)
-    state = raw.get("decoder_state_dict")
-    if state is None:
-        raise KeyError(
-            "dictionary does not contain decoder_state_dict. "
-            "Create it with train_vqword_decoder_only.py."
-        )
-
-    decoder = nn.Linear(d_model, token_vocab_size)
-    decoder.load_state_dict(state, strict=True)
-    decoder.to(device)
-    decoder.eval()
-    decoder.requires_grad_(False)
-    return decoder, raw
-
-
-def load_centers(codebook_path, device):
-    raw = torch.load(codebook_path, map_location="cpu", weights_only=False)
-    if "global_centers" not in raw:
-        raise KeyError("codebook checkpoint does not contain global_centers")
-    centers = raw["global_centers"].float().to(device)
-    return F.normalize(centers, dim=-1), raw
+        return self.bpe_head(h) + self.bpe_bias
 
 
 @torch.no_grad()
-def decode_vq_ids(vq_ids, centers, decoder):
-    """Decode arbitrary-shaped VQ IDs to BPE logits."""
-    flat_ids = vq_ids.reshape(-1)
-    unique_ids, inverse = torch.unique(flat_ids, return_inverse=True)
-    unique_logits = decoder(centers[unique_ids])
-    return unique_logits[inverse].reshape(*vq_ids.shape, -1)
-
-@torch.no_grad()
-def topk_marginal_bpe_nll(
-    vq_logits,
-    tok_y,
-    centers,
-    decoder,
-    topk=32,
-    max_tokens=2048,
-):
-    """
-    Approximate:
-        P(BPE=y | context)
-        = sum_v P(v | context) P(y | v)
-
-    using only the top-k VQ candidates.
-
-    Returns:
-        summed NLL
-        token count
-    """
-    flat_vq_logits = vq_logits.reshape(-1, vq_logits.size(-1))
-    flat_tok_y = tok_y.reshape(-1)
-
-    valid = flat_tok_y.ne(-100)
-    flat_vq_logits = flat_vq_logits[valid]
-    flat_tok_y = flat_tok_y[valid]
-
-    if flat_tok_y.numel() == 0:
-        return 0.0, 0
-
-    if max_tokens > 0 and flat_tok_y.numel() > max_tokens:
-        chosen = torch.randperm(
-            flat_tok_y.numel(),
-            device=flat_tok_y.device,
-        )[:max_tokens]
-
-        flat_vq_logits = flat_vq_logits[chosen]
-        flat_tok_y = flat_tok_y[chosen]
-
-    k = min(int(topk), flat_vq_logits.size(-1))
-
-    # 全VQ語彙に対する正規化を維持したままtop-kを取る
-    all_log_p_vq = F.log_softmax(flat_vq_logits, dim=-1)
-    top_log_p_vq, top_ids = all_log_p_vq.topk(k, dim=-1)
-
-    # トークン方向に分割して、巨大な [N, K, BPE_vocab] を作らない
-    chunk_size = max(1, min(32, 4096 // k))
-    total_nll = 0.0
-    total_count = 0
-
-    for start in range(0, flat_tok_y.numel(), chunk_size):
-        end = min(start + chunk_size, flat_tok_y.numel())
-
-        chunk_top_ids = top_ids[start:end]
-        chunk_top_log_p_vq = top_log_p_vq[start:end]
-        chunk_targets = flat_tok_y[start:end]
-
-        # [chunk, K, D]
-        selected_centers = centers[chunk_top_ids]
-
-        # [chunk, K, BPE_vocab]
-        bpe_logits = decoder(selected_centers)
-        log_p_bpe = F.log_softmax(bpe_logits, dim=-1)
-
-        # [chunk, K, 1]
-        target_index = chunk_targets[:, None, None].expand(-1, k, 1)
-
-        # [chunk, K]
-        target_log_p_bpe = log_p_bpe.gather(
-            dim=-1,
-            index=target_index,
-        ).squeeze(-1)
-
-        # [chunk]
-        target_log_prob = torch.logsumexp(
-            chunk_top_log_p_vq + target_log_p_bpe,
-            dim=-1,
-        )
-
-        total_nll += float((-target_log_prob.sum()).item())
-        total_count += int(chunk_targets.numel())
-
-    return total_nll, total_count
-
-def topk_pipeline_bpe_loss(
-    vq_logits,
-    tok_y,
-    centers,
-    decoder,
-    topk,
-    max_tokens,
-):
-    """
-    Optional differentiable approximation:
-      top-k P(VQ|context) -> weighted center -> fixed decoder -> BPE CE.
-
-    This is auxiliary only. The default weight is zero.
-    """
-    flat_vq_logits = vq_logits.reshape(-1, vq_logits.size(-1))
-    flat_tok_y = tok_y.reshape(-1)
-    valid = flat_tok_y.ne(-100)
-
-    flat_vq_logits = flat_vq_logits[valid]
-    flat_tok_y = flat_tok_y[valid]
-
-    if flat_tok_y.numel() == 0:
-        return vq_logits.sum() * 0.0
-
-    if max_tokens > 0 and flat_tok_y.numel() > max_tokens:
-        chosen = torch.randperm(
-            flat_tok_y.numel(),
-            device=flat_tok_y.device,
-        )[:max_tokens]
-        flat_vq_logits = flat_vq_logits[chosen]
-        flat_tok_y = flat_tok_y[chosen]
-
-    k = min(int(topk), flat_vq_logits.size(-1))
-    values, ids = flat_vq_logits.topk(k, dim=-1)
-    weights = F.softmax(values, dim=-1)
-    mixed_center = (
-        centers[ids] * weights.unsqueeze(-1)
-    ).sum(dim=1)
-
-    bpe_logits = decoder(mixed_center)
-    return F.cross_entropy(bpe_logits, flat_tok_y)
-
-
-@torch.no_grad()
-def evaluate(
-        model,
-        loader,
-        centers,
-        decoder,
-        device,
-        marginal_topks=(1, 8, 32, 128),
-        marginal_max_tokens=0,
-):
+def evaluate(model, loader, device):
     model.eval()
-
-    total_vq_loss = 0.0
+    total_loss = 0.0
     total_count = 0
-    total_vq_correct = 0
+    total_top1 = 0
+    total_top5 = 0
 
-    total_pipe_bpe_loss = 0.0
-    total_pipe_top1 = 0
-    total_pipe_top5 = 0
-
-    total_marginal_bpe_loss = {
-        int(k): 0.0 for k in marginal_topks
-    }
-    total_marginal_count = {
-        int(k): 0 for k in marginal_topks
-    }
-
-    total_oracle_bpe_loss = 0.0
-
-    total_oracle_top1 = 0
-    total_oracle_top5 = 0
-
-    for (
-            vq_context,
-            hop_valid,
-            tok_in,
-            vq_y,
-            tok_y,
-            attention_mask,
-    ) in tqdm(
-        loader,
-        desc="[eval]",
-        leave=False,
+    for tok_in, vq_in, tok_y, attention_mask in tqdm(
+        loader, desc="[eval]", leave=False
     ):
-        vq_context = vq_context.to(device)
-        hop_valid = hop_valid.to(device)
         tok_in = tok_in.to(device)
-        vq_y = vq_y.to(device)
+        vq_in = vq_in.to(device)
         tok_y = tok_y.to(device)
         attention_mask = attention_mask.to(device)
 
-        vq_logits = model(
-            vq_context=vq_context,
-            hop_valid=hop_valid,
-            tok_in=tok_in,
-            key_padding_mask=~attention_mask,
-        )
-        vq_loss = F.cross_entropy(
-            vq_logits.reshape(-1, vq_logits.size(-1)),
-            vq_y.reshape(-1),
+        logits = model(tok_in, vq_in, key_padding_mask=~attention_mask)
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            tok_y.reshape(-1),
             ignore_index=-100,
             reduction="sum",
         )
 
-        valid = vq_y.ne(-100)
+        valid = tok_y.ne(-100)
         n = int(valid.sum().item())
-        pred_vq = vq_logits.argmax(dim=-1)
+        pred = logits[valid]
+        target = tok_y[valid]
+        topk = pred.topk(min(5, pred.size(-1)), dim=-1).indices
 
-        total_vq_loss += float(vq_loss.item())
+        total_loss += float(loss.item())
         total_count += n
-        total_vq_correct += int(pred_vq[valid].eq(vq_y[valid]).sum().item())
+        total_top1 += int(topk[:, 0].eq(target).sum().item())
+        total_top5 += int(topk.eq(target[:, None]).any(dim=1).sum().item())
 
-        pred_bpe_logits = decode_vq_ids(pred_vq[valid], centers, decoder)
-        true_bpe = tok_y[valid]
-        pipe_loss = F.cross_entropy(
-            pred_bpe_logits,
-            true_bpe,
-            reduction="sum",
-        )
-
-        pipe_topk = pred_bpe_logits.topk(
-            min(5, pred_bpe_logits.size(-1)),
-            dim=-1,
-        ).indices
-
-        total_pipe_bpe_loss += float(pipe_loss.item())
-        total_pipe_top1 += int(pipe_topk[:, 0].eq(true_bpe).sum().item())
-        total_pipe_top5 += int(
-            pipe_topk.eq(true_bpe[:, None]).any(dim=1).sum().item()
-        )
-        for marginal_k in marginal_topks:
-            marginal_loss_sum, marginal_count = topk_marginal_bpe_nll(
-                vq_logits=vq_logits,
-                tok_y=tok_y,
-                centers=centers,
-                decoder=decoder,
-                topk=marginal_k,
-                max_tokens=marginal_max_tokens,
-            )
-
-            total_marginal_bpe_loss[int(marginal_k)] += marginal_loss_sum
-            total_marginal_count[int(marginal_k)] += marginal_count
-
-        oracle_bpe_logits = decode_vq_ids(vq_y[valid], centers, decoder)
-        oracle_loss = F.cross_entropy(
-            oracle_bpe_logits,
-            true_bpe,
-            reduction="sum",
-        )
-        oracle_topk = oracle_bpe_logits.topk(
-            min(5, oracle_bpe_logits.size(-1)),
-            dim=-1,
-        ).indices
-
-        total_oracle_bpe_loss += float(oracle_loss.item())
-        total_oracle_top1 += int(
-            oracle_topk[:, 0].eq(true_bpe).sum().item()
-        )
-        total_oracle_top5 += int(
-            oracle_topk.eq(true_bpe[:, None]).any(dim=1).sum().item()
-        )
-
-    vq_ce = total_vq_loss / max(total_count, 1)
-    pipe_ce = total_pipe_bpe_loss / max(total_count, 1)
-    marginal_ce = {
-        int(k): (
-                total_marginal_bpe_loss[int(k)]
-                / max(total_marginal_count[int(k)], 1)
-        )
-        for k in marginal_topks
-    }
-    oracle_ce = total_oracle_bpe_loss / max(total_count, 1)
-
+    ce = total_loss / max(total_count, 1)
     return {
-        "vq_loss": vq_ce,
-        "vq_ppl": math.exp(min(vq_ce, 20.0)),
-        "vq_acc": total_vq_correct / max(total_count, 1),
-        # This is hard argmax-VQ pipeline CE, not a fully marginalized PPL.
-        "pipeline_bpe_hard_loss": pipe_ce,
-        "pipeline_bpe_hard_ppl": math.exp(min(pipe_ce, 20.0)),
-        "pipeline_bpe_top1": total_pipe_top1 / max(total_count, 1),
-        "pipeline_bpe_top5": total_pipe_top5 / max(total_count, 1),
-        "marginal_bpe_loss": marginal_ce,
-
-        "marginal_bpe_ppl": {
-            int(k): math.exp(min(marginal_ce[int(k)], 20.0))
-            for k in marginal_topks
-        },
-
-        "marginal_bpe_count": total_marginal_count,
-        # Upper bound imposed by tokenizer+decoder reconstruction quality.
-        "oracle_bpe_loss": oracle_ce,
-        "oracle_bpe_ppl": math.exp(min(oracle_ce, 20.0)),
-        "oracle_bpe_top1": total_oracle_top1 / max(total_count, 1),
-        "oracle_bpe_top5": total_oracle_top5 / max(total_count, 1),
+        "bpe_loss": ce,
+        "bpe_ppl": math.exp(min(ce, 20.0)),
+        "bpe_top1": total_top1 / max(total_count, 1),
+        "bpe_top5": total_top5 / max(total_count, 1),
         "count": total_count,
     }
 
 
 def main():
     ap = argparse.ArgumentParser()
-
-    ap.add_argument("--dictionary", required=True)
-    ap.add_argument("--codebook", required=True)
-    ap.add_argument("--out", default="ar_vqw_to_vqw_to_bpe.pt")
-    ap.add_argument(
-        "--bpe_input_weight",
-        type=float,
-        default=0.01,
-        help="scale applied to BPE embedding before concatenation",
-    )
-    ap.add_argument(
-        "--marginal_topks",
-        type=int,
-        nargs="+",
-        default=[1, 8, 32, 128],
-        help="top-k values used for marginalized BPE evaluation",
-    )
-
-    ap.add_argument(
-        "--marginal_max_tokens",
-        type=int,
-        default=0,
-        help="maximum evaluated positions per batch; 0 means all valid positions",
-    )
-    ap.add_argument(
-        "--hop_data",
-        nargs=11,
-        required=True,
-        help="HOP0 ... HOP10 TinyStories ID files",
-    )
-    ap.add_argument(
-        "--hop_codebooks",
-        nargs=11,
-        required=True,
-        help="HOP0 ... HOP10 codebook checkpoint files",
-    )
+    ap.add_argument("--data", required=True, help="TinyStories SC0 VQ ID file")
+    ap.add_argument("--codebook", required=True, help="matching SC0 VQ codebook")
+    ap.add_argument("--out", default="ar_bpe_plus_sc0vqw.pt")
+    ap.add_argument("--vq_input_weight", type=float, default=0.01)
     ap.add_argument("--batch_size", type=int, default=32)
-    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--d_model", type=int, default=256)
     ap.add_argument("--n_layers", type=int, default=6)
     ap.add_argument("--n_heads", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--max_len", type=int, default=512)
+    ap.add_argument("--max_len", type=int, default=255)
     ap.add_argument("--seed", type=int, default=0)
-
-    ap.add_argument(
-        "--pipeline_bpe_loss_weight",
-        type=float,
-        default=0.0,
-        help="optional auxiliary loss through top-k VQ mixture and fixed decoder",
-    )
-    ap.add_argument("--pipeline_topk", type=int, default=8)
-    ap.add_argument(
-        "--pipeline_bpe_max_tokens",
-        type=int,
-        default=512,
-        help="maximum valid positions used by auxiliary BPE loss per batch",
-    )
-
+    ap.add_argument("--tie_weights", action="store_true")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -782,378 +236,170 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {device}")
 
-    dictionary_preview = torch.load(
-        args.dictionary,
-        map_location="cpu",
-        weights_only=False,
-    )
-    dictionary_args = dictionary_preview.get("args", {})
-    dictionary_hop = int(dictionary_args.get("hop", -1))
+    data = torch.load(args.data, map_location="cpu", weights_only=False)
+    codebook = torch.load(args.codebook, map_location="cpu", weights_only=False)
 
-    if dictionary_hop not in (-1, 10):
+    required = {"samples", "token_ids_flat", "vq_ids_flat"}
+    missing = sorted(required - set(data.keys()))
+    if missing:
+        raise KeyError(f"data missing keys: {missing}")
+    if "global_centers" not in codebook:
+        raise KeyError("codebook missing global_centers")
+
+    samples = list(data["samples"])
+    token_ids_flat = data["token_ids_flat"].long().reshape(-1)
+    vq_ids_flat = data["vq_ids_flat"].long().reshape(-1)
+    centers = codebook["global_centers"].float()
+
+    token_vocab_size = int(token_ids_flat.max().item()) + 1
+    if "token_vocab_size" in data:
+        token_vocab_size = int(data["token_vocab_size"])
+    elif int(token_ids_flat.max().item()) < 50257:
+        token_vocab_size = 50257
+
+    vq_vocab_size = int(centers.size(0))
+    if vq_ids_flat.min().item() < 0 or vq_ids_flat.max().item() >= vq_vocab_size:
         raise ValueError(
-            f"Output dictionary must be HOP10, "
-            f"but got HOP{dictionary_hop}"
+            f"VQ IDs out of range: {int(vq_ids_flat.min())}.."
+            f"{int(vq_ids_flat.max())}, vocab={vq_vocab_size}"
         )
-    hop_data = [
-        torch.load(path, map_location="cpu", weights_only=False)
-        for path in args.hop_data
-    ]
-    reference = hop_data[0]
 
-    samples = list(reference["samples"])
-    token_ids_flat = reference["token_ids_flat"].long().reshape(-1)
+    data_hop = int(data.get("hop", -1))
+    codebook_hop = int(codebook.get("args", {}).get("hop", -1))
+    data_center_scale = data.get("center_scale", None)
+    codebook_center_scale = codebook.get("args", {}).get("center_scale", None)
 
-    hop_vq_ids_flat = [
-        data["vq_ids_flat"].long().reshape(-1)
-        for data in hop_data
-    ]
-    for hop, data in enumerate(hop_data):
-        current_tokens = data["token_ids_flat"].long().reshape(-1)
-
-        if not torch.equal(token_ids_flat, current_tokens):
-            raise ValueError(
-                f"HOP{hop}: token_ids_flat does not match HOP0"
-            )
-
-        if len(data["samples"]) != len(samples):
-            raise ValueError(
-                f"HOP{hop}: sample count mismatch"
-            )
-
-        for i, (ref_sample, current_sample) in enumerate(
-                zip(samples, data["samples"])
-        ):
-            for key in ("sample_idx", "start", "end", "length"):
-                if int(ref_sample[key]) != int(current_sample[key]):
-                    raise ValueError(
-                        f"HOP{hop}: sample metadata mismatch "
-                        f"at sample={i}, key={key}"
-                    )
-
-        recorded_hop = int(data.get("hop", -1))
-        if recorded_hop != hop:
-            raise ValueError(
-                f"Expected HOP{hop} file, but metadata says HOP{recorded_hop}"
-            )
-
-    decoder_state = dictionary_preview.get("decoder_state_dict")
-    if decoder_state is None:
-        raise KeyError("dictionary does not contain decoder_state_dict")
-
-    token_vocab_size = int(decoder_state["weight"].shape[0])
-
+    print(f"[task] BPE + SC0VQW -> BPE")
+    print(f"[data hop] {data_hop}")
+    print(f"[codebook hop] {codebook_hop}")
+    print(f"[data center scale] {data_center_scale}")
+    print(f"[codebook center scale] {codebook_center_scale}")
     print(f"[token vocab size] {token_vocab_size}")
-    print(f"[BPE auxiliary input weight] {args.bpe_input_weight}")
-
-    codebook_raw = torch.load(
-        args.codebook,
-        map_location="cpu",
-        weights_only=False,
-    )
-    codebook_hop = int(codebook_raw.get("args", {}).get("hop", -1))
-
-    if codebook_hop != 10:
-        raise ValueError(
-            f"Output codebook must be HOP10, but got HOP{codebook_hop}"
-        )
-    centers_cpu = codebook_raw["global_centers"].float()
-    vq_vocab_size = int(centers_cpu.size(0))
-    center_dim = int(centers_cpu.size(1))
-
-    if args.d_model != center_dim:
-        print(
-            f"[note] AR d_model={args.d_model}, "
-            f"decoder center dim={center_dim}; these may differ."
-        )
-
-    centers = F.normalize(centers_cpu, dim=-1).to(device)
-    decoder, dictionary_raw = load_fixed_decoder(
-        args.dictionary,
-        d_model=center_dim,
-        token_vocab_size=token_vocab_size,
-        device=device,
-    )
-    # --------------------------------------------------
-    # sanity check
-    # --------------------------------------------------
-    print("==================================================")
-    print("[oracle decoder sanity check]")
-
-    ids = hop_vq_ids_flat[10][:100000].to(device)
-    target = token_ids_flat[:100000].to(device)
-
-    with torch.no_grad():
-        logits = decoder(centers[ids])
-        loss = F.cross_entropy(logits, target)
-        top1 = (logits.argmax(dim=-1) == target).float().mean()
-
-    print(f"oracle ppl  = {math.exp(loss.item()):.4f}")
-    print(f"oracle top1 = {top1.item():.4f}")
-    print("==================================================")
-
-    dictionary_vq_size = int(
-        dictionary_raw.get("vq_vocab_size", vq_vocab_size)
-    )
-    if dictionary_vq_size != vq_vocab_size:
-        raise ValueError(
-            f"VQ size mismatch: dictionary={dictionary_vq_size}, "
-            f"codebook={vq_vocab_size}"
-        )
-
-    for hop, ids in enumerate(hop_vq_ids_flat):
-        if ids.numel() != token_ids_flat.numel():
-            raise ValueError(
-                f"HOP{hop}: VQ/token length mismatch: "
-                f"vq={ids.numel():,}, token={token_ids_flat.numel():,}"
-            )
-
-        vq_min = int(ids.min().item())
-        vq_max = int(ids.max().item())
-
-        if vq_min < 0 or vq_max >= vq_vocab_size:
-            raise ValueError(
-                f"HOP{hop}: VQ IDs out of range: "
-                f"min={vq_min}, max={vq_max}, "
-                f"vocab={vq_vocab_size}"
-            )
-
-        print(
-            f"[HOP{hop}] VQ range={vq_min}..{vq_max}, "
-            f"used={torch.unique(ids).numel():,}"
-        )
+    print(f"[VQ vocab size] {vq_vocab_size}")
+    print(f"[VQ input weight] {args.vq_input_weight}")
 
     random.shuffle(samples)
     n = len(samples)
     n_train = int(0.8 * n)
     n_valid = int(0.1 * n)
-
     train_samples = samples[:n_train]
     valid_samples = samples[n_train:n_train + n_valid]
     test_samples = samples[n_train + n_valid:]
 
-    vq_pad_id = vq_vocab_size
+    train_ds = BPEPlusSC0Dataset(
+        train_samples, token_ids_flat, vq_ids_flat, args.max_len
+    )
+    valid_ds = BPEPlusSC0Dataset(
+        valid_samples, token_ids_flat, vq_ids_flat, args.max_len
+    )
+    test_ds = BPEPlusSC0Dataset(
+        test_samples, token_ids_flat, vq_ids_flat, args.max_len
+    )
+
     tok_pad_id = token_vocab_size
-
-    train_ds = MultiHopVQARDataset(
-        samples=train_samples,
-        token_ids_flat=token_ids_flat,
-        hop_vq_ids_flat=hop_vq_ids_flat,
-        vq_pad_id=vq_pad_id,
-        max_len=args.max_len,
-        target_hop=10,
-    )
-
-    valid_ds = MultiHopVQARDataset(
-        samples=valid_samples,
-        token_ids_flat=token_ids_flat,
-        hop_vq_ids_flat=hop_vq_ids_flat,
-        vq_pad_id=vq_pad_id,
-        max_len=args.max_len,
-        target_hop=10,
-    )
-
-    test_ds = MultiHopVQARDataset(
-        samples=test_samples,
-        token_ids_flat=token_ids_flat,
-        hop_vq_ids_flat=hop_vq_ids_flat,
-        vq_pad_id=vq_pad_id,
-        max_len=args.max_len,
-        target_hop=10,
-    )
-
     vq_pad_id = vq_vocab_size
-    tok_pad_id = token_vocab_size
 
     def make_loader(dataset, shuffle):
         return DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=shuffle,
-            collate_fn=lambda b: collate_multihop(
-                b,
-                vq_pad_id,
-                tok_pad_id,
-            )
+            collate_fn=lambda b: collate_batch(b, tok_pad_id, vq_pad_id),
         )
 
     train_loader = make_loader(train_ds, True)
     valid_loader = make_loader(valid_ds, False)
     test_loader = make_loader(test_ds, False)
-    hop_centers = []
 
-    for expected_hop, path in enumerate(args.hop_codebooks):
-        raw = torch.load(
-            path,
-            map_location="cpu",
-            weights_only=False,
-        )
-
-        actual_hop = int(raw["args"]["hop"])
-        if actual_hop != expected_hop:
-            raise ValueError(
-                f"Expected HOP{expected_hop}, "
-                f"but {path} contains HOP{actual_hop}"
-            )
-
-        current_centers = raw["global_centers"].float()
-
-        if tuple(current_centers.shape) != (vq_vocab_size, center_dim):
-            raise ValueError(
-                f"HOP{expected_hop}: center shape mismatch: "
-                f"expected={(vq_vocab_size, center_dim)}, "
-                f"actual={tuple(current_centers.shape)}"
-            )
-        hop_centers.append(current_centers)
-
-    model = MultiHopVQAutoregressiveLM(
-        hop_centers=hop_centers,
-        target_vq_vocab_size=vq_vocab_size,
+    model = BPEPlusSC0LM(
+        centers=centers,
         token_vocab_size=token_vocab_size,
-        bpe_input_weight=args.bpe_input_weight,
+        vq_input_weight=args.vq_input_weight,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         dropout=args.dropout,
         max_len=args.max_len,
+        tie_weights=args.tie_weights,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
     history = []
     best_valid = float("inf")
+    best_path = str(Path(args.out).with_name(Path(args.out).stem + "_best.pt"))
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        running_vq = 0.0
-        running_aux = 0.0
-        running_n = 0
+        running_loss = 0.0
+        running_count = 0
 
         pbar = tqdm(train_loader, desc=f"[train] epoch {epoch}/{args.epochs}")
-
-        for (
-                vq_context,
-                hop_valid,
-                tok_in,
-                vq_y,
-                tok_y,
-                attention_mask,
-        ) in pbar:
-            vq_context = vq_context.to(device)
-            hop_valid = hop_valid.to(device)
+        for tok_in, vq_in, tok_y, attention_mask in pbar:
             tok_in = tok_in.to(device)
-            vq_y = vq_y.to(device)
+            vq_in = vq_in.to(device)
             tok_y = tok_y.to(device)
             attention_mask = attention_mask.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-
-            vq_logits = model(
-                vq_context=vq_context,
-                hop_valid=hop_valid,
-                tok_in=tok_in,
-                key_padding_mask=~attention_mask,
-            )
-            vq_loss = F.cross_entropy(
-                vq_logits.reshape(-1, vq_logits.size(-1)),
-                vq_y.reshape(-1),
+            logits = model(tok_in, vq_in, key_padding_mask=~attention_mask)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                tok_y.reshape(-1),
                 ignore_index=-100,
             )
-
-            if args.pipeline_bpe_loss_weight > 0:
-                aux_loss = topk_pipeline_bpe_loss(
-                    vq_logits=vq_logits,
-                    tok_y=tok_y,
-                    centers=centers,
-                    decoder=decoder,
-                    topk=args.pipeline_topk,
-                    max_tokens=args.pipeline_bpe_max_tokens,
-                )
-            else:
-                aux_loss = vq_loss.new_zeros(())
-
-            loss = vq_loss + args.pipeline_bpe_loss_weight * aux_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            n_valid_tokens = int(vq_y.ne(-100).sum().item())
-            running_vq += float(vq_loss.item()) * n_valid_tokens
-            running_aux += float(aux_loss.item()) * n_valid_tokens
-            running_n += n_valid_tokens
-
+            n_valid_tokens = int(tok_y.ne(-100).sum().item())
+            running_loss += float(loss.item()) * n_valid_tokens
+            running_count += n_valid_tokens
             pbar.set_postfix(
-                vq=f"{running_vq / max(running_n, 1):.4f}",
-                aux=f"{running_aux / max(running_n, 1):.4f}",
+                bpe=f"{running_loss / max(running_count, 1):.4f}"
             )
 
-        valid_metrics = evaluate(
-            model,
-            valid_loader,
-            centers,
-            decoder,
-            device,
-            marginal_topks=args.marginal_topks,
-            marginal_max_tokens=args.marginal_max_tokens,
-        )
-        test_metrics = evaluate(
-            model,
-            test_loader,
-            centers,
-            decoder,
-            device,
-            marginal_topks=args.marginal_topks,
-            marginal_max_tokens=args.marginal_max_tokens,
-        )
-
-        row = {
-            "epoch": epoch,
-            "valid": valid_metrics,
-            "test": test_metrics,
-        }
-        history.append(row)
-
-        marginal_text = " ".join(
-            f"@{k}={test_metrics['marginal_bpe_ppl'][int(k)]:.2f}"
-            for k in args.marginal_topks
-        )
+        valid_metrics = evaluate(model, valid_loader, device)
+        test_metrics = evaluate(model, test_loader, device)
 
         print(
             f"[epoch {epoch}] "
-            f"valid_vq_ppl={valid_metrics['vq_ppl']:.4f} "
-            f"valid_vq_acc={valid_metrics['vq_acc']:.4f} "
-            f"valid_hard_bpe_ppl={valid_metrics['pipeline_bpe_hard_ppl']:.4f} "
-            f"valid_marginal_bpe_ppl={valid_metrics['marginal_bpe_ppl']} "
-            f"valid_bpe_top1={valid_metrics['pipeline_bpe_top1']:.4f} "
-            f"test_vq_ppl={test_metrics['vq_ppl']:.4f} "
-            f"test_hard_bpe_ppl={test_metrics['pipeline_bpe_hard_ppl']:.4f} "
-            f"test_marginal_ppl {marginal_text} "
-            f"test_bpe_top1={test_metrics['pipeline_bpe_top1']:.4f} "
-            f"oracle_bpe_ppl={test_metrics['oracle_bpe_ppl']:.4f} "
-            f"oracle_bpe_top1={test_metrics['oracle_bpe_top1']:.4f}"
+            f"valid_bpe_ppl={valid_metrics['bpe_ppl']:.4f} "
+            f"valid_bpe_top1={valid_metrics['bpe_top1']:.4f} "
+            f"valid_bpe_top5={valid_metrics['bpe_top5']:.4f} "
+            f"test_bpe_ppl={test_metrics['bpe_ppl']:.4f} "
+            f"test_bpe_top1={test_metrics['bpe_top1']:.4f} "
+            f"test_bpe_top5={test_metrics['bpe_top5']:.4f}"
         )
+
+        record = {
+            "epoch": epoch,
+            "train_bpe_loss": running_loss / max(running_count, 1),
+            "valid": valid_metrics,
+            "test": test_metrics,
+        }
+        history.append(record)
+
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
             "history": history,
-            "vq_vocab_size": vq_vocab_size,
-            "vq_pad_id": vq_pad_id,
             "token_vocab_size": token_vocab_size,
-            "decoder_frozen": True,
-            "decoder_source": str(args.dictionary),
-            "codebook_source": str(args.codebook),
+            "vq_vocab_size": vq_vocab_size,
+            "tok_pad_id": tok_pad_id,
+            "vq_pad_id": vq_pad_id,
+            "data_source": args.data,
+            "codebook_source": args.codebook,
+            "vq_centers_frozen": True,
             "last_valid": valid_metrics,
             "last_test": test_metrics,
         }
         torch.save(checkpoint, args.out)
 
-        if valid_metrics["vq_loss"] < best_valid:
-            best_valid = valid_metrics["vq_loss"]
-            best_path = str(Path(args.out).with_suffix("")) + "_best.pt"
+        if valid_metrics["bpe_ppl"] < best_valid:
+            best_valid = valid_metrics["bpe_ppl"]
             torch.save(checkpoint, best_path)
             print(f"[save best] {best_path}")
 
