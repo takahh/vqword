@@ -174,7 +174,7 @@ TARGET_CODEBOOK_PATH="${HOP_CODEBOOK_PATHS[10]}"
 DICTIONARY="wikitext103_vqword_${TARGET_TAG}_dictionary.pt"
 DICTIONARY_PATH="/vqword/${DICTIONARY}"
 
-RUN="ar_multihop00_10_to_hop10_bpe${BPE_VOCAB_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_bpein${BPE_INPUT_WEIGHT}_pipebpe${PIPELINE_BPE_LOSS_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_multihop00_10_to_hop10_bpe${BPE_VOCAB_LABEL}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_bpein${BPE_INPUT_WEIGHT}_pipebpe${PIPELINE_BPE_LOSS_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
