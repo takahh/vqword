@@ -54,7 +54,7 @@ DATA_FILE="tinystories_vqword_${TAG}_ids.pt"
 CODEBOOK_FILE="wikitext103_vqword_${TAG}.pt"
 DATA_PATH="/vqword/${DATA_FILE}"
 CODEBOOK_PATH="/vqword/${CODEBOOK_FILE}"
-AR_SCRIPT="/vqword/ar_bpe_plus_sc0vqw.py"
+AR_SCRIPT="/vqword/ar_multihop.py"
 
 RUN="ar_bpeplussc0vqw_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_vqin${VQ_INPUT_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
 FINAL_PATH="/vqword/${RUN}.pt"
