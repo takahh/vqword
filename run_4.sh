@@ -24,6 +24,8 @@ git pull
 # ============================================================
 # 共通設定
 # ============================================================
+CENTER_SCALE=1.0
+CENTER_LABEL=1
 
 BPE_VOCAB_LABEL=50257
 VQ_CODEBOOK_LABEL=100k
@@ -91,7 +93,7 @@ fi
 for HOP in $(seq 0 10); do
   HOP2=$(printf "%02d" "${HOP}")
 
-  BASE_TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center0_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+  BASE_TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_LABEL}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 
   VQ_CKPT="wikitext103_vqword_${BASE_TAG}.pt"
   VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
@@ -137,7 +139,7 @@ EOF
 
   python - <<PY
 import torch
-
+expected_center_scale = float("${CENTER_SCALE}")
 path = "${VQ_CKPT_PATH}"
 expected_hop = int("${HOP}")
 expected_vq_vocab = int("${VQ_CODEBOOK_SIZE}")
@@ -164,11 +166,18 @@ if missing:
 
 args = ckpt["args"]
 actual_hop = int(args["hop"])
+actual_center_scale = float(
+    args.get("center_scale", args.get("center_weight", -1.0))
+)
 actual_vq_vocab = int(ckpt["vq_vocab_size"])
 actual_bpe_vocab = int(
     ckpt["model"]["tok_emb.weight"].shape[0]
 )
-
+if abs(actual_center_scale - expected_center_scale) > 1e-8:
+    raise ValueError(
+        f"Center scale mismatch: expected={expected_center_scale}, "
+        f"actual={actual_center_scale}"
+    )
 if actual_hop != expected_hop:
     raise ValueError(
         f"HOP mismatch: expected={expected_hop}, actual={actual_hop}"
@@ -189,6 +198,7 @@ if actual_bpe_vocab != expected_bpe_vocab:
 print("[checkpoint check] OK")
 print("hop:", actual_hop)
 print("vq_vocab_size:", actual_vq_vocab)
+print("center_scale:", actual_center_scale)
 print("bpe_vocab_size:", actual_bpe_vocab)
 PY
 
