@@ -60,7 +60,7 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
-VQ_INPUT_WEIGHT="${VQ_INPUT_WEIGHT:-0.01}"
+VQ_LOSS_WEIGHT="${VQ_LOSS_WEIGHT:-0.1}"
 
 TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 DATA_FILE="tinystories_vqword_${TAG}_ids.pt"
@@ -76,7 +76,7 @@ if [ "${INPUT_MODE}" = "vq_shuffle" ]; then
   CONTROL_TAG="${INPUT_MODE}${CONTROL_SEED}"
 fi
 
-RUN="ar_cat_${CONTROL_TAG}_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_twostream_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_vqloss${VQ_LOSS_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
 LOG_PATH="/vqword/${RUN}.log"
@@ -139,34 +139,14 @@ print("hop:", expected_hop)
 print("center_scale requested:", expected_scale)
 PY
 
-echo "============================================================"
-echo "[start CAT autoregressive training]"
-echo "mode    = ${INPUT_MODE}"
-echo "target  = BPE[t+1]"
-echo "hop     = bilateral ${TARGET_HOP}"
-echo "center  = ${CENTER_SCALE}"
-
-case "${INPUT_MODE}" in
-  vqw)
-    echo "input   = CAT(BPE[t], projected VQW[t]) -> Linear"
-    ;;
-
-  bpe2)
-    echo "input   = CAT(BPE_embedding1[t], BPE_embedding2[t]) -> Linear"
-    ;;
-
-  vq_shuffle)
-    echo "input   = CAT(BPE[t], projected shuffled-VQW[t]) -> Linear"
-    echo "control seed = ${CONTROL_SEED}"
-    ;;
-
-  zero)
-    echo "input   = CAT(BPE[t], zero vector) -> Linear"
-    ;;
-esac
-echo "target  = BPE[t+1]"
-echo "hop     = bilateral ${TARGET_HOP}"
-echo "center  = ${CENTER_SCALE}"
+eecho "============================================================"
+echo "[start BPE/SC0 two-stream autoregressive training]"
+echo "BPE stream = BPE[t] -> h_bpe"
+echo "VQ stream  = VQW[t] -> h_vq -> VQW[t+1]"
+echo "fusion     = CAT(h_bpe, h_vq) -> BPE[t+1]"
+echo "VQ loss weight = ${VQ_LOSS_WEIGHT}"
+echo "hop        = bilateral ${TARGET_HOP}"
+echo "center     = ${CENTER_SCALE}"
 echo "============================================================"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -185,7 +165,7 @@ python "${AR_SCRIPT}" \
   --dropout "${DROPOUT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
-  --vq_input_weight "${VQ_INPUT_WEIGHT}" \
+  --vq_loss_weight "${VQ_LOSS_WEIGHT}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 
