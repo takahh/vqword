@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
-Two-stream autoregressive language model.
+Input-CAT shared-transformer autoregressive language model.
 
-BPE stream:
-    BPE[t] -> causal Transformer -> h_bpe
-
-VQ stream (matched to the earlier frozen-center multi-hop VQ AR):
-    For target position t+1, collect VQW IDs from source positions
-        t-hop, for hop=0..10
-    Lookup each HOP-specific frozen codebook center
-    -> trainable HOP-specific projection
-    -> gated aggregation
-    -> optional 0.01 * BPE[t] auxiliary input
-    -> causal Transformer
-    -> next HOP10 VQW logits
+Inputs:
+    BPE[t] embedding
+    Multi-hop VQ context from HOP0..HOP10 frozen centers
 
 Fusion:
-    CAT(h_bpe, h_vq) -> learned projection -> BPE[t+1] logits
+    CAT(BPE embedding, aggregated multi-hop VQ context)
+    -> learned projection
+    -> shared causal Transformer
+    -> BPE[t+1] head and HOP10 VQW[t+1] head
 
 Frozen:
     - all HOP0..HOP10 codebook centers
@@ -198,7 +192,7 @@ class FrozenCenterEmbedding(nn.Module):
         )
 
 
-class BPETwoStreamMultiHopVQLM(nn.Module):
+class BPEMultiHopSharedCatLM(nn.Module):
     def __init__(
         self,
         hop_centers,
@@ -209,7 +203,6 @@ class BPETwoStreamMultiHopVQLM(nn.Module):
         n_heads=8,
         dropout=0.1,
         max_len=255,
-        vq_bpe_input_weight=0.01,
         tie_weights=False,
     ):
         super().__init__()
@@ -223,52 +216,37 @@ class BPETwoStreamMultiHopVQLM(nn.Module):
         self.tok_pad_id = self.token_vocab_size
         self.vq_pad_id = self.vq_vocab_size
         self.d_model = int(d_model)
-        self.vq_bpe_input_weight = float(vq_bpe_input_weight)
 
-        # ---------------- BPE stream ----------------
+        # ---------------- BPE input ----------------
         self.tok_emb = nn.Embedding(
             self.token_vocab_size + 1,
             d_model,
             padding_idx=self.tok_pad_id,
         )
-        self.bpe_pos_emb = nn.Embedding(max_len, d_model)
 
-        bpe_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=4 * d_model,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.bpe_transformer = nn.TransformerEncoder(
-            bpe_layer,
-            num_layers=n_layers,
-        )
-        self.bpe_norm = nn.LayerNorm(d_model)
-
-        # ---------------- VQ stream ----------------
+        # ---------------- Multi-hop VQ input ----------------
         self.center_embeddings = nn.ModuleList([
             FrozenCenterEmbedding(centers)
             for centers in hop_centers
         ])
-
         self.hop_projections = nn.ModuleList([
             nn.Linear(centers.size(1), d_model, bias=False)
             for centers in hop_centers
         ])
-
         self.hop_gates = nn.Parameter(torch.zeros(self.num_hops))
         self.vq_context_norm = nn.LayerNorm(d_model)
 
-        # Same small BPE auxiliary path as the earlier VQ AR.
-        self.vq_bpe_proj = nn.Linear(d_model, d_model, bias=False)
-        with torch.no_grad():
-            self.vq_bpe_proj.weight.copy_(torch.eye(d_model))
+        # CAT([BPE embedding, multi-hop VQ context]) -> d_model
+        self.input_fusion_proj = nn.Linear(
+            2 * d_model,
+            d_model,
+            bias=True,
+        )
+        self.input_fusion_norm = nn.LayerNorm(d_model)
+        self.pos_emb = nn.Embedding(max_len, d_model)
 
-        self.vq_pos_emb = nn.Embedding(max_len, d_model)
-
-        vq_layer = nn.TransformerEncoderLayer(
+        # ---------------- Shared Transformer ----------------
+        shared_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=4 * d_model,
@@ -276,25 +254,13 @@ class BPETwoStreamMultiHopVQLM(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.vq_transformer = nn.TransformerEncoder(
-            vq_layer,
+        self.shared_transformer = nn.TransformerEncoder(
+            shared_layer,
             num_layers=n_layers,
         )
-        self.vq_norm = nn.LayerNorm(d_model)
-        self.vq_head = nn.Linear(
-            d_model,
-            self.vq_vocab_size,
-            bias=True,
-        )
+        self.shared_norm = nn.LayerNorm(d_model)
 
-        # ---------------- Fusion ----------------
-        self.fusion_proj = nn.Linear(
-            2 * d_model,
-            d_model,
-            bias=True,
-        )
-        self.fusion_norm = nn.LayerNorm(d_model)
-
+        # ---------------- Two output heads ----------------
         self.bpe_head = nn.Linear(
             d_model,
             self.token_vocab_size,
@@ -302,6 +268,11 @@ class BPETwoStreamMultiHopVQLM(nn.Module):
         )
         self.bpe_bias = nn.Parameter(
             torch.zeros(self.token_vocab_size)
+        )
+        self.vq_head = nn.Linear(
+            d_model,
+            self.vq_vocab_size,
+            bias=True,
         )
 
         if tie_weights:
@@ -318,10 +289,10 @@ class BPETwoStreamMultiHopVQLM(nn.Module):
     ):
         batch_size, seq_len = tok_in.shape
 
-        if seq_len > self.bpe_pos_emb.num_embeddings:
+        if seq_len > self.pos_emb.num_embeddings:
             raise ValueError(
                 f"sequence length {seq_len} exceeds max_len "
-                f"{self.bpe_pos_emb.num_embeddings}"
+                f"{self.pos_emb.num_embeddings}"
             )
 
         pos = torch.arange(
@@ -339,23 +310,16 @@ class BPETwoStreamMultiHopVQLM(nn.Module):
             diagonal=1,
         )
 
-        # ---------------- BPE stream ----------------
-        bpe_h = self.tok_emb(tok_in)
-        bpe_h = bpe_h + self.bpe_pos_emb(pos)
-        bpe_h = self.bpe_transformer(
-            bpe_h,
-            mask=causal_mask,
-            src_key_padding_mask=key_padding_mask,
-        )
-        bpe_h = self.bpe_norm(bpe_h)
+        # ---------------- BPE representation ----------------
+        bpe_x = self.tok_emb(tok_in)
 
-        # ---------------- VQ stream ----------------
+        # ---------------- Multi-hop VQ aggregation ----------------
         context_h = torch.zeros(
             batch_size,
             seq_len,
             self.d_model,
             device=tok_in.device,
-            dtype=self.vq_head.weight.dtype,
+            dtype=bpe_x.dtype,
         )
 
         gate_values = F.softplus(self.hop_gates)
@@ -379,35 +343,28 @@ class BPETwoStreamMultiHopVQLM(nn.Module):
         context_h = context_h / valid_count.sqrt()
         context_h = self.vq_context_norm(context_h)
 
-        # Reproduce the earlier VQ AR condition.
-        vq_bpe_h = self.vq_bpe_proj(self.tok_emb(tok_in))
-        vq_h = (
-            context_h
-            + self.vq_bpe_input_weight * vq_bpe_h
-        )
-        vq_h = vq_h + self.vq_pos_emb(pos)
+        # ---------------- Input CAT and shared processing ----------------
+        shared_x = torch.cat([bpe_x, context_h], dim=-1)
+        shared_x = self.input_fusion_proj(shared_x)
+        shared_x = self.input_fusion_norm(shared_x)
+        shared_x = shared_x + self.pos_emb(pos)
 
-        vq_h = self.vq_transformer(
-            vq_h,
+        shared_h = self.shared_transformer(
+            shared_x,
             mask=causal_mask,
             src_key_padding_mask=key_padding_mask,
         )
-        vq_h = self.vq_norm(vq_h)
-        vq_logits = self.vq_head(vq_h)
+        shared_h = self.shared_norm(shared_h)
 
-        # ---------------- Fusion ----------------
-        fused_h = torch.cat([bpe_h, vq_h], dim=-1)
-        fused_h = self.fusion_proj(fused_h)
-        fused_h = self.fusion_norm(fused_h)
-
-        bpe_logits = self.bpe_head(fused_h) + self.bpe_bias
+        bpe_logits = self.bpe_head(shared_h) + self.bpe_bias
+        vq_logits = self.vq_head(shared_h)
 
         return {
             "bpe_logits": bpe_logits,
             "vq_logits": vq_logits,
-            "bpe_hidden": bpe_h,
-            "vq_hidden": vq_h,
-            "fused_hidden": fused_h,
+            "shared_hidden": shared_h,
+            "bpe_input": bpe_x,
+            "vq_context_hidden": context_h,
         }
 
 
@@ -550,13 +507,6 @@ def main():
         default=1.0,
         help="weight for next-HOP10-VQW auxiliary loss",
     )
-    ap.add_argument(
-        "--vq_bpe_input_weight",
-        type=float,
-        default=0.01,
-        help="small BPE auxiliary input inside the VQ stream",
-    )
-
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -654,9 +604,8 @@ def main():
             f"used={torch.unique(ids).numel():,}"
         )
 
-    print("[architecture] BPE stream + frozen-center multi-hop VQ stream")
+    print("[architecture] input CAT(BPE, multi-hop VQ) + shared Transformer + two heads")
     print("[VQ target] HOP10 VQW[t+1]")
-    print(f"[VQ BPE auxiliary weight] {args.vq_bpe_input_weight}")
     print(f"[VQ loss weight] {args.vq_loss_weight}")
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
@@ -714,7 +663,7 @@ def main():
     valid_loader = make_loader(valid_ds, False)
     test_loader = make_loader(test_ds, False)
 
-    model = BPETwoStreamMultiHopVQLM(
+    model = BPEMultiHopSharedCatLM(
         hop_centers=hop_centers,
         token_vocab_size=token_vocab_size,
         target_vq_vocab_size=vq_vocab_size,
@@ -723,7 +672,6 @@ def main():
         n_heads=args.n_heads,
         dropout=args.dropout,
         max_len=args.max_len,
-        vq_bpe_input_weight=args.vq_bpe_input_weight,
         tie_weights=args.tie_weights,
     ).to(device)
 
@@ -862,7 +810,6 @@ def main():
                 running_vq_loss / max(running_count, 1)
             ),
             "vq_loss_weight": args.vq_loss_weight,
-            "vq_bpe_input_weight": args.vq_bpe_input_weight,
             "valid": valid_metrics,
             "test": test_metrics,
         }
@@ -871,7 +818,7 @@ def main():
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "architecture": "bpe_multihop_vqw_two_stream",
+            "architecture": "bpe_multihop_vqw_input_cat_shared",
             "history": history,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
@@ -882,7 +829,6 @@ def main():
             "vq_centers_frozen": True,
             "vq_target_hop": 10,
             "vq_loss_weight": args.vq_loss_weight,
-            "vq_bpe_input_weight": args.vq_bpe_input_weight,
             "last_valid": valid_metrics,
             "last_test": test_metrics,
         }
