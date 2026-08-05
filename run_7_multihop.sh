@@ -31,8 +31,6 @@ if [ "$#" -ne 2 ]; then
   echo "Usage: $0 {100k} {ar_seed}"
   echo
   echo "Example:"
-  echo "  VQ_LOSS_WEIGHT=1.0 \\"
-  echo "  VQ_BPE_INPUT_WEIGHT=0.01 \\"
   echo "  CENTER_SCALE=0 \\"
   echo "  $0 100k 0"
   exit 1
@@ -74,11 +72,8 @@ LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
 
-# Earlier multi-hop VQ AR condition
-VQ_LOSS_WEIGHT="${VQ_LOSS_WEIGHT:-1.0}"
-VQ_BPE_INPUT_WEIGHT="${VQ_BPE_INPUT_WEIGHT:-0.01}"
-
-AR_SCRIPT="/vqword/ar_multihop.py"
+# Input-CAT -> shared Transformer -> BPE-only model
+AR_SCRIPT="/vqword/ar_bpe_multihop_input_cat_bpe_only.py"
 
 # ============================================================
 # Construct HOP0 ... HOP10 filenames
@@ -108,7 +103,7 @@ done
 # Output names
 # ============================================================
 
-RUN="ar_twostream_multihop_bpe${BPE_VOCAB_LABEL}_bilateral00to10_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_vqloss${VQ_LOSS_WEIGHT}_vqbpe${VQ_BPE_INPUT_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_inputcat_bpeonly_multihop_bpe${BPE_VOCAB_LABEL}_bilateral00to10_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_$(date +%Y%m%d_%H%M%S)"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
@@ -382,25 +377,20 @@ PY
 # ============================================================
 
 echo "============================================================"
-echo "[start BPE + multi-hop VQW two-stream AR training]"
+echo "[start input-CAT BPE-only AR training]"
 echo
-echo "BPE stream:"
-echo "  BPE[t] -> causal Transformer -> h_bpe"
-echo
-echo "VQ stream:"
-echo "  HOP0..HOP10 frozen centers"
-echo "  -> HOP-specific projections and gates"
-echo "  -> + ${VQ_BPE_INPUT_WEIGHT} * BPE[t]"
-echo "  -> causal Transformer"
-echo "  -> HOP10 VQW[t+1]"
+echo "Input:"
+echo "  BPE[t] embedding"
+echo "  + aggregated HOP0..HOP10 frozen-center context"
 echo
 echo "Fusion:"
-echo "  CAT(h_bpe, h_vq)"
+echo "  CAT(BPE embedding, multi-hop VQ context)"
 echo "  -> learned projection"
+echo "  -> shared causal Transformer"
 echo "  -> BPE[t+1]"
 echo
-echo "VQ loss weight       = ${VQ_LOSS_WEIGHT}"
-echo "VQ BPE input weight  = ${VQ_BPE_INPUT_WEIGHT}"
+echo "VQ prediction head   = disabled"
+echo "VQ auxiliary loss    = disabled"
 echo "center scale         = ${CENTER_SCALE}"
 echo "AR seed              = ${AR_SEED}"
 echo "============================================================"
@@ -422,7 +412,6 @@ python "${AR_SCRIPT}" \
   --dropout "${DROPOUT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
-  --vq_loss_weight "${VQ_LOSS_WEIGHT}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 
