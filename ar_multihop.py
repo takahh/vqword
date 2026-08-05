@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
 """
-BPE + SC0VQW autoregressive language model.
+Two-stream autoregressive language model.
 
-Pipeline:
-    input at position t:
-        BPE[t] + alpha * projected(SC0VQW[t])
-    causal Transformer
-    target:
-        BPE[t+1]
+BPE stream:
+    BPE[t] -> causal Transformer -> h_bpe
 
-The SC0 VQ codebook centers are frozen. The BPE embedding, VQ projection,
-Transformer, and BPE output head are trained end-to-end.
+VQ stream (matched to the earlier frozen-center multi-hop VQ AR):
+    For target position t+1, collect VQW IDs from source positions
+        t-hop, for hop=0..10
+    Lookup each HOP-specific frozen codebook center
+    -> trainable HOP-specific projection
+    -> gated aggregation
+    -> optional 0.01 * BPE[t] auxiliary input
+    -> causal Transformer
+    -> next HOP10 VQW logits
+
+Fusion:
+    CAT(h_bpe, h_vq) -> learned projection -> BPE[t+1] logits
+
+Frozen:
+    - all HOP0..HOP10 codebook centers
+
+Trainable:
+    - BPE embedding / BPE Transformer
+    - HOP projections and gates
+    - VQ Transformer and VQ head
+    - fusion and BPE output head
 """
 
 import argparse
@@ -25,18 +40,34 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
-class BPEPlusSC0Dataset(Dataset):
-    def __init__(self, samples, token_ids_flat, vq_ids_flat, max_len=512):
+class MultiHopTwoStreamDataset(Dataset):
+    def __init__(
+        self,
+        samples,
+        token_ids_flat,
+        hop_vq_ids_flat,
+        vq_pad_id,
+        max_len=255,
+        target_hop=10,
+    ):
+        if len(hop_vq_ids_flat) != 11:
+            raise ValueError("Exactly 11 HOP ID tensors are required")
+
         self.samples = []
         self.token_ids_flat = token_ids_flat.long().reshape(-1)
-        self.vq_ids_flat = vq_ids_flat.long().reshape(-1)
+        self.hop_vq_ids_flat = [
+            x.long().reshape(-1) for x in hop_vq_ids_flat
+        ]
+        self.vq_pad_id = int(vq_pad_id)
         self.max_len = int(max_len)
+        self.target_hop = int(target_hop)
 
-        if self.token_ids_flat.numel() != self.vq_ids_flat.numel():
-            raise ValueError(
-                f"BPE/VQ length mismatch: {self.token_ids_flat.numel()} vs "
-                f"{self.vq_ids_flat.numel()}"
-            )
+        for hop, ids in enumerate(self.hop_vq_ids_flat):
+            if ids.numel() != self.token_ids_flat.numel():
+                raise ValueError(
+                    f"HOP{hop}: VQ/token length mismatch: "
+                    f"{ids.numel()} vs {self.token_ids_flat.numel()}"
+                )
 
         for sample in samples:
             start = int(sample["start"])
@@ -50,15 +81,48 @@ class BPEPlusSC0Dataset(Dataset):
 
     def __getitem__(self, index):
         start, end = self.samples[index]
+        length = end - start
+
+        # One training row corresponds to predicting local positions 1..length-1.
+        target_positions = torch.arange(1, length)
+
+        # For target position u, HOP h reads source u-h-1.
+        # Shape: [L-1, 11]
+        vq_context = torch.full(
+            (length - 1, 11),
+            self.vq_pad_id,
+            dtype=torch.long,
+        )
+        hop_valid = torch.zeros(
+            (length - 1, 11),
+            dtype=torch.bool,
+        )
+
+        for hop in range(11):
+            source_positions = target_positions - hop - 1
+            valid = source_positions >= 0
+            if valid.any():
+                global_source = start + source_positions[valid]
+                vq_context[valid, hop] = self.hop_vq_ids_flat[hop][
+                    global_source
+                ]
+                hop_valid[valid, hop] = True
+
+        tok_in = self.token_ids_flat[start:end - 1]
+        tok_y = self.token_ids_flat[start + 1:end]
+
+        # Same target definition as the earlier VQ AR:
+        # predict HOP10 VQW at the next physical-token position.
+        vq_y = self.hop_vq_ids_flat[self.target_hop][
+            start + 1:end
+        ]
 
         return {
-            # position t
-            "tok_in": self.token_ids_flat[start:end - 1],
-            "vq_in": self.vq_ids_flat[start:end - 1],
-
-            # position t+1
-            "tok_y": self.token_ids_flat[start + 1:end],
-            "vq_y": self.vq_ids_flat[start + 1:end],
+            "tok_in": tok_in,
+            "vq_context": vq_context,
+            "hop_valid": hop_valid,
+            "tok_y": tok_y,
+            "vq_y": vq_y,
         }
 
 
@@ -71,26 +135,25 @@ def collate_batch(batch, tok_pad_id, vq_pad_id):
         tok_pad_id,
         dtype=torch.long,
     )
-
-    vq_in = torch.full(
-        (batch_size, max_len),
+    vq_context = torch.full(
+        (batch_size, max_len, 11),
         vq_pad_id,
         dtype=torch.long,
     )
-
-    # cross_entropyのignore_index用
+    hop_valid = torch.zeros(
+        (batch_size, max_len, 11),
+        dtype=torch.bool,
+    )
     tok_y = torch.full(
         (batch_size, max_len),
         -100,
         dtype=torch.long,
     )
-
     vq_y = torch.full(
         (batch_size, max_len),
         -100,
         dtype=torch.long,
     )
-
     attention_mask = torch.zeros(
         (batch_size, max_len),
         dtype=torch.bool,
@@ -98,20 +161,22 @@ def collate_batch(batch, tok_pad_id, vq_pad_id):
 
     for i, item in enumerate(batch):
         n = item["tok_in"].numel()
-
         tok_in[i, :n] = item["tok_in"]
-        vq_in[i, :n] = item["vq_in"]
+        vq_context[i, :n] = item["vq_context"]
+        hop_valid[i, :n] = item["hop_valid"]
         tok_y[i, :n] = item["tok_y"]
         vq_y[i, :n] = item["vq_y"]
         attention_mask[i, :n] = True
 
     return (
         tok_in,
-        vq_in,
+        vq_context,
+        hop_valid,
         tok_y,
         vq_y,
         attention_mask,
     )
+
 
 class FrozenCenterEmbedding(nn.Module):
     def __init__(self, centers):
@@ -120,64 +185,53 @@ class FrozenCenterEmbedding(nn.Module):
         self.padding_idx = int(centers.size(0))
         zero = torch.zeros(1, centers.size(1), dtype=centers.dtype)
         self.register_buffer(
-            "weight", torch.cat([centers, zero], dim=0), persistent=False
+            "weight",
+            torch.cat([centers, zero], dim=0),
+            persistent=False,
         )
 
     def forward(self, ids):
-        return F.embedding(ids, self.weight, padding_idx=self.padding_idx)
+        return F.embedding(
+            ids,
+            self.weight,
+            padding_idx=self.padding_idx,
+        )
 
 
-class BPESC0TwoStreamLM(nn.Module):
-    """
-    Two-stream autoregressive model.
-
-    BPE stream:
-        BPE[t] -> causal Transformer -> h_bpe
-
-    VQ stream:
-        VQW[t] -> causal Transformer -> h_vq
-               -> auxiliary prediction of VQW[t+1]
-
-    Fusion:
-        CAT(h_bpe, h_vq)
-        -> Linear
-        -> final prediction of BPE[t+1]
-    """
-
+class BPETwoStreamMultiHopVQLM(nn.Module):
     def __init__(
         self,
-        centers,
+        hop_centers,
         token_vocab_size,
+        target_vq_vocab_size,
         d_model=256,
         n_layers=6,
         n_heads=8,
         dropout=0.1,
-        max_len=512,
+        max_len=255,
+        vq_bpe_input_weight=0.01,
         tie_weights=False,
     ):
         super().__init__()
 
-        self.token_vocab_size = int(token_vocab_size)
-        self.vq_vocab_size = int(centers.size(0))
+        if len(hop_centers) != 11:
+            raise ValueError("Expected 11 HOP center matrices")
 
+        self.num_hops = 11
+        self.token_vocab_size = int(token_vocab_size)
+        self.vq_vocab_size = int(target_vq_vocab_size)
         self.tok_pad_id = self.token_vocab_size
         self.vq_pad_id = self.vq_vocab_size
         self.d_model = int(d_model)
+        self.vq_bpe_input_weight = float(vq_bpe_input_weight)
 
-        # ====================================================
-        # BPE stream
-        # ====================================================
-
+        # ---------------- BPE stream ----------------
         self.tok_emb = nn.Embedding(
             self.token_vocab_size + 1,
             d_model,
             padding_idx=self.tok_pad_id,
         )
-
-        self.bpe_pos_emb = nn.Embedding(
-            max_len,
-            d_model,
-        )
+        self.bpe_pos_emb = nn.Embedding(max_len, d_model)
 
         bpe_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -187,35 +241,32 @@ class BPESC0TwoStreamLM(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-
         self.bpe_transformer = nn.TransformerEncoder(
             bpe_layer,
             num_layers=n_layers,
         )
-
         self.bpe_norm = nn.LayerNorm(d_model)
 
-        # ====================================================
-        # VQ stream
-        # ====================================================
+        # ---------------- VQ stream ----------------
+        self.center_embeddings = nn.ModuleList([
+            FrozenCenterEmbedding(centers)
+            for centers in hop_centers
+        ])
 
-        # コードブック中心は固定
-        self.vq_emb = FrozenCenterEmbedding(centers)
+        self.hop_projections = nn.ModuleList([
+            nn.Linear(centers.size(1), d_model, bias=False)
+            for centers in hop_centers
+        ])
 
-        # 元のコードブック空間からVQ Transformer空間へ写像
-        self.vq_proj = nn.Linear(
-            centers.size(1),
-            d_model,
-            bias=False,
-        )
+        self.hop_gates = nn.Parameter(torch.zeros(self.num_hops))
+        self.vq_context_norm = nn.LayerNorm(d_model)
 
-        self.vq_input_norm = nn.LayerNorm(d_model)
+        # Same small BPE auxiliary path as the earlier VQ AR.
+        self.vq_bpe_proj = nn.Linear(d_model, d_model, bias=False)
+        with torch.no_grad():
+            self.vq_bpe_proj.weight.copy_(torch.eye(d_model))
 
-        # BPE側とは別の位置埋め込みを持たせる
-        self.vq_pos_emb = nn.Embedding(
-            max_len,
-            d_model,
-        )
+        self.vq_pos_emb = nn.Embedding(max_len, d_model)
 
         vq_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -225,31 +276,23 @@ class BPESC0TwoStreamLM(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-
         self.vq_transformer = nn.TransformerEncoder(
             vq_layer,
             num_layers=n_layers,
         )
-
         self.vq_norm = nn.LayerNorm(d_model)
-
-        # VQW[t+1] auxiliary prediction
         self.vq_head = nn.Linear(
             d_model,
             self.vq_vocab_size,
             bias=True,
         )
 
-        # ====================================================
-        # Fusion and final BPE prediction
-        # ====================================================
-
+        # ---------------- Fusion ----------------
         self.fusion_proj = nn.Linear(
             2 * d_model,
             d_model,
             bias=True,
         )
-
         self.fusion_norm = nn.LayerNorm(d_model)
 
         self.bpe_head = nn.Linear(
@@ -257,13 +300,11 @@ class BPESC0TwoStreamLM(nn.Module):
             self.token_vocab_size,
             bias=False,
         )
-
         self.bpe_bias = nn.Parameter(
             torch.zeros(self.token_vocab_size)
         )
 
         if tie_weights:
-            # 元コードと同じ方式
             self.bpe_head.weight = self.tok_emb.weight[
                 :self.token_vocab_size
             ]
@@ -271,7 +312,8 @@ class BPESC0TwoStreamLM(nn.Module):
     def forward(
         self,
         tok_in,
-        vq_in,
+        vq_context,
+        hop_valid,
         key_padding_mask=None,
     ):
         batch_size, seq_len = tok_in.shape
@@ -297,28 +339,52 @@ class BPESC0TwoStreamLM(nn.Module):
             diagonal=1,
         )
 
-        # ====================================================
-        # BPE stream
-        # ====================================================
-
+        # ---------------- BPE stream ----------------
         bpe_h = self.tok_emb(tok_in)
         bpe_h = bpe_h + self.bpe_pos_emb(pos)
-
         bpe_h = self.bpe_transformer(
             bpe_h,
             mask=causal_mask,
             src_key_padding_mask=key_padding_mask,
         )
-
         bpe_h = self.bpe_norm(bpe_h)
 
-        # ====================================================
-        # VQ stream
-        # ====================================================
+        # ---------------- VQ stream ----------------
+        context_h = torch.zeros(
+            batch_size,
+            seq_len,
+            self.d_model,
+            device=tok_in.device,
+            dtype=self.vq_head.weight.dtype,
+        )
 
-        vq_h = self.vq_emb(vq_in)
-        vq_h = self.vq_proj(vq_h)
-        vq_h = self.vq_input_norm(vq_h)
+        gate_values = F.softplus(self.hop_gates)
+        valid_count = hop_valid.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1)
+
+        for hop in range(self.num_hops):
+            ids = vq_context[:, :, hop]
+            center_h = self.center_embeddings[hop](ids)
+            projected = self.hop_projections[hop](center_h)
+            valid = hop_valid[:, :, hop].unsqueeze(-1)
+
+            context_h = context_h + (
+                gate_values[hop]
+                * projected
+                * valid
+            )
+
+        context_h = context_h / valid_count.sqrt()
+        context_h = self.vq_context_norm(context_h)
+
+        # Reproduce the earlier VQ AR condition.
+        vq_bpe_h = self.vq_bpe_proj(self.tok_emb(tok_in))
+        vq_h = (
+            context_h
+            + self.vq_bpe_input_weight * vq_bpe_h
+        )
         vq_h = vq_h + self.vq_pos_emb(pos)
 
         vq_h = self.vq_transformer(
@@ -326,29 +392,15 @@ class BPESC0TwoStreamLM(nn.Module):
             mask=causal_mask,
             src_key_padding_mask=key_padding_mask,
         )
-
         vq_h = self.vq_norm(vq_h)
-
-        # SC0[t] -> SC0[t+1]
         vq_logits = self.vq_head(vq_h)
 
-        # ====================================================
-        # Fusion
-        # ====================================================
-
-        fused_h = torch.cat(
-            [bpe_h, vq_h],
-            dim=-1,
-        )
-
+        # ---------------- Fusion ----------------
+        fused_h = torch.cat([bpe_h, vq_h], dim=-1)
         fused_h = self.fusion_proj(fused_h)
         fused_h = self.fusion_norm(fused_h)
 
-        # BPE[t+1]
-        bpe_logits = (
-            self.bpe_head(fused_h)
-            + self.bpe_bias
-        )
+        bpe_logits = self.bpe_head(fused_h) + self.bpe_bias
 
         return {
             "bpe_logits": bpe_logits,
@@ -358,41 +410,39 @@ class BPESC0TwoStreamLM(nn.Module):
             "fused_hidden": fused_h,
         }
 
+
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
 
     total_bpe_loss = 0.0
     total_vq_loss = 0.0
-
     total_count = 0
-
     total_bpe_top1 = 0
     total_bpe_top5 = 0
-
     total_vq_top1 = 0
     total_vq_top5 = 0
 
     for (
         tok_in,
-        vq_in,
+        vq_context,
+        hop_valid,
         tok_y,
         vq_y,
         attention_mask,
-    ) in tqdm(
-        loader,
-        desc="[eval]",
-        leave=False,
-    ):
+    ) in tqdm(loader, desc="[eval]", leave=False):
+
         tok_in = tok_in.to(device)
-        vq_in = vq_in.to(device)
+        vq_context = vq_context.to(device)
+        hop_valid = hop_valid.to(device)
         tok_y = tok_y.to(device)
         vq_y = vq_y.to(device)
         attention_mask = attention_mask.to(device)
 
         output = model(
-            tok_in,
-            vq_in,
+            tok_in=tok_in,
+            vq_context=vq_context,
+            hop_valid=hop_valid,
             key_padding_mask=~attention_mask,
         )
 
@@ -400,20 +450,13 @@ def evaluate(model, loader, device):
         vq_logits = output["vq_logits"]
 
         bpe_loss = F.cross_entropy(
-            bpe_logits.reshape(
-                -1,
-                bpe_logits.size(-1),
-            ),
+            bpe_logits.reshape(-1, bpe_logits.size(-1)),
             tok_y.reshape(-1),
             ignore_index=-100,
             reduction="sum",
         )
-
         vq_loss = F.cross_entropy(
-            vq_logits.reshape(
-                -1,
-                vq_logits.size(-1),
-            ),
+            vq_logits.reshape(-1, vq_logits.size(-1)),
             vq_y.reshape(-1),
             ignore_index=-100,
             reduction="sum",
@@ -422,57 +465,36 @@ def evaluate(model, loader, device):
         valid = tok_y.ne(-100)
         n = int(valid.sum().item())
 
-        # BPE metrics
         bpe_pred = bpe_logits[valid]
         bpe_target = tok_y[valid]
-
         bpe_topk = bpe_pred.topk(
             min(5, bpe_pred.size(-1)),
             dim=-1,
         ).indices
 
-        total_bpe_top1 += int(
-            bpe_topk[:, 0]
-            .eq(bpe_target)
-            .sum()
-            .item()
-        )
-
-        total_bpe_top5 += int(
-            bpe_topk
-            .eq(bpe_target[:, None])
-            .any(dim=1)
-            .sum()
-            .item()
-        )
-
-        # VQ metrics
         vq_pred = vq_logits[valid]
         vq_target = vq_y[valid]
-
         vq_topk = vq_pred.topk(
             min(5, vq_pred.size(-1)),
             dim=-1,
         ).indices
 
-        total_vq_top1 += int(
-            vq_topk[:, 0]
-            .eq(vq_target)
-            .sum()
-            .item()
-        )
-
-        total_vq_top5 += int(
-            vq_topk
-            .eq(vq_target[:, None])
-            .any(dim=1)
-            .sum()
-            .item()
-        )
-
         total_bpe_loss += float(bpe_loss.item())
         total_vq_loss += float(vq_loss.item())
         total_count += n
+
+        total_bpe_top1 += int(
+            bpe_topk[:, 0].eq(bpe_target).sum().item()
+        )
+        total_bpe_top5 += int(
+            bpe_topk.eq(bpe_target[:, None]).any(dim=1).sum().item()
+        )
+        total_vq_top1 += int(
+            vq_topk[:, 0].eq(vq_target).sum().item()
+        )
+        total_vq_top5 += int(
+            vq_topk.eq(vq_target[:, None]).any(dim=1).sum().item()
+        )
 
     bpe_ce = total_bpe_loss / max(total_count, 1)
     vq_ce = total_vq_loss / max(total_count, 1)
@@ -482,22 +504,34 @@ def evaluate(model, loader, device):
         "bpe_ppl": math.exp(min(bpe_ce, 20.0)),
         "bpe_top1": total_bpe_top1 / max(total_count, 1),
         "bpe_top5": total_bpe_top5 / max(total_count, 1),
-
         "vq_loss": vq_ce,
         "vq_ppl": math.exp(min(vq_ce, 20.0)),
         "vq_top1": total_vq_top1 / max(total_count, 1),
         "vq_top5": total_vq_top5 / max(total_count, 1),
-
         "count": total_count,
     }
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="TinyStories SC0 VQ ID file")
-    ap.add_argument("--codebook", required=True, help="matching SC0 VQ codebook")
-    ap.add_argument("--out", default="ar_bpe_plus_sc0vqw.pt")
-    ap.add_argument("--vq_input_weight", type=float, default=0.01)
+
+    ap.add_argument(
+        "--hop_data",
+        nargs=11,
+        required=True,
+        help="HOP0 ... HOP10 TinyStories VQ ID files",
+    )
+    ap.add_argument(
+        "--hop_codebooks",
+        nargs=11,
+        required=True,
+        help="HOP0 ... HOP10 codebook checkpoint files",
+    )
+    ap.add_argument(
+        "--out",
+        default="ar_bpe_multihop_vqw_two_stream.pt",
+    )
+
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -509,36 +543,20 @@ def main():
     ap.add_argument("--max_len", type=int, default=255)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tie_weights", action="store_true")
+
     ap.add_argument(
         "--vq_loss_weight",
         type=float,
-        default=0.1,
-        help="weight for next-VQ auxiliary loss",
+        default=1.0,
+        help="weight for next-HOP10-VQW auxiliary loss",
     )
     ap.add_argument(
-        "--input_mode",
-        type=str,
-        default="vqw",
-        choices=[
-            "vqw",
-            "bpe2",
-            "vq_shuffle",
-            "zero",
-        ],
-        help=(
-            "vqw: normal BPE + VQW concat; "
-            "bpe2: two independently learned BPE embeddings; "
-            "vq_shuffle: globally shuffled VQ IDs; "
-            "zero: zero-valued second input channel"
-        ),
+        "--vq_bpe_input_weight",
+        type=float,
+        default=0.01,
+        help="small BPE auxiliary input inside the VQ stream",
     )
 
-    ap.add_argument(
-        "--control_seed",
-        type=int,
-        default=12345,
-        help="seed used for control-input construction such as VQ shuffling",
-    )
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -546,131 +564,182 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
     print(f"[device] {device}")
 
-    data = torch.load(args.data, map_location="cpu", weights_only=False)
-    codebook = torch.load(args.codebook, map_location="cpu", weights_only=False)
+    hop_data = [
+        torch.load(path, map_location="cpu", weights_only=False)
+        for path in args.hop_data
+    ]
+    reference = hop_data[0]
 
-    required = {"samples", "token_ids_flat", "vq_ids_flat"}
-    missing = sorted(required - set(data.keys()))
-    if missing:
-        raise KeyError(f"data missing keys: {missing}")
-    if "global_centers" not in codebook:
-        raise KeyError("codebook missing global_centers")
+    samples = list(reference["samples"])
+    token_ids_flat = reference["token_ids_flat"].long().reshape(-1)
+    hop_vq_ids_flat = [
+        data["vq_ids_flat"].long().reshape(-1)
+        for data in hop_data
+    ]
 
-    samples = list(data["samples"])
-    token_ids_flat = data["token_ids_flat"].long().reshape(-1)
-    vq_ids_flat = data["vq_ids_flat"].long().reshape(-1)
-    centers = codebook["global_centers"].float()
-    if args.input_mode == "vq_shuffle":
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(args.control_seed)
+    for hop, data in enumerate(hop_data):
+        current_tokens = data["token_ids_flat"].long().reshape(-1)
+        if not torch.equal(token_ids_flat, current_tokens):
+            raise ValueError(
+                f"HOP{hop}: token_ids_flat does not match HOP0"
+            )
 
-        permutation = torch.randperm(
-            vq_ids_flat.numel(),
-            generator=generator,
-        )
+        if len(data["samples"]) != len(samples):
+            raise ValueError(
+                f"HOP{hop}: sample count mismatch"
+            )
 
-        vq_ids_flat = vq_ids_flat[permutation]
+        for i, (ref_sample, current_sample) in enumerate(
+            zip(samples, data["samples"])
+        ):
+            for key in ("sample_idx", "start", "end", "length"):
+                if int(ref_sample[key]) != int(current_sample[key]):
+                    raise ValueError(
+                        f"HOP{hop}: sample metadata mismatch "
+                        f"at sample={i}, key={key}"
+                    )
 
+        recorded_hop = int(data.get("hop", -1))
+        if recorded_hop != hop:
+            raise ValueError(
+                f"Expected HOP{hop} data, metadata says HOP{recorded_hop}"
+            )
+
+    hop_centers = []
+    vq_vocab_size = None
+    center_dim = None
+
+    for expected_hop, path in enumerate(args.hop_codebooks):
+        raw = torch.load(path, map_location="cpu", weights_only=False)
+        actual_hop = int(raw.get("args", {}).get("hop", -1))
+        if actual_hop != expected_hop:
+            raise ValueError(
+                f"Expected HOP{expected_hop} codebook, "
+                f"but metadata says HOP{actual_hop}"
+            )
+
+        centers = raw["global_centers"].float()
+
+        if vq_vocab_size is None:
+            vq_vocab_size = int(centers.size(0))
+            center_dim = int(centers.size(1))
+        elif tuple(centers.shape) != (vq_vocab_size, center_dim):
+            raise ValueError(
+                f"HOP{expected_hop}: center shape mismatch: "
+                f"{tuple(centers.shape)} vs "
+                f"{(vq_vocab_size, center_dim)}"
+            )
+
+        hop_centers.append(centers)
+
+    token_vocab_size = int(
+        reference.get("token_vocab_size", 50257)
+    )
+
+    for hop, ids in enumerate(hop_vq_ids_flat):
+        vq_min = int(ids.min().item())
+        vq_max = int(ids.max().item())
+        if vq_min < 0 or vq_max >= vq_vocab_size:
+            raise ValueError(
+                f"HOP{hop}: VQ IDs out of range: "
+                f"{vq_min}..{vq_max}, vocab={vq_vocab_size}"
+            )
         print(
-            "[control] VQ IDs globally shuffled "
-            f"with seed={args.control_seed}"
+            f"[HOP{hop}] VQ range={vq_min}..{vq_max}, "
+            f"used={torch.unique(ids).numel():,}"
         )
 
-    token_vocab_size = int(token_ids_flat.max().item()) + 1
-    if "token_vocab_size" in data:
-        token_vocab_size = int(data["token_vocab_size"])
-    elif int(token_ids_flat.max().item()) < 50257:
-        token_vocab_size = 50257
-
-    vq_vocab_size = int(centers.size(0))
-    if vq_ids_flat.min().item() < 0 or vq_ids_flat.max().item() >= vq_vocab_size:
-        raise ValueError(
-            f"VQ IDs out of range: {int(vq_ids_flat.min())}.."
-            f"{int(vq_ids_flat.max())}, vocab={vq_vocab_size}"
-        )
-
-    data_hop = int(data.get("hop", -1))
-    codebook_hop = int(codebook.get("args", {}).get("hop", -1))
-    data_center_scale = data.get("center_scale", None)
-    codebook_center_scale = codebook.get("args", {}).get("center_scale", None)
-
-    print("[task] autoregressive BPE prediction")
-    print(f"[input mode] {args.input_mode}")
-    if args.input_mode == "vqw":
-        print("[input] CAT(BPE embedding, projected VQW center)")
-
-    elif args.input_mode == "bpe2":
-        print("[input] CAT(BPE embedding 1, BPE embedding 2)")
-
-    elif args.input_mode == "vq_shuffle":
-        print("[input] CAT(BPE embedding, projected shuffled VQW center)")
-        print(f"[control seed] {args.control_seed}")
-    elif args.input_mode == "zero":
-        print("[input] CAT(BPE embedding, zero vector)")
-
-    print(f"[data hop] {data_hop}")
-    print(f"[codebook hop] {codebook_hop}")
-    print(f"[data center scale] {data_center_scale}")
-    print(f"[codebook center scale] {codebook_center_scale}")
+    print("[architecture] BPE stream + frozen-center multi-hop VQ stream")
+    print("[VQ target] HOP10 VQW[t+1]")
+    print(f"[VQ BPE auxiliary weight] {args.vq_bpe_input_weight}")
+    print(f"[VQ loss weight] {args.vq_loss_weight}")
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
-    print("[fusion] concat + learned linear projection")
-    print("[input fusion] concat + linear projection")
 
     random.shuffle(samples)
     n = len(samples)
     n_train = int(0.8 * n)
     n_valid = int(0.1 * n)
+
     train_samples = samples[:n_train]
     valid_samples = samples[n_train:n_train + n_valid]
     test_samples = samples[n_train + n_valid:]
 
-    train_ds = BPEPlusSC0Dataset(
-        train_samples, token_ids_flat, vq_ids_flat, args.max_len
-    )
-    valid_ds = BPEPlusSC0Dataset(
-        valid_samples, token_ids_flat, vq_ids_flat, args.max_len
-    )
-    test_ds = BPEPlusSC0Dataset(
-        test_samples, token_ids_flat, vq_ids_flat, args.max_len
-    )
-
     tok_pad_id = token_vocab_size
     vq_pad_id = vq_vocab_size
+
+    train_ds = MultiHopTwoStreamDataset(
+        train_samples,
+        token_ids_flat,
+        hop_vq_ids_flat,
+        vq_pad_id,
+        max_len=args.max_len,
+        target_hop=10,
+    )
+    valid_ds = MultiHopTwoStreamDataset(
+        valid_samples,
+        token_ids_flat,
+        hop_vq_ids_flat,
+        vq_pad_id,
+        max_len=args.max_len,
+        target_hop=10,
+    )
+    test_ds = MultiHopTwoStreamDataset(
+        test_samples,
+        token_ids_flat,
+        hop_vq_ids_flat,
+        vq_pad_id,
+        max_len=args.max_len,
+        target_hop=10,
+    )
 
     def make_loader(dataset, shuffle):
         return DataLoader(
             dataset,
             batch_size=args.batch_size,
             shuffle=shuffle,
-            collate_fn=lambda b: collate_batch(b, tok_pad_id, vq_pad_id),
+            collate_fn=lambda batch: collate_batch(
+                batch,
+                tok_pad_id,
+                vq_pad_id,
+            ),
         )
 
     train_loader = make_loader(train_ds, True)
     valid_loader = make_loader(valid_ds, False)
     test_loader = make_loader(test_ds, False)
 
-    model = BPESC0TwoStreamLM(
-        centers=centers,
+    model = BPETwoStreamMultiHopVQLM(
+        hop_centers=hop_centers,
         token_vocab_size=token_vocab_size,
+        target_vq_vocab_size=vq_vocab_size,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         dropout=args.dropout,
         max_len=args.max_len,
+        vq_bpe_input_weight=args.vq_bpe_input_weight,
         tie_weights=args.tie_weights,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
 
     history = []
     best_valid = float("inf")
-    best_path = str(Path(args.out).with_name(Path(args.out).stem + "_best.pt"))
+    best_path = str(
+        Path(args.out).with_name(
+            Path(args.out).stem + "_best.pt"
+        )
+    )
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -686,14 +755,17 @@ def main():
         )
 
         for (
-                tok_in,
-                vq_in,
-                tok_y,
-                vq_y,
-                attention_mask,
+            tok_in,
+            vq_context,
+            hop_valid,
+            tok_y,
+            vq_y,
+            attention_mask,
         ) in pbar:
+
             tok_in = tok_in.to(device)
-            vq_in = vq_in.to(device)
+            vq_context = vq_context.to(device)
+            hop_valid = hop_valid.to(device)
             tok_y = tok_y.to(device)
             vq_y = vq_y.to(device)
             attention_mask = attention_mask.to(device)
@@ -701,8 +773,9 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             output = model(
-                tok_in,
-                vq_in,
+                tok_in=tok_in,
+                vq_context=vq_context,
+                hop_valid=hop_valid,
                 key_padding_mask=~attention_mask,
             )
 
@@ -710,68 +783,44 @@ def main():
             vq_logits = output["vq_logits"]
 
             bpe_loss = F.cross_entropy(
-                bpe_logits.reshape(
-                    -1,
-                    bpe_logits.size(-1),
-                ),
+                bpe_logits.reshape(-1, bpe_logits.size(-1)),
                 tok_y.reshape(-1),
                 ignore_index=-100,
             )
-
             vq_loss = F.cross_entropy(
-                vq_logits.reshape(
-                    -1,
-                    vq_logits.size(-1),
-                ),
+                vq_logits.reshape(-1, vq_logits.size(-1)),
                 vq_y.reshape(-1),
                 ignore_index=-100,
             )
 
             total_loss = (
-                    bpe_loss
-                    + args.vq_loss_weight * vq_loss
+                bpe_loss
+                + args.vq_loss_weight * vq_loss
             )
 
             total_loss.backward()
-
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 1.0,
             )
-
             optimizer.step()
 
-            n_valid_tokens = int(
-                tok_y.ne(-100).sum().item()
-            )
-
+            n_valid_tokens = int(tok_y.ne(-100).sum().item())
             running_total_loss += (
-                    float(total_loss.item())
-                    * n_valid_tokens
+                float(total_loss.item()) * n_valid_tokens
             )
-
             running_bpe_loss += (
-                    float(bpe_loss.item())
-                    * n_valid_tokens
+                float(bpe_loss.item()) * n_valid_tokens
             )
-
             running_vq_loss += (
-                    float(vq_loss.item())
-                    * n_valid_tokens
+                float(vq_loss.item()) * n_valid_tokens
             )
-
             running_count += n_valid_tokens
 
             pbar.set_postfix(
-                total=(
-                    f"{running_total_loss / max(running_count, 1):.4f}"
-                ),
-                bpe=(
-                    f"{running_bpe_loss / max(running_count, 1):.4f}"
-                ),
-                vq=(
-                    f"{running_vq_loss / max(running_count, 1):.4f}"
-                ),
+                total=f"{running_total_loss / max(running_count, 1):.4f}",
+                bpe=f"{running_bpe_loss / max(running_count, 1):.4f}",
+                vq=f"{running_vq_loss / max(running_count, 1):.4f}",
             )
 
         valid_metrics = evaluate(
@@ -779,7 +828,6 @@ def main():
             valid_loader,
             device,
         )
-
         test_metrics = evaluate(
             model,
             test_loader,
@@ -801,22 +849,20 @@ def main():
             f"test_vq_top1={test_metrics['vq_top1']:.4f} "
             f"test_vq_top5={test_metrics['vq_top5']:.4f}"
         )
+
         record = {
             "epoch": epoch,
-
             "train_total_loss": (
-                    running_total_loss / max(running_count, 1)
+                running_total_loss / max(running_count, 1)
             ),
-
             "train_bpe_loss": (
-                    running_bpe_loss / max(running_count, 1)
+                running_bpe_loss / max(running_count, 1)
             ),
-
             "train_vq_loss": (
-                    running_vq_loss / max(running_count, 1)
+                running_vq_loss / max(running_count, 1)
             ),
-
             "vq_loss_weight": args.vq_loss_weight,
+            "vq_bpe_input_weight": args.vq_bpe_input_weight,
             "valid": valid_metrics,
             "test": test_metrics,
         }
@@ -825,23 +871,22 @@ def main():
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "architecture": "bpe_sc0_two_stream",
+            "architecture": "bpe_multihop_vqw_two_stream",
             "history": history,
-
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
             "tok_pad_id": tok_pad_id,
             "vq_pad_id": vq_pad_id,
-
-            "data_source": args.data,
-            "codebook_source": args.codebook,
+            "hop_data_sources": list(args.hop_data),
+            "hop_codebook_sources": list(args.hop_codebooks),
             "vq_centers_frozen": True,
-
+            "vq_target_hop": 10,
             "vq_loss_weight": args.vq_loss_weight,
-
+            "vq_bpe_input_weight": args.vq_bpe_input_weight,
             "last_valid": valid_metrics,
             "last_test": test_metrics,
         }
+
         torch.save(checkpoint, args.out)
 
         if valid_metrics["bpe_ppl"] < best_valid:
