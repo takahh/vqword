@@ -107,8 +107,15 @@ class BPEPlusSC0LM(nn.Module):
         super().__init__()
         self.input_mode = str(input_mode)
 
-        if self.input_mode not in {"vqw", "bpe2", "vq_shuffle"}:
-            raise ValueError(f"unsupported input_mode: {self.input_mode}")
+        if self.input_mode not in {
+            "vqw",
+            "bpe2",
+            "vq_shuffle",
+            "zero",
+        }:
+            raise ValueError(
+                f"unsupported input_mode: {self.input_mode}"
+            )
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(centers.size(0))
         self.tok_pad_id = self.token_vocab_size
@@ -181,7 +188,12 @@ class BPEPlusSC0LM(nn.Module):
             second_h = self.tok_emb2(tok_in)
 
         elif self.input_mode in {"vqw", "vq_shuffle"}:
-            second_h = self.vq_proj(self.vq_emb(vq_in))
+            second_h = self.vq_proj(
+                self.vq_emb(vq_in)
+            )
+
+        elif self.input_mode == "zero":
+            second_h = torch.zeros_like(bpe_h)
 
         else:
             raise RuntimeError(
@@ -192,6 +204,9 @@ class BPEPlusSC0LM(nn.Module):
             [bpe_h, second_h],
             dim=-1,
         )
+
+        h = self.input_proj(combined_h)
+        h = self.input_norm(h)
 
         h = self.input_proj(combined_h)
         h = self.input_norm(h)
@@ -278,11 +293,17 @@ def main():
         "--input_mode",
         type=str,
         default="vqw",
-        choices=["vqw", "bpe2", "vq_shuffle"],
+        choices=[
+            "vqw",
+            "bpe2",
+            "vq_shuffle",
+            "zero",
+        ],
         help=(
-            "vqw: normal BPE+VQW concat, "
-            "bpe2: two independently learned BPE embeddings concat, "
-            "vq_shuffle: concat with globally shuffled VQ IDs"
+            "vqw: normal BPE + VQW concat; "
+            "bpe2: two independently learned BPE embeddings; "
+            "vq_shuffle: globally shuffled VQ IDs; "
+            "zero: zero-valued second input channel"
         ),
     )
 
@@ -361,6 +382,9 @@ def main():
     elif args.input_mode == "vq_shuffle":
         print("[input] CAT(BPE embedding, projected shuffled VQW center)")
         print(f"[control seed] {args.control_seed}")
+    elif args.input_mode == "zero":
+        print("[input] CAT(BPE embedding, zero vector)")
+        
     print(f"[data hop] {data_hop}")
     print(f"[codebook hop] {codebook_hop}")
     print(f"[data center scale] {data_center_scale}")

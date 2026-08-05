@@ -28,14 +28,16 @@ case "${VQ_CODEBOOK_LABEL}" in
   100k) VQ_CODEBOOK_SIZE=100000 ;;
   *) echo "[error] expected 100k"; exit 1 ;;
 esac
+
 INPUT_MODE="${INPUT_MODE:-vqw}"
 CONTROL_SEED="${CONTROL_SEED:-12345}"
 
 case "${INPUT_MODE}" in
-  vqw|bpe2|vq_shuffle)
+  vqw|bpe2|vq_shuffle|zero)
     ;;
   *)
-    echo "[error] INPUT_MODE must be one of: vqw, bpe2, vq_shuffle"
+    echo "[error] INPUT_MODE must be one of:"
+    echo "        vqw, bpe2, vq_shuffle, zero"
     exit 1
     ;;
 esac
@@ -148,12 +150,18 @@ case "${INPUT_MODE}" in
   vqw)
     echo "input   = CAT(BPE[t], projected VQW[t]) -> Linear"
     ;;
+
   bpe2)
     echo "input   = CAT(BPE_embedding1[t], BPE_embedding2[t]) -> Linear"
     ;;
+
   vq_shuffle)
     echo "input   = CAT(BPE[t], projected shuffled-VQW[t]) -> Linear"
     echo "control seed = ${CONTROL_SEED}"
+    ;;
+
+  zero)
+    echo "input   = CAT(BPE[t], zero vector) -> Linear"
     ;;
 esac
 echo "target  = BPE[t+1]"
