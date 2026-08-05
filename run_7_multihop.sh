@@ -78,7 +78,7 @@ MAX_LEN="${MAX_LEN:-255}"
 VQ_LOSS_WEIGHT="${VQ_LOSS_WEIGHT:-1.0}"
 VQ_BPE_INPUT_WEIGHT="${VQ_BPE_INPUT_WEIGHT:-0.01}"
 
-AR_SCRIPT="/vqword/ar_bpe_multihop_vqw_two_stream.py"
+AR_SCRIPT="/vqword/ar_multihoppy"
 
 # ============================================================
 # Construct HOP0 ... HOP10 filenames
