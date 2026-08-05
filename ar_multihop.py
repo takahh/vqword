@@ -182,15 +182,11 @@ class BPEPlusSC0LM(nn.Module):
         bpe_h = self.tok_emb(tok_in)
 
         if self.input_mode == "bpe2":
-            if self.tok_emb2 is None:
-                raise RuntimeError("tok_emb2 is not initialized")
-
             second_h = self.tok_emb2(tok_in)
 
         elif self.input_mode in {"vqw", "vq_shuffle"}:
-            second_h = self.vq_proj(
-                self.vq_emb(vq_in)
-            )
+            second_h = self.vq_proj(self.vq_emb(vq_in))
+            second_h = self.vq_input_weight * second_h
 
         elif self.input_mode == "zero":
             second_h = torch.zeros_like(bpe_h)
