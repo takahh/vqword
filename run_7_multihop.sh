@@ -423,7 +423,6 @@ python "${AR_SCRIPT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
   --vq_loss_weight "${VQ_LOSS_WEIGHT}" \
-  --vq_bpe_input_weight "${VQ_BPE_INPUT_WEIGHT}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 
