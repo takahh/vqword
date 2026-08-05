@@ -1,4 +1,4 @@
-```bash
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -476,4 +476,4 @@ echo "best  = ${BEST_PATH}"
 echo "final = ${FINAL_PATH}"
 echo "log   = ${LOG_PATH}"
 echo "============================================================"
-```
+
