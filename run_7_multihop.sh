@@ -1,3 +1,4 @@
+```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -6,155 +7,411 @@ apt install -y lftp
 pip install torch tqdm numpy
 
 cd /
+
 if [ ! -d /vqword ]; then
   git clone https://github.com/takahh/vqword.git
 fi
+
 cd /vqword
 git pull
+
+# ============================================================
+# FTP
+# ============================================================
 
 FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
 FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
+# ============================================================
+# Usage
+# ============================================================
+
 if [ "$#" -ne 2 ]; then
   echo "Usage: $0 {100k} {ar_seed}"
-  echo "Example: VQ_INPUT_WEIGHT=0.01 CENTER_SCALE=0 $0 100k 0"
+  echo
+  echo "Example:"
+  echo "  VQ_LOSS_WEIGHT=1.0 \\"
+  echo "  VQ_BPE_INPUT_WEIGHT=0.01 \\"
+  echo "  CENTER_SCALE=0 \\"
+  echo "  $0 100k 0"
   exit 1
 fi
 
 VQ_CODEBOOK_LABEL="$1"
 AR_SEED="$2"
+
 case "${VQ_CODEBOOK_LABEL}" in
-  100k) VQ_CODEBOOK_SIZE=100000 ;;
-  *) echo "[error] expected 100k"; exit 1 ;;
-esac
-
-INPUT_MODE="${INPUT_MODE:-vqw}"
-CONTROL_SEED="${CONTROL_SEED:-12345}"
-
-case "${INPUT_MODE}" in
-  vqw|bpe2|vq_shuffle|zero)
+  100k)
+    VQ_CODEBOOK_SIZE=100000
     ;;
   *)
-    echo "[error] INPUT_MODE must be one of:"
-    echo "        vqw, bpe2, vq_shuffle, zero"
+    echo "[error] expected codebook label: 100k"
     exit 1
     ;;
 esac
 
+# ============================================================
+# Common settings
+# ============================================================
+
 CENTER_SCALE="${CENTER_SCALE:-0}"
-TARGET_HOP="${TARGET_HOP:-10}"
-HOP2=$(printf "%02d" "${TARGET_HOP}")
+
 BPE_VOCAB_LABEL=50257
 IVF_NLIST=256
 DISCRETIZATION_SEED=0
 MODEL_VARIANT="deconly"
 DECODER_EPOCHS=3
 
-D_MODEL=256
-N_LAYERS=6
-N_HEADS=8
-DROPOUT=0.1
+D_MODEL="${D_MODEL:-256}"
+N_LAYERS="${N_LAYERS:-6}"
+N_HEADS="${N_HEADS:-8}"
+DROPOUT="${DROPOUT:-0.1}"
+
 EPOCHS="${EPOCHS:-30}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
-VQ_LOSS_WEIGHT="${VQ_LOSS_WEIGHT:-0.1}"
 
-TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
-DATA_FILE="tinystories_vqword_${TAG}_ids.pt"
-CODEBOOK_FILE="wikitext103_vqword_${TAG}.pt"
-DATA_PATH="/vqword/${DATA_FILE}"
-CODEBOOK_PATH="/vqword/${CODEBOOK_FILE}"
-AR_SCRIPT="/vqword/ar_multihop.py"
+# Earlier multi-hop VQ AR condition
+VQ_LOSS_WEIGHT="${VQ_LOSS_WEIGHT:-1.0}"
+VQ_BPE_INPUT_WEIGHT="${VQ_BPE_INPUT_WEIGHT:-0.01}"
 
+AR_SCRIPT="/vqword/ar_bpe_multihop_vqw_two_stream.py"
 
-CONTROL_TAG="${INPUT_MODE}"
+# ============================================================
+# Construct HOP0 ... HOP10 filenames
+# ============================================================
 
-if [ "${INPUT_MODE}" = "vq_shuffle" ]; then
-  CONTROL_TAG="${INPUT_MODE}${CONTROL_SEED}"
-fi
+declare -a HOP_DATA_FILES
+declare -a HOP_DATA_PATHS
+declare -a HOP_CODEBOOK_FILES
+declare -a HOP_CODEBOOK_PATHS
 
-RUN="ar_twostream_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_vqloss${VQ_LOSS_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
+for HOP in $(seq 0 10); do
+  HOP2=$(printf "%02d" "${HOP}")
+
+  TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+
+  DATA_FILE="tinystories_vqword_${TAG}_ids.pt"
+  CODEBOOK_FILE="wikitext103_vqword_${TAG}.pt"
+
+  HOP_DATA_FILES+=("${DATA_FILE}")
+  HOP_DATA_PATHS+=("/vqword/${DATA_FILE}")
+
+  HOP_CODEBOOK_FILES+=("${CODEBOOK_FILE}")
+  HOP_CODEBOOK_PATHS+=("/vqword/${CODEBOOK_FILE}")
+done
+
+# ============================================================
+# Output names
+# ============================================================
+
+RUN="ar_twostream_multihop_bpe${BPE_VOCAB_LABEL}_bilateral00to10_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_vqloss${VQ_LOSS_WEIGHT}_vqbpe${VQ_BPE_INPUT_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
+
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
 LOG_PATH="/vqword/${RUN}.log"
 
-for pair in "${DATA_FILE}:${DATA_PATH}" "${CODEBOOK_FILE}:${CODEBOOK_PATH}"; do
-  FILE="${pair%%:*}"
-  PATH_OUT="${pair#*:}"
-  if [ -s "${PATH_OUT}" ]; then
-    echo "[reuse] ${PATH_OUT}"
-    continue
+# ============================================================
+# Download HOP0 ... HOP10 data and codebooks
+# ============================================================
+
+download_file() {
+  local remote_file="$1"
+  local local_path="$2"
+
+  if [ -s "${local_path}" ]; then
+    echo "[reuse] ${local_path}"
+    return
   fi
+
+  echo "[download] ${remote_file}"
+
   lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 60
 set cmd:fail-exit yes
-get "${FILE}" -o "${PATH_OUT}"
+get "${remote_file}" -o "${local_path}"
 bye
 EOF
+
+  if [ ! -s "${local_path}" ]; then
+    echo "[error] download failed: ${local_path}"
+    exit 1
+  fi
+}
+
+for HOP in $(seq 0 10); do
+  download_file \
+    "${HOP_DATA_FILES[$HOP]}" \
+    "${HOP_DATA_PATHS[$HOP]}"
+
+  download_file \
+    "${HOP_CODEBOOK_FILES[$HOP]}" \
+    "${HOP_CODEBOOK_PATHS[$HOP]}"
 done
 
-for p in "${DATA_PATH}" "${CODEBOOK_PATH}" "${AR_SCRIPT}"; do
-  [ -s "${p}" ] || { echo "[error] missing ${p}"; exit 1; }
+# ============================================================
+# Required-file check
+# ============================================================
+
+for HOP in $(seq 0 10); do
+  for PATH_TO_CHECK in \
+    "${HOP_DATA_PATHS[$HOP]}" \
+    "${HOP_CODEBOOK_PATHS[$HOP]}"
+  do
+    if [ ! -s "${PATH_TO_CHECK}" ]; then
+      echo "[error] missing: ${PATH_TO_CHECK}"
+      exit 1
+    fi
+  done
 done
 
-python - "${DATA_PATH}" "${CODEBOOK_PATH}" "${TARGET_HOP}" "${CENTER_SCALE}" <<'PY'
-import sys, torch
+if [ ! -s "${AR_SCRIPT}" ]; then
+  echo "[error] missing AR script: ${AR_SCRIPT}"
+  exit 1
+fi
 
-data_path, codebook_path, expected_hop, expected_scale = sys.argv[1:]
-expected_hop = int(expected_hop)
-expected_scale = float(expected_scale)
-data = torch.load(data_path, map_location="cpu", weights_only=False)
-cb = torch.load(codebook_path, map_location="cpu", weights_only=False)
+# ============================================================
+# Verify all 11 data/codebook pairs
+# ============================================================
+
+python - \
+  "${VQ_CODEBOOK_SIZE}" \
+  "${CENTER_SCALE}" \
+  "${HOP_DATA_PATHS[@]}" \
+  "${HOP_CODEBOOK_PATHS[@]}" <<'PY'
+import sys
+import torch
+
+if len(sys.argv) != 25:
+    raise ValueError(
+        f"expected 24 arguments after script name, got {len(sys.argv) - 1}"
+    )
+
+expected_vq_size = int(sys.argv[1])
+expected_center_scale = float(sys.argv[2])
+
+data_paths = sys.argv[3:14]
+codebook_paths = sys.argv[14:25]
+
+if len(data_paths) != 11:
+    raise ValueError(f"expected 11 data files, got {len(data_paths)}")
+
+if len(codebook_paths) != 11:
+    raise ValueError(
+        f"expected 11 codebook files, got {len(codebook_paths)}"
+    )
+
+all_data = [
+    torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    for path in data_paths
+]
+
+all_codebooks = [
+    torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    for path in codebook_paths
+]
+
+reference_data = all_data[0]
 
 for key in ("samples", "token_ids_flat", "vq_ids_flat"):
-    if key not in data:
-        raise KeyError(f"data missing {key}")
-if "global_centers" not in cb:
-    raise KeyError("codebook missing global_centers")
+    if key not in reference_data:
+        raise KeyError(f"HOP0 data missing key: {key}")
 
-hop_data = int(data.get("hop", -1))
-hop_cb = int(cb.get("args", {}).get("hop", -1))
-if hop_data != expected_hop or hop_cb != expected_hop:
-    raise ValueError(f"hop mismatch: data={hop_data}, cb={hop_cb}, expected={expected_hop}")
+reference_tokens = (
+    reference_data["token_ids_flat"]
+    .long()
+    .reshape(-1)
+)
 
-centers = cb["global_centers"]
-vq = data["vq_ids_flat"].long().reshape(-1)
-tok = data["token_ids_flat"].long().reshape(-1)
-if tok.numel() != vq.numel():
-    raise ValueError("token/VQ length mismatch")
-if centers.shape[0] != 100000:
-    raise ValueError(f"expected 100000 centers, got {centers.shape[0]}")
-if int(vq.min()) < 0 or int(vq.max()) >= centers.shape[0]:
-    raise ValueError("VQ IDs out of range")
+reference_samples = list(reference_data["samples"])
+
+reference_center_shape = None
+
+for hop, (data, codebook) in enumerate(
+    zip(all_data, all_codebooks)
+):
+    for key in ("samples", "token_ids_flat", "vq_ids_flat"):
+        if key not in data:
+            raise KeyError(
+                f"HOP{hop} data missing key: {key}"
+            )
+
+    if "global_centers" not in codebook:
+        raise KeyError(
+            f"HOP{hop} codebook missing global_centers"
+        )
+
+    data_hop = int(data.get("hop", -1))
+    codebook_hop = int(
+        codebook.get("args", {}).get("hop", -1)
+    )
+
+    if data_hop != hop:
+        raise ValueError(
+            f"HOP{hop} data metadata mismatch: "
+            f"recorded hop={data_hop}"
+        )
+
+    if codebook_hop != hop:
+        raise ValueError(
+            f"HOP{hop} codebook metadata mismatch: "
+            f"recorded hop={codebook_hop}"
+        )
+
+    tokens = (
+        data["token_ids_flat"]
+        .long()
+        .reshape(-1)
+    )
+
+    vq_ids = (
+        data["vq_ids_flat"]
+        .long()
+        .reshape(-1)
+    )
+
+    if not torch.equal(tokens, reference_tokens):
+        raise ValueError(
+            f"HOP{hop}: token_ids_flat differs from HOP0"
+        )
+
+    if tokens.numel() != vq_ids.numel():
+        raise ValueError(
+            f"HOP{hop}: token/VQ length mismatch: "
+            f"{tokens.numel()} vs {vq_ids.numel()}"
+        )
+
+    samples = list(data["samples"])
+
+    if len(samples) != len(reference_samples):
+        raise ValueError(
+            f"HOP{hop}: sample count mismatch: "
+            f"{len(samples)} vs {len(reference_samples)}"
+        )
+
+    for sample_index, (ref_sample, current_sample) in enumerate(
+        zip(reference_samples, samples)
+    ):
+        for key in ("sample_idx", "start", "end", "length"):
+            ref_value = int(ref_sample[key])
+            current_value = int(current_sample[key])
+
+            if ref_value != current_value:
+                raise ValueError(
+                    f"HOP{hop}: sample metadata mismatch "
+                    f"at sample={sample_index}, key={key}: "
+                    f"{current_value} vs {ref_value}"
+                )
+
+    centers = codebook["global_centers"]
+
+    if int(centers.shape[0]) != expected_vq_size:
+        raise ValueError(
+            f"HOP{hop}: expected {expected_vq_size} centers, "
+            f"got {centers.shape[0]}"
+        )
+
+    if reference_center_shape is None:
+        reference_center_shape = tuple(centers.shape)
+    elif tuple(centers.shape) != reference_center_shape:
+        raise ValueError(
+            f"HOP{hop}: center shape mismatch: "
+            f"{tuple(centers.shape)} vs "
+            f"{reference_center_shape}"
+        )
+
+    if int(vq_ids.min()) < 0:
+        raise ValueError(
+            f"HOP{hop}: negative VQ ID found"
+        )
+
+    if int(vq_ids.max()) >= centers.shape[0]:
+        raise ValueError(
+            f"HOP{hop}: VQ ID out of range: "
+            f"max={int(vq_ids.max())}, "
+            f"vocab={centers.shape[0]}"
+        )
+
+    data_center_scale = data.get(
+        "center_scale",
+        None,
+    )
+
+    codebook_center_scale = (
+        codebook
+        .get("args", {})
+        .get("center_scale", None)
+    )
+
+    print(
+        f"[HOP{hop:02d}] "
+        f"tokens={tokens.numel():,} "
+        f"samples={len(samples):,} "
+        f"used_vq={torch.unique(vq_ids).numel():,} "
+        f"range={int(vq_ids.min())}..{int(vq_ids.max())} "
+        f"centers={tuple(centers.shape)} "
+        f"data_center_scale={data_center_scale} "
+        f"codebook_center_scale={codebook_center_scale}"
+    )
+
+print("============================================================")
 print("[verification OK]")
-print("tokens:", f"{tok.numel():,}")
-print("samples:", f"{len(data['samples']):,}")
-print("centers:", tuple(centers.shape))
-print("hop:", expected_hop)
-print("center_scale requested:", expected_scale)
+print("HOP range: 0 ... 10")
+print("tokens:", f"{reference_tokens.numel():,}")
+print("samples:", f"{len(reference_samples):,}")
+print("center shape:", reference_center_shape)
+print("requested center scale:", expected_center_scale)
+print("============================================================")
 PY
 
+# ============================================================
+# Start training
+# ============================================================
+
 echo "============================================================"
-echo "[start BPE/SC0 two-stream autoregressive training]"
-echo "BPE stream = BPE[t] -> h_bpe"
-echo "VQ stream  = VQW[t] -> h_vq -> VQW[t+1]"
-echo "fusion     = CAT(h_bpe, h_vq) -> BPE[t+1]"
-echo "VQ loss weight = ${VQ_LOSS_WEIGHT}"
-echo "hop        = bilateral ${TARGET_HOP}"
-echo "center     = ${CENTER_SCALE}"
+echo "[start BPE + multi-hop VQW two-stream AR training]"
+echo
+echo "BPE stream:"
+echo "  BPE[t] -> causal Transformer -> h_bpe"
+echo
+echo "VQ stream:"
+echo "  HOP0..HOP10 frozen centers"
+echo "  -> HOP-specific projections and gates"
+echo "  -> + ${VQ_BPE_INPUT_WEIGHT} * BPE[t]"
+echo "  -> causal Transformer"
+echo "  -> HOP10 VQW[t+1]"
+echo
+echo "Fusion:"
+echo "  CAT(h_bpe, h_vq)"
+echo "  -> learned projection"
+echo "  -> BPE[t+1]"
+echo
+echo "VQ loss weight       = ${VQ_LOSS_WEIGHT}"
+echo "VQ BPE input weight  = ${VQ_BPE_INPUT_WEIGHT}"
+echo "center scale         = ${CENTER_SCALE}"
+echo "AR seed              = ${AR_SEED}"
 echo "============================================================"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 python "${AR_SCRIPT}" \
-  --data "${DATA_PATH}" \
-  --codebook "${CODEBOOK_PATH}" \
-  --input_mode "${INPUT_MODE}" \
-  --control_seed "${CONTROL_SEED}" \
+  --hop_data \
+    "${HOP_DATA_PATHS[@]}" \
+  --hop_codebooks \
+    "${HOP_CODEBOOK_PATHS[@]}" \
   --batch_size "${BATCH_SIZE}" \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
@@ -166,14 +423,38 @@ python "${AR_SCRIPT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
   --vq_loss_weight "${VQ_LOSS_WEIGHT}" \
+  --vq_bpe_input_weight "${VQ_BPE_INPUT_WEIGHT}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 
-for p in "${FINAL_PATH}" "${BEST_PATH}" "${LOG_PATH}"; do
-  [ -s "${p}" ] || { echo "[error] missing output ${p}"; exit 1; }
+# ============================================================
+# Output check
+# ============================================================
+
+for PATH_TO_CHECK in \
+  "${FINAL_PATH}" \
+  "${BEST_PATH}" \
+  "${LOG_PATH}"
+do
+  if [ ! -s "${PATH_TO_CHECK}" ]; then
+    echo "[error] missing output: ${PATH_TO_CHECK}"
+    exit 1
+  fi
 done
 
-grep -E "\[epoch [0-9]+\]|\[save best\]|\[save final\]" "${LOG_PATH}" || true
+echo
+echo "============================================================"
+echo "[training summary]"
+echo "============================================================"
+
+grep -E \
+  "\[epoch [0-9]+\]|\[save best\]|\[save final\]" \
+  "${LOG_PATH}" \
+  || true
+
+# ============================================================
+# Upload outputs
+# ============================================================
 
 lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
@@ -187,4 +468,12 @@ put "${LOG_PATH}" -o "${RUN}.log"
 bye
 EOF
 
-echo "[completed] ${RUN}"
+echo
+echo "============================================================"
+echo "[completed]"
+echo "run   = ${RUN}"
+echo "best  = ${BEST_PATH}"
+echo "final = ${FINAL_PATH}"
+echo "log   = ${LOG_PATH}"
+echo "============================================================"
+```
