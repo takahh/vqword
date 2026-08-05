@@ -271,6 +271,149 @@ def evaluate(model, loader, device):
         "count": total_count,
     }
 
+@torch.no_grad()
+def analyze_input_contributions(model, loader, device):
+    """
+    Measure how much the BPE channel and second channel contribute
+    to the learned input projection.
+
+    input_proj:
+        [BPE channel | second channel] -> d_model
+    """
+    model.eval()
+
+    weight = model.input_proj.weight
+    input_dim = int(weight.size(1))
+
+    if input_dim % 2 != 0:
+        raise ValueError(
+            f"input_proj input dimension must be even, got {input_dim}"
+        )
+
+    d_model = input_dim // 2
+
+    # input_proj.weight shape:
+    #     [d_model, 2 * d_model]
+    w_bpe = weight[:, :d_model]
+    w_second = weight[:, d_model:]
+
+    weight_bpe_fro = float(torch.linalg.vector_norm(w_bpe).item())
+    weight_second_fro = float(torch.linalg.vector_norm(w_second).item())
+
+    total_bpe_contrib_l2 = 0.0
+    total_second_contrib_l2 = 0.0
+    total_combined_l2 = 0.0
+    total_tokens = 0
+
+    for tok_in, vq_in, tok_y, attention_mask in loader:
+        tok_in = tok_in.to(device)
+        vq_in = vq_in.to(device)
+        attention_mask = attention_mask.to(device)
+
+        # [B, T, d_model]
+        bpe_h = model.tok_emb(tok_in)
+
+        if model.input_mode == "bpe2":
+            if model.tok_emb2 is None:
+                raise RuntimeError(
+                    "tok_emb2 is missing in bpe2 mode"
+                )
+            second_h = model.tok_emb2(tok_in)
+
+        elif model.input_mode in {"vqw", "vq_shuffle"}:
+            second_h = model.vq_proj(
+                model.vq_emb(vq_in)
+            )
+
+        elif model.input_mode == "zero":
+            second_h = torch.zeros_like(bpe_h)
+
+        else:
+            raise RuntimeError(
+                f"unsupported input_mode: {model.input_mode}"
+            )
+
+        # input_proj(cat([bpe_h, second_h])) is equivalent to:
+        #
+        #   bpe_h    @ W_bpe.T
+        # + second_h @ W_second.T
+        # + bias
+        #
+        # Bias is excluded because we want to compare the two channels.
+        bpe_contrib = F.linear(
+            bpe_h,
+            w_bpe,
+            bias=None,
+        )
+
+        second_contrib = F.linear(
+            second_h,
+            w_second,
+            bias=None,
+        )
+
+        combined_contrib = bpe_contrib + second_contrib
+
+        valid = attention_mask
+
+        bpe_l2 = torch.linalg.vector_norm(
+            bpe_contrib,
+            dim=-1,
+        )
+
+        second_l2 = torch.linalg.vector_norm(
+            second_contrib,
+            dim=-1,
+        )
+
+        combined_l2 = torch.linalg.vector_norm(
+            combined_contrib,
+            dim=-1,
+        )
+
+        total_bpe_contrib_l2 += float(
+            bpe_l2[valid].sum().item()
+        )
+        total_second_contrib_l2 += float(
+            second_l2[valid].sum().item()
+        )
+        total_combined_l2 += float(
+            combined_l2[valid].sum().item()
+        )
+        total_tokens += int(valid.sum().item())
+
+    mean_bpe_contrib_l2 = (
+        total_bpe_contrib_l2 / max(total_tokens, 1)
+    )
+
+    mean_second_contrib_l2 = (
+        total_second_contrib_l2 / max(total_tokens, 1)
+    )
+
+    mean_combined_l2 = (
+        total_combined_l2 / max(total_tokens, 1)
+    )
+
+    weight_ratio = (
+        weight_second_fro / max(weight_bpe_fro, 1e-12)
+    )
+
+    contribution_ratio = (
+        mean_second_contrib_l2
+        / max(mean_bpe_contrib_l2, 1e-12)
+    )
+
+    return {
+        "weight_bpe_fro": weight_bpe_fro,
+        "weight_second_fro": weight_second_fro,
+        "weight_second_over_bpe": weight_ratio,
+        "mean_bpe_contrib_l2": mean_bpe_contrib_l2,
+        "mean_second_contrib_l2": mean_second_contrib_l2,
+        "mean_combined_l2": mean_combined_l2,
+        "contrib_second_over_bpe": contribution_ratio,
+        "count": total_tokens,
+    }
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -384,7 +527,7 @@ def main():
         print(f"[control seed] {args.control_seed}")
     elif args.input_mode == "zero":
         print("[input] CAT(BPE embedding, zero vector)")
-        
+
     print(f"[data hop] {data_hop}")
     print(f"[codebook hop] {codebook_hop}")
     print(f"[data center scale] {data_center_scale}")
@@ -480,7 +623,11 @@ def main():
 
         valid_metrics = evaluate(model, valid_loader, device)
         test_metrics = evaluate(model, test_loader, device)
-
+        input_stats = analyze_input_contributions(
+            model,
+            valid_loader,
+            device,
+        )
         print(
             f"[epoch {epoch}] "
             f"valid_bpe_ppl={valid_metrics['bpe_ppl']:.4f} "
@@ -490,20 +637,29 @@ def main():
             f"test_bpe_top1={test_metrics['bpe_top1']:.4f} "
             f"test_bpe_top5={test_metrics['bpe_top5']:.4f}"
         )
-
+        print(
+            f"[input stats epoch {epoch}] "
+            f"weight_bpe={input_stats['weight_bpe_fro']:.6f} "
+            f"weight_second={input_stats['weight_second_fro']:.6f} "
+            f"weight_ratio={input_stats['weight_second_over_bpe']:.6f} "
+            f"contrib_bpe={input_stats['mean_bpe_contrib_l2']:.6f} "
+            f"contrib_second={input_stats['mean_second_contrib_l2']:.6f} "
+            f"contrib_ratio={input_stats['contrib_second_over_bpe']:.6f}"
+        )
         record = {
             "epoch": epoch,
             "train_bpe_loss": running_loss / max(running_count, 1),
             "valid": valid_metrics,
             "test": test_metrics,
+            "input_stats": input_stats,
         }
         history.append(record)
 
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "history": history,
             "input_mode": args.input_mode,
+            "history": history,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
             "tok_pad_id": tok_pad_id,
@@ -513,6 +669,7 @@ def main():
             "vq_centers_frozen": True,
             "last_valid": valid_metrics,
             "last_test": test_metrics,
+            "last_input_stats": input_stats,
         }
         torch.save(checkpoint, args.out)
 
