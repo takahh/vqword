@@ -139,7 +139,7 @@ print("hop:", expected_hop)
 print("center_scale requested:", expected_scale)
 PY
 
-eecho "============================================================"
+echo "============================================================"
 echo "[start BPE/SC0 two-stream autoregressive training]"
 echo "BPE stream = BPE[t] -> h_bpe"
 echo "VQ stream  = VQW[t] -> h_vq -> VQW[t+1]"
