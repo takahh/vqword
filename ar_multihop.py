@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Input-CAT shared-transformer autoregressive language model.
+Input-CAT BPE-only autoregressive language model.
 
 Inputs:
     BPE[t] embedding
@@ -10,16 +10,17 @@ Fusion:
     CAT(BPE embedding, aggregated multi-hop VQ context)
     -> learned projection
     -> shared causal Transformer
-    -> BPE[t+1] head and HOP10 VQW[t+1] head
+    -> BPE[t+1] head only
 
 Frozen:
     - all HOP0..HOP10 codebook centers
 
 Trainable:
-    - BPE embedding / BPE Transformer
+    - BPE embedding
     - HOP projections and gates
-    - VQ Transformer and VQ head
-    - fusion and BPE output head
+    - input fusion projection
+    - shared causal Transformer
+    - BPE output head
 """
 
 import argparse
@@ -192,7 +193,7 @@ class FrozenCenterEmbedding(nn.Module):
         )
 
 
-class BPEMultiHopSharedCatLM(nn.Module):
+class BPEMultiHopInputCatLM(nn.Module):
     def __init__(
         self,
         hop_centers,
@@ -260,32 +261,8 @@ class BPEMultiHopSharedCatLM(nn.Module):
         )
         self.shared_norm = nn.LayerNorm(d_model)
 
-        # ---------------- Two output heads ----------------
-        # ---------------- VQ intermediate representation ----------------
-        # shared_hから、HOP10 VQW[t+1]予測に特化した中間表現を作る
-        self.vq_adapter = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-            nn.Dropout(dropout),
-        )
-
-        # VQ中間表現からHOP10 VQW[t+1]を予測
-        self.vq_head = nn.Linear(
-            d_model,
-            self.vq_vocab_size,
-            bias=True,
-        )
-
-        # shared_hとVQ予測用中間表現を結合してBPE用表現へ戻す
-        self.bpe_fusion = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-            nn.Dropout(dropout),
-        )
-
-        # 融合後の表現からBPE[t+1]を予測
+        # ---------------- BPE output head only ----------------
+        # shared Transformerの出力から直接BPE[t+1]を予測
         self.bpe_head = nn.Linear(
             d_model,
             self.token_vocab_size,
@@ -377,31 +354,12 @@ class BPEMultiHopSharedCatLM(nn.Module):
         )
         shared_h = self.shared_norm(shared_h)
 
-        # ---------------- VQ prediction branch ----------------
-        # HOP10 VQW[t+1]予測用の中間表現
-        vq_hidden = self.vq_adapter(shared_h)
-
-        # HOP10 VQW[t+1]予測
-        vq_logits = self.vq_head(vq_hidden)
-
-        # ---------------- BPE prediction branch ----------------
-        # Transformer表現とVQ予測用表現を結合
-        bpe_fusion_input = torch.cat(
-            [shared_h, vq_hidden],
-            dim=-1,
-        )
-
-        bpe_hidden = self.bpe_fusion(bpe_fusion_input)
-
-        # BPE[t+1]予測
-        bpe_logits = self.bpe_head(bpe_hidden) + self.bpe_bias
+        # ---------------- BPE prediction only ----------------
+        bpe_logits = self.bpe_head(shared_h) + self.bpe_bias
 
         return {
             "bpe_logits": bpe_logits,
-            "vq_logits": vq_logits,
             "shared_hidden": shared_h,
-            "vq_prediction_hidden": vq_hidden,
-            "bpe_hidden": bpe_hidden,
             "bpe_input": bpe_x,
             "vq_context_hidden": context_h,
         }
@@ -412,19 +370,16 @@ def evaluate(model, loader, device):
     model.eval()
 
     total_bpe_loss = 0.0
-    total_vq_loss = 0.0
     total_count = 0
     total_bpe_top1 = 0
     total_bpe_top5 = 0
-    total_vq_top1 = 0
-    total_vq_top5 = 0
 
     for (
         tok_in,
         vq_context,
         hop_valid,
         tok_y,
-        vq_y,
+        _vq_y,
         attention_mask,
     ) in tqdm(loader, desc="[eval]", leave=False):
 
@@ -432,7 +387,6 @@ def evaluate(model, loader, device):
         vq_context = vq_context.to(device)
         hop_valid = hop_valid.to(device)
         tok_y = tok_y.to(device)
-        vq_y = vq_y.to(device)
         attention_mask = attention_mask.to(device)
 
         output = model(
@@ -443,17 +397,10 @@ def evaluate(model, loader, device):
         )
 
         bpe_logits = output["bpe_logits"]
-        vq_logits = output["vq_logits"]
 
         bpe_loss = F.cross_entropy(
             bpe_logits.reshape(-1, bpe_logits.size(-1)),
             tok_y.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
-        vq_loss = F.cross_entropy(
-            vq_logits.reshape(-1, vq_logits.size(-1)),
-            vq_y.reshape(-1),
             ignore_index=-100,
             reduction="sum",
         )
@@ -468,15 +415,7 @@ def evaluate(model, loader, device):
             dim=-1,
         ).indices
 
-        vq_pred = vq_logits[valid]
-        vq_target = vq_y[valid]
-        vq_topk = vq_pred.topk(
-            min(5, vq_pred.size(-1)),
-            dim=-1,
-        ).indices
-
         total_bpe_loss += float(bpe_loss.item())
-        total_vq_loss += float(vq_loss.item())
         total_count += n
 
         total_bpe_top1 += int(
@@ -485,25 +424,14 @@ def evaluate(model, loader, device):
         total_bpe_top5 += int(
             bpe_topk.eq(bpe_target[:, None]).any(dim=1).sum().item()
         )
-        total_vq_top1 += int(
-            vq_topk[:, 0].eq(vq_target).sum().item()
-        )
-        total_vq_top5 += int(
-            vq_topk.eq(vq_target[:, None]).any(dim=1).sum().item()
-        )
 
     bpe_ce = total_bpe_loss / max(total_count, 1)
-    vq_ce = total_vq_loss / max(total_count, 1)
 
     return {
         "bpe_loss": bpe_ce,
         "bpe_ppl": math.exp(min(bpe_ce, 20.0)),
         "bpe_top1": total_bpe_top1 / max(total_count, 1),
         "bpe_top5": total_bpe_top5 / max(total_count, 1),
-        "vq_loss": vq_ce,
-        "vq_ppl": math.exp(min(vq_ce, 20.0)),
-        "vq_top1": total_vq_top1 / max(total_count, 1),
-        "vq_top5": total_vq_top5 / max(total_count, 1),
         "count": total_count,
     }
 
@@ -525,7 +453,7 @@ def main():
     )
     ap.add_argument(
         "--out",
-        default="ar_bpe_multihop_vqw_two_stream.pt",
+        default="ar_bpe_multihop_input_cat_bpe_only.pt",
     )
 
     ap.add_argument("--batch_size", type=int, default=32)
@@ -540,12 +468,6 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tie_weights", action="store_true")
 
-    ap.add_argument(
-        "--vq_loss_weight",
-        type=float,
-        default=1.0,
-        help="weight for next-HOP10-VQW auxiliary loss",
-    )
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -643,9 +565,7 @@ def main():
             f"used={torch.unique(ids).numel():,}"
         )
 
-    print("[architecture] input CAT(BPE, multi-hop VQ) + shared Transformer + two heads")
-    print("[VQ target] HOP10 VQW[t+1]")
-    print(f"[VQ loss weight] {args.vq_loss_weight}")
+    print("[architecture] input CAT(BPE, multi-hop VQ) + shared Transformer + BPE head only")
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
 
@@ -702,7 +622,7 @@ def main():
     valid_loader = make_loader(valid_ds, False)
     test_loader = make_loader(test_ds, False)
 
-    model = BPEMultiHopSharedCatLM(
+    model = BPEMultiHopInputCatLM(
         hop_centers=hop_centers,
         token_vocab_size=token_vocab_size,
         target_vq_vocab_size=vq_vocab_size,
@@ -731,9 +651,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
 
-        running_total_loss = 0.0
         running_bpe_loss = 0.0
-        running_vq_loss = 0.0
         running_count = 0
 
         pbar = tqdm(
@@ -754,7 +672,7 @@ def main():
             vq_context = vq_context.to(device)
             hop_valid = hop_valid.to(device)
             tok_y = tok_y.to(device)
-            vq_y = vq_y.to(device)
+            # vq_y is intentionally unused in the BPE-only experiment.
             attention_mask = attention_mask.to(device)
 
             optimizer.zero_grad(set_to_none=True)
@@ -767,25 +685,14 @@ def main():
             )
 
             bpe_logits = output["bpe_logits"]
-            vq_logits = output["vq_logits"]
 
             bpe_loss = F.cross_entropy(
                 bpe_logits.reshape(-1, bpe_logits.size(-1)),
                 tok_y.reshape(-1),
                 ignore_index=-100,
             )
-            vq_loss = F.cross_entropy(
-                vq_logits.reshape(-1, vq_logits.size(-1)),
-                vq_y.reshape(-1),
-                ignore_index=-100,
-            )
 
-            total_loss = (
-                bpe_loss
-                + args.vq_loss_weight * vq_loss
-            )
-
-            total_loss.backward()
+            bpe_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 1.0,
@@ -793,21 +700,13 @@ def main():
             optimizer.step()
 
             n_valid_tokens = int(tok_y.ne(-100).sum().item())
-            running_total_loss += (
-                float(total_loss.item()) * n_valid_tokens
-            )
             running_bpe_loss += (
                 float(bpe_loss.item()) * n_valid_tokens
-            )
-            running_vq_loss += (
-                float(vq_loss.item()) * n_valid_tokens
             )
             running_count += n_valid_tokens
 
             pbar.set_postfix(
-                total=f"{running_total_loss / max(running_count, 1):.4f}",
                 bpe=f"{running_bpe_loss / max(running_count, 1):.4f}",
-                vq=f"{running_vq_loss / max(running_count, 1):.4f}",
             )
 
         valid_metrics = evaluate(
@@ -826,29 +725,16 @@ def main():
             f"valid_bpe_ppl={valid_metrics['bpe_ppl']:.4f} "
             f"valid_bpe_top1={valid_metrics['bpe_top1']:.4f} "
             f"valid_bpe_top5={valid_metrics['bpe_top5']:.4f} "
-            f"valid_vq_ppl={valid_metrics['vq_ppl']:.4f} "
-            f"valid_vq_top1={valid_metrics['vq_top1']:.4f} "
-            f"valid_vq_top5={valid_metrics['vq_top5']:.4f} "
             f"test_bpe_ppl={test_metrics['bpe_ppl']:.4f} "
             f"test_bpe_top1={test_metrics['bpe_top1']:.4f} "
-            f"test_bpe_top5={test_metrics['bpe_top5']:.4f} "
-            f"test_vq_ppl={test_metrics['vq_ppl']:.4f} "
-            f"test_vq_top1={test_metrics['vq_top1']:.4f} "
-            f"test_vq_top5={test_metrics['vq_top5']:.4f}"
+            f"test_bpe_top5={test_metrics['bpe_top5']:.4f}"
         )
 
         record = {
             "epoch": epoch,
-            "train_total_loss": (
-                running_total_loss / max(running_count, 1)
-            ),
             "train_bpe_loss": (
                 running_bpe_loss / max(running_count, 1)
             ),
-            "train_vq_loss": (
-                running_vq_loss / max(running_count, 1)
-            ),
-            "vq_loss_weight": args.vq_loss_weight,
             "valid": valid_metrics,
             "test": test_metrics,
         }
@@ -857,10 +743,7 @@ def main():
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "architecture": (
-                "bpe_multihop_vqw_input_cat_"
-                "shared_vqhidden_to_bpe"
-            ),
+            "architecture": "bpe_multihop_input_cat_bpe_only",
             "history": history,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
@@ -869,8 +752,7 @@ def main():
             "hop_data_sources": list(args.hop_data),
             "hop_codebook_sources": list(args.hop_codebooks),
             "vq_centers_frozen": True,
-            "vq_target_hop": 10,
-            "vq_loss_weight": args.vq_loss_weight,
+            "vq_used_as_input_only": True,
             "last_valid": valid_metrics,
             "last_test": test_metrics,
         }
