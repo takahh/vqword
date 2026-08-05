@@ -261,18 +261,39 @@ class BPEMultiHopSharedCatLM(nn.Module):
         self.shared_norm = nn.LayerNorm(d_model)
 
         # ---------------- Two output heads ----------------
+        # ---------------- VQ intermediate representation ----------------
+        # shared_hから、HOP10 VQW[t+1]予測に特化した中間表現を作る
+        self.vq_adapter = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+        )
+
+        # VQ中間表現からHOP10 VQW[t+1]を予測
+        self.vq_head = nn.Linear(
+            d_model,
+            self.vq_vocab_size,
+            bias=True,
+        )
+
+        # shared_hとVQ予測用中間表現を結合してBPE用表現へ戻す
+        self.bpe_fusion = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+        )
+
+        # 融合後の表現からBPE[t+1]を予測
         self.bpe_head = nn.Linear(
             d_model,
             self.token_vocab_size,
             bias=False,
         )
+
         self.bpe_bias = nn.Parameter(
             torch.zeros(self.token_vocab_size)
-        )
-        self.vq_head = nn.Linear(
-            d_model,
-            self.vq_vocab_size,
-            bias=True,
         )
 
         if tie_weights:
@@ -356,13 +377,31 @@ class BPEMultiHopSharedCatLM(nn.Module):
         )
         shared_h = self.shared_norm(shared_h)
 
-        bpe_logits = self.bpe_head(shared_h) + self.bpe_bias
-        vq_logits = self.vq_head(shared_h)
+        # ---------------- VQ prediction branch ----------------
+        # HOP10 VQW[t+1]予測用の中間表現
+        vq_hidden = self.vq_adapter(shared_h)
+
+        # HOP10 VQW[t+1]予測
+        vq_logits = self.vq_head(vq_hidden)
+
+        # ---------------- BPE prediction branch ----------------
+        # Transformer表現とVQ予測用表現を結合
+        bpe_fusion_input = torch.cat(
+            [shared_h, vq_hidden],
+            dim=-1,
+        )
+
+        bpe_hidden = self.bpe_fusion(bpe_fusion_input)
+
+        # BPE[t+1]予測
+        bpe_logits = self.bpe_head(bpe_hidden) + self.bpe_bias
 
         return {
             "bpe_logits": bpe_logits,
             "vq_logits": vq_logits,
             "shared_hidden": shared_h,
+            "vq_prediction_hidden": vq_hidden,
+            "bpe_hidden": bpe_hidden,
             "bpe_input": bpe_x,
             "vq_context_hidden": context_h,
         }
@@ -818,7 +857,10 @@ def main():
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "architecture": "bpe_multihop_vqw_input_cat_shared",
+            "architecture": (
+                "bpe_multihop_vqw_input_cat_"
+                "shared_vqhidden_to_bpe"
+            ),
             "history": history,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
