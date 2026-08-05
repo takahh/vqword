@@ -95,6 +95,7 @@ class BPEPlusSC0LM(nn.Module):
         self,
         centers,
         token_vocab_size,
+        input_mode="vqw",
         vq_input_weight=0.01,
         d_model=256,
         n_layers=6,
@@ -104,6 +105,10 @@ class BPEPlusSC0LM(nn.Module):
         tie_weights=False,
     ):
         super().__init__()
+        self.input_mode = str(input_mode)
+
+        if self.input_mode not in {"vqw", "bpe2", "vq_shuffle"}:
+            raise ValueError(f"unsupported input_mode: {self.input_mode}")
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(centers.size(0))
         self.tok_pad_id = self.token_vocab_size
@@ -115,6 +120,14 @@ class BPEPlusSC0LM(nn.Module):
             d_model,
             padding_idx=self.tok_pad_id,
         )
+        self.tok_emb2 = None
+
+        if self.input_mode == "bpe2":
+            self.tok_emb2 = nn.Embedding(
+                self.token_vocab_size + 1,
+                d_model,
+                padding_idx=self.tok_pad_id,
+            )
         self.vq_emb = FrozenCenterEmbedding(centers)
 
         # VQコードブック中心をTransformerの隠れ次元へ写像
@@ -160,10 +173,23 @@ class BPEPlusSC0LM(nn.Module):
             )
 
         bpe_h = self.tok_emb(tok_in)
-        vq_h = self.vq_proj(self.vq_emb(vq_in))
+
+        if self.input_mode == "bpe2":
+            if self.tok_emb2 is None:
+                raise RuntimeError("tok_emb2 is not initialized")
+
+            second_h = self.tok_emb2(tok_in)
+
+        elif self.input_mode in {"vqw", "vq_shuffle"}:
+            second_h = self.vq_proj(self.vq_emb(vq_in))
+
+        else:
+            raise RuntimeError(
+                f"unsupported input_mode in forward: {self.input_mode}"
+            )
 
         combined_h = torch.cat(
-            [bpe_h, vq_h],
+            [bpe_h, second_h],
             dim=-1,
         )
 
@@ -248,6 +274,24 @@ def main():
     ap.add_argument("--max_len", type=int, default=255)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tie_weights", action="store_true")
+    ap.add_argument(
+        "--input_mode",
+        type=str,
+        default="vqw",
+        choices=["vqw", "bpe2", "vq_shuffle"],
+        help=(
+            "vqw: normal BPE+VQW concat, "
+            "bpe2: two independently learned BPE embeddings concat, "
+            "vq_shuffle: concat with globally shuffled VQ IDs"
+        ),
+    )
+
+    ap.add_argument(
+        "--control_seed",
+        type=int,
+        default=12345,
+        help="seed used for control-input construction such as VQ shuffling",
+    )
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -272,6 +316,21 @@ def main():
     token_ids_flat = data["token_ids_flat"].long().reshape(-1)
     vq_ids_flat = data["vq_ids_flat"].long().reshape(-1)
     centers = codebook["global_centers"].float()
+    if args.input_mode == "vq_shuffle":
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(args.control_seed)
+
+        permutation = torch.randperm(
+            vq_ids_flat.numel(),
+            generator=generator,
+        )
+
+        vq_ids_flat = vq_ids_flat[permutation]
+
+        print(
+            "[control] VQ IDs globally shuffled "
+            f"with seed={args.control_seed}"
+        )
 
     token_vocab_size = int(token_ids_flat.max().item()) + 1
     if "token_vocab_size" in data:
@@ -291,14 +350,24 @@ def main():
     data_center_scale = data.get("center_scale", None)
     codebook_center_scale = codebook.get("args", {}).get("center_scale", None)
 
-    print(f"[task] BPE + SC0VQW -> BPE")
+    print("[task] autoregressive BPE prediction")
+    print(f"[input mode] {args.input_mode}")
+    if args.input_mode == "vqw":
+        print("[input] CAT(BPE embedding, projected VQW center)")
+
+    elif args.input_mode == "bpe2":
+        print("[input] CAT(BPE embedding 1, BPE embedding 2)")
+
+    elif args.input_mode == "vq_shuffle":
+        print("[input] CAT(BPE embedding, projected shuffled VQW center)")
+        print(f"[control seed] {args.control_seed}")
     print(f"[data hop] {data_hop}")
     print(f"[codebook hop] {codebook_hop}")
     print(f"[data center scale] {data_center_scale}")
     print(f"[codebook center scale] {codebook_center_scale}")
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
-    print(f"[VQ input weight] {args.vq_input_weight}")
+    print("[fusion] concat + learned linear projection")
     print("[input fusion] concat + linear projection")
 
     random.shuffle(samples)
@@ -337,6 +406,7 @@ def main():
     model = BPEPlusSC0LM(
         centers=centers,
         token_vocab_size=token_vocab_size,
+        input_mode=args.input_mode,
         vq_input_weight=args.vq_input_weight,
         d_model=args.d_model,
         n_layers=args.n_layers,
@@ -409,6 +479,7 @@ def main():
             "model": model.state_dict(),
             "args": vars(args),
             "history": history,
+            "input_mode": args.input_mode,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
             "tok_pad_id": tok_pad_id,

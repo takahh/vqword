@@ -28,6 +28,17 @@ case "${VQ_CODEBOOK_LABEL}" in
   100k) VQ_CODEBOOK_SIZE=100000 ;;
   *) echo "[error] expected 100k"; exit 1 ;;
 esac
+INPUT_MODE="${INPUT_MODE:-vqw}"
+CONTROL_SEED="${CONTROL_SEED:-12345}"
+
+case "${INPUT_MODE}" in
+  vqw|bpe2|vq_shuffle)
+    ;;
+  *)
+    echo "[error] INPUT_MODE must be one of: vqw, bpe2, vq_shuffle"
+    exit 1
+    ;;
+esac
 
 CENTER_SCALE="${CENTER_SCALE:-0}"
 TARGET_HOP="${TARGET_HOP:-10}"
@@ -56,7 +67,14 @@ DATA_PATH="/vqword/${DATA_FILE}"
 CODEBOOK_PATH="/vqword/${CODEBOOK_FILE}"
 AR_SCRIPT="/vqword/ar_multihop.py"
 
-RUN="ar_bpeplussc0vqw_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_vqin${VQ_INPUT_WEIGHT}_$(date +%Y%m%d_%H%M%S)"
+
+CONTROL_TAG="${INPUT_MODE}"
+
+if [ "${INPUT_MODE}" = "vq_shuffle" ]; then
+  CONTROL_TAG="${INPUT_MODE}${CONTROL_SEED}"
+fi
+
+RUN="ar_cat_${CONTROL_TAG}_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_$(date +%Y%m%d_%H%M%S)"
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
 LOG_PATH="/vqword/${RUN}.log"
@@ -120,8 +138,24 @@ print("center_scale requested:", expected_scale)
 PY
 
 echo "============================================================"
-echo "[start BPE + SC0VQW autoregressive training]"
-echo "input   = BPE[t] + ${VQ_INPUT_WEIGHT} * SC0VQW[t]"
+echo "[start CAT autoregressive training]"
+echo "mode    = ${INPUT_MODE}"
+echo "target  = BPE[t+1]"
+echo "hop     = bilateral ${TARGET_HOP}"
+echo "center  = ${CENTER_SCALE}"
+
+case "${INPUT_MODE}" in
+  vqw)
+    echo "input   = CAT(BPE[t], projected VQW[t]) -> Linear"
+    ;;
+  bpe2)
+    echo "input   = CAT(BPE_embedding1[t], BPE_embedding2[t]) -> Linear"
+    ;;
+  vq_shuffle)
+    echo "input   = CAT(BPE[t], projected shuffled-VQW[t]) -> Linear"
+    echo "control seed = ${CONTROL_SEED}"
+    ;;
+esac
 echo "target  = BPE[t+1]"
 echo "hop     = bilateral ${TARGET_HOP}"
 echo "center  = ${CENTER_SCALE}"
@@ -131,6 +165,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python "${AR_SCRIPT}" \
   --data "${DATA_PATH}" \
   --codebook "${CODEBOOK_PATH}" \
+  --input_mode "${INPUT_MODE}" \
+  --control_seed "${CONTROL_SEED}" \
   --batch_size "${BATCH_SIZE}" \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
