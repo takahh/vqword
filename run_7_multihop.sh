@@ -73,7 +73,7 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
 
 # Input-CAT -> shared Transformer -> BPE-only model
-AR_SCRIPT="/vqword/ar_bpe_multihop_input_cat_bpe_only.py"
+AR_SCRIPT="/vqword/ar_multihop.py"
 
 # ============================================================
 # Construct HOP0 ... HOP10 filenames
