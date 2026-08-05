@@ -116,7 +116,22 @@ class BPEPlusSC0LM(nn.Module):
             padding_idx=self.tok_pad_id,
         )
         self.vq_emb = FrozenCenterEmbedding(centers)
-        self.vq_proj = nn.Linear(centers.size(1), d_model, bias=False)
+
+        # VQコードブック中心をTransformerの隠れ次元へ写像
+        self.vq_proj = nn.Linear(
+            centers.size(1),
+            d_model,
+            bias=False,
+        )
+
+        # BPE埋め込みとVQ埋め込みを連結すると2 * d_modelになる。
+        # それをTransformer入力のd_modelへ戻す。
+        self.input_proj = nn.Linear(
+            2 * d_model,
+            d_model,
+            bias=True,
+        )
+
         self.input_norm = nn.LayerNorm(d_model)
         self.pos_emb = nn.Embedding(max_len, d_model)
 
@@ -146,7 +161,14 @@ class BPEPlusSC0LM(nn.Module):
 
         bpe_h = self.tok_emb(tok_in)
         vq_h = self.vq_proj(self.vq_emb(vq_in))
-        h = self.input_norm(bpe_h + self.vq_input_weight * vq_h)
+
+        combined_h = torch.cat(
+            [bpe_h, vq_h],
+            dim=-1,
+        )
+
+        h = self.input_proj(combined_h)
+        h = self.input_norm(h)
 
         pos = torch.arange(seq_len, device=tok_in.device)[None, :]
         h = h + self.pos_emb(pos)
@@ -277,6 +299,7 @@ def main():
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
     print(f"[VQ input weight] {args.vq_input_weight}")
+    print("[input fusion] concat + linear projection")
 
     random.shuffle(samples)
     n = len(samples)
