@@ -50,10 +50,15 @@ class BPEPlusSC0Dataset(Dataset):
 
     def __getitem__(self, index):
         start, end = self.samples[index]
+
         return {
+            # position t
             "tok_in": self.token_ids_flat[start:end - 1],
             "vq_in": self.vq_ids_flat[start:end - 1],
+
+            # position t+1
             "tok_y": self.token_ids_flat[start + 1:end],
+            "vq_y": self.vq_ids_flat[start + 1:end],
         }
 
 
@@ -61,20 +66,52 @@ def collate_batch(batch, tok_pad_id, vq_pad_id):
     batch_size = len(batch)
     max_len = max(item["tok_in"].numel() for item in batch)
 
-    tok_in = torch.full((batch_size, max_len), tok_pad_id, dtype=torch.long)
-    vq_in = torch.full((batch_size, max_len), vq_pad_id, dtype=torch.long)
-    tok_y = torch.full((batch_size, max_len), -100, dtype=torch.long)
-    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
+    tok_in = torch.full(
+        (batch_size, max_len),
+        tok_pad_id,
+        dtype=torch.long,
+    )
+
+    vq_in = torch.full(
+        (batch_size, max_len),
+        vq_pad_id,
+        dtype=torch.long,
+    )
+
+    # cross_entropyのignore_index用
+    tok_y = torch.full(
+        (batch_size, max_len),
+        -100,
+        dtype=torch.long,
+    )
+
+    vq_y = torch.full(
+        (batch_size, max_len),
+        -100,
+        dtype=torch.long,
+    )
+
+    attention_mask = torch.zeros(
+        (batch_size, max_len),
+        dtype=torch.bool,
+    )
 
     for i, item in enumerate(batch):
         n = item["tok_in"].numel()
+
         tok_in[i, :n] = item["tok_in"]
         vq_in[i, :n] = item["vq_in"]
         tok_y[i, :n] = item["tok_y"]
+        vq_y[i, :n] = item["vq_y"]
         attention_mask[i, :n] = True
 
-    return tok_in, vq_in, tok_y, attention_mask
-
+    return (
+        tok_in,
+        vq_in,
+        tok_y,
+        vq_y,
+        attention_mask,
+    )
 
 class FrozenCenterEmbedding(nn.Module):
     def __init__(self, centers):
@@ -90,13 +127,27 @@ class FrozenCenterEmbedding(nn.Module):
         return F.embedding(ids, self.weight, padding_idx=self.padding_idx)
 
 
-class BPEPlusSC0LM(nn.Module):
+class BPESC0TwoStreamLM(nn.Module):
+    """
+    Two-stream autoregressive model.
+
+    BPE stream:
+        BPE[t] -> causal Transformer -> h_bpe
+
+    VQ stream:
+        VQW[t] -> causal Transformer -> h_vq
+               -> auxiliary prediction of VQW[t+1]
+
+    Fusion:
+        CAT(h_bpe, h_vq)
+        -> Linear
+        -> final prediction of BPE[t+1]
+    """
+
     def __init__(
         self,
         centers,
         token_vocab_size,
-        input_mode="vqw",
-        vq_input_weight=0.01,
         d_model=256,
         n_layers=6,
         n_heads=8,
@@ -105,57 +156,30 @@ class BPEPlusSC0LM(nn.Module):
         tie_weights=False,
     ):
         super().__init__()
-        self.input_mode = str(input_mode)
 
-        if self.input_mode not in {
-            "vqw",
-            "bpe2",
-            "vq_shuffle",
-            "zero",
-        }:
-            raise ValueError(
-                f"unsupported input_mode: {self.input_mode}"
-            )
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(centers.size(0))
+
         self.tok_pad_id = self.token_vocab_size
         self.vq_pad_id = self.vq_vocab_size
-        self.vq_input_weight = float(vq_input_weight)
+        self.d_model = int(d_model)
+
+        # ====================================================
+        # BPE stream
+        # ====================================================
 
         self.tok_emb = nn.Embedding(
             self.token_vocab_size + 1,
             d_model,
             padding_idx=self.tok_pad_id,
         )
-        self.tok_emb2 = None
 
-        if self.input_mode == "bpe2":
-            self.tok_emb2 = nn.Embedding(
-                self.token_vocab_size + 1,
-                d_model,
-                padding_idx=self.tok_pad_id,
-            )
-        self.vq_emb = FrozenCenterEmbedding(centers)
-
-        # VQコードブック中心をTransformerの隠れ次元へ写像
-        self.vq_proj = nn.Linear(
-            centers.size(1),
+        self.bpe_pos_emb = nn.Embedding(
+            max_len,
             d_model,
-            bias=False,
         )
 
-        # BPE埋め込みとVQ埋め込みを連結すると2 * d_modelになる。
-        # それをTransformer入力のd_modelへ戻す。
-        self.input_proj = nn.Linear(
-            2 * d_model,
-            d_model,
-            bias=True,
-        )
-
-        self.input_norm = nn.LayerNorm(d_model)
-        self.pos_emb = nn.Embedding(max_len, d_model)
-
-        layer = nn.TransformerEncoderLayer(
+        bpe_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=4 * d_model,
@@ -163,251 +187,308 @@ class BPEPlusSC0LM(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self.norm = nn.LayerNorm(d_model)
-        self.bpe_head = nn.Linear(d_model, self.token_vocab_size, bias=False)
-        self.bpe_bias = nn.Parameter(torch.zeros(self.token_vocab_size))
+
+        self.bpe_transformer = nn.TransformerEncoder(
+            bpe_layer,
+            num_layers=n_layers,
+        )
+
+        self.bpe_norm = nn.LayerNorm(d_model)
+
+        # ====================================================
+        # VQ stream
+        # ====================================================
+
+        # コードブック中心は固定
+        self.vq_emb = FrozenCenterEmbedding(centers)
+
+        # 元のコードブック空間からVQ Transformer空間へ写像
+        self.vq_proj = nn.Linear(
+            centers.size(1),
+            d_model,
+            bias=False,
+        )
+
+        self.vq_input_norm = nn.LayerNorm(d_model)
+
+        # BPE側とは別の位置埋め込みを持たせる
+        self.vq_pos_emb = nn.Embedding(
+            max_len,
+            d_model,
+        )
+
+        vq_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+
+        self.vq_transformer = nn.TransformerEncoder(
+            vq_layer,
+            num_layers=n_layers,
+        )
+
+        self.vq_norm = nn.LayerNorm(d_model)
+
+        # VQW[t+1] auxiliary prediction
+        self.vq_head = nn.Linear(
+            d_model,
+            self.vq_vocab_size,
+            bias=True,
+        )
+
+        # ====================================================
+        # Fusion and final BPE prediction
+        # ====================================================
+
+        self.fusion_proj = nn.Linear(
+            2 * d_model,
+            d_model,
+            bias=True,
+        )
+
+        self.fusion_norm = nn.LayerNorm(d_model)
+
+        self.bpe_head = nn.Linear(
+            d_model,
+            self.token_vocab_size,
+            bias=False,
+        )
+
+        self.bpe_bias = nn.Parameter(
+            torch.zeros(self.token_vocab_size)
+        )
 
         if tie_weights:
-            self.bpe_head.weight = self.tok_emb.weight[:self.token_vocab_size]
+            # 元コードと同じ方式
+            self.bpe_head.weight = self.tok_emb.weight[
+                :self.token_vocab_size
+            ]
 
-    def forward(self, tok_in, vq_in, key_padding_mask=None):
+    def forward(
+        self,
+        tok_in,
+        vq_in,
+        key_padding_mask=None,
+    ):
         batch_size, seq_len = tok_in.shape
-        if seq_len > self.pos_emb.num_embeddings:
+
+        if seq_len > self.bpe_pos_emb.num_embeddings:
             raise ValueError(
                 f"sequence length {seq_len} exceeds max_len "
-                f"{self.pos_emb.num_embeddings}"
+                f"{self.bpe_pos_emb.num_embeddings}"
             )
 
-        bpe_h = self.tok_emb(tok_in)
-
-        if self.input_mode == "bpe2":
-            second_h = self.tok_emb2(tok_in)
-
-        elif self.input_mode in {"vqw", "vq_shuffle"}:
-            second_h = self.vq_proj(self.vq_emb(vq_in))
-            second_h = self.vq_input_weight * second_h
-
-        elif self.input_mode == "zero":
-            second_h = torch.zeros_like(bpe_h)
-
-        else:
-            raise RuntimeError(
-                f"unsupported input_mode in forward: {self.input_mode}"
-            )
-
-        combined_h = torch.cat(
-            [bpe_h, second_h],
-            dim=-1,
-        )
-
-        h = self.input_proj(combined_h)
-        h = self.input_norm(h)
-
-        h = self.input_proj(combined_h)
-        h = self.input_norm(h)
-
-        pos = torch.arange(seq_len, device=tok_in.device)[None, :]
-        h = h + self.pos_emb(pos)
+        pos = torch.arange(
+            seq_len,
+            device=tok_in.device,
+        )[None, :]
 
         causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=h.device),
+            torch.ones(
+                seq_len,
+                seq_len,
+                dtype=torch.bool,
+                device=tok_in.device,
+            ),
             diagonal=1,
         )
-        h = self.transformer(
-            h,
+
+        # ====================================================
+        # BPE stream
+        # ====================================================
+
+        bpe_h = self.tok_emb(tok_in)
+        bpe_h = bpe_h + self.bpe_pos_emb(pos)
+
+        bpe_h = self.bpe_transformer(
+            bpe_h,
             mask=causal_mask,
             src_key_padding_mask=key_padding_mask,
         )
-        h = self.norm(h)
-        return self.bpe_head(h) + self.bpe_bias
 
+        bpe_h = self.bpe_norm(bpe_h)
+
+        # ====================================================
+        # VQ stream
+        # ====================================================
+
+        vq_h = self.vq_emb(vq_in)
+        vq_h = self.vq_proj(vq_h)
+        vq_h = self.vq_input_norm(vq_h)
+        vq_h = vq_h + self.vq_pos_emb(pos)
+
+        vq_h = self.vq_transformer(
+            vq_h,
+            mask=causal_mask,
+            src_key_padding_mask=key_padding_mask,
+        )
+
+        vq_h = self.vq_norm(vq_h)
+
+        # SC0[t] -> SC0[t+1]
+        vq_logits = self.vq_head(vq_h)
+
+        # ====================================================
+        # Fusion
+        # ====================================================
+
+        fused_h = torch.cat(
+            [bpe_h, vq_h],
+            dim=-1,
+        )
+
+        fused_h = self.fusion_proj(fused_h)
+        fused_h = self.fusion_norm(fused_h)
+
+        # BPE[t+1]
+        bpe_logits = (
+            self.bpe_head(fused_h)
+            + self.bpe_bias
+        )
+
+        return {
+            "bpe_logits": bpe_logits,
+            "vq_logits": vq_logits,
+            "bpe_hidden": bpe_h,
+            "vq_hidden": vq_h,
+            "fused_hidden": fused_h,
+        }
 
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
-    total_loss = 0.0
-    total_count = 0
-    total_top1 = 0
-    total_top5 = 0
 
-    for tok_in, vq_in, tok_y, attention_mask in tqdm(
-        loader, desc="[eval]", leave=False
+    total_bpe_loss = 0.0
+    total_vq_loss = 0.0
+
+    total_count = 0
+
+    total_bpe_top1 = 0
+    total_bpe_top5 = 0
+
+    total_vq_top1 = 0
+    total_vq_top5 = 0
+
+    for (
+        tok_in,
+        vq_in,
+        tok_y,
+        vq_y,
+        attention_mask,
+    ) in tqdm(
+        loader,
+        desc="[eval]",
+        leave=False,
     ):
         tok_in = tok_in.to(device)
         vq_in = vq_in.to(device)
         tok_y = tok_y.to(device)
+        vq_y = vq_y.to(device)
         attention_mask = attention_mask.to(device)
 
-        logits = model(tok_in, vq_in, key_padding_mask=~attention_mask)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
+        output = model(
+            tok_in,
+            vq_in,
+            key_padding_mask=~attention_mask,
+        )
+
+        bpe_logits = output["bpe_logits"]
+        vq_logits = output["vq_logits"]
+
+        bpe_loss = F.cross_entropy(
+            bpe_logits.reshape(
+                -1,
+                bpe_logits.size(-1),
+            ),
             tok_y.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+
+        vq_loss = F.cross_entropy(
+            vq_logits.reshape(
+                -1,
+                vq_logits.size(-1),
+            ),
+            vq_y.reshape(-1),
             ignore_index=-100,
             reduction="sum",
         )
 
         valid = tok_y.ne(-100)
         n = int(valid.sum().item())
-        pred = logits[valid]
-        target = tok_y[valid]
-        topk = pred.topk(min(5, pred.size(-1)), dim=-1).indices
 
-        total_loss += float(loss.item())
+        # BPE metrics
+        bpe_pred = bpe_logits[valid]
+        bpe_target = tok_y[valid]
+
+        bpe_topk = bpe_pred.topk(
+            min(5, bpe_pred.size(-1)),
+            dim=-1,
+        ).indices
+
+        total_bpe_top1 += int(
+            bpe_topk[:, 0]
+            .eq(bpe_target)
+            .sum()
+            .item()
+        )
+
+        total_bpe_top5 += int(
+            bpe_topk
+            .eq(bpe_target[:, None])
+            .any(dim=1)
+            .sum()
+            .item()
+        )
+
+        # VQ metrics
+        vq_pred = vq_logits[valid]
+        vq_target = vq_y[valid]
+
+        vq_topk = vq_pred.topk(
+            min(5, vq_pred.size(-1)),
+            dim=-1,
+        ).indices
+
+        total_vq_top1 += int(
+            vq_topk[:, 0]
+            .eq(vq_target)
+            .sum()
+            .item()
+        )
+
+        total_vq_top5 += int(
+            vq_topk
+            .eq(vq_target[:, None])
+            .any(dim=1)
+            .sum()
+            .item()
+        )
+
+        total_bpe_loss += float(bpe_loss.item())
+        total_vq_loss += float(vq_loss.item())
         total_count += n
-        total_top1 += int(topk[:, 0].eq(target).sum().item())
-        total_top5 += int(topk.eq(target[:, None]).any(dim=1).sum().item())
 
-    ce = total_loss / max(total_count, 1)
+    bpe_ce = total_bpe_loss / max(total_count, 1)
+    vq_ce = total_vq_loss / max(total_count, 1)
+
     return {
-        "bpe_loss": ce,
-        "bpe_ppl": math.exp(min(ce, 20.0)),
-        "bpe_top1": total_top1 / max(total_count, 1),
-        "bpe_top5": total_top5 / max(total_count, 1),
+        "bpe_loss": bpe_ce,
+        "bpe_ppl": math.exp(min(bpe_ce, 20.0)),
+        "bpe_top1": total_bpe_top1 / max(total_count, 1),
+        "bpe_top5": total_bpe_top5 / max(total_count, 1),
+
+        "vq_loss": vq_ce,
+        "vq_ppl": math.exp(min(vq_ce, 20.0)),
+        "vq_top1": total_vq_top1 / max(total_count, 1),
+        "vq_top5": total_vq_top5 / max(total_count, 1),
+
         "count": total_count,
-    }
-
-@torch.no_grad()
-def analyze_input_contributions(model, loader, device):
-    """
-    Measure how much the BPE channel and second channel contribute
-    to the learned input projection.
-
-    input_proj:
-        [BPE channel | second channel] -> d_model
-    """
-    model.eval()
-
-    weight = model.input_proj.weight
-    input_dim = int(weight.size(1))
-
-    if input_dim % 2 != 0:
-        raise ValueError(
-            f"input_proj input dimension must be even, got {input_dim}"
-        )
-
-    d_model = input_dim // 2
-
-    # input_proj.weight shape:
-    #     [d_model, 2 * d_model]
-    w_bpe = weight[:, :d_model]
-    w_second = weight[:, d_model:]
-
-    weight_bpe_fro = float(torch.linalg.vector_norm(w_bpe).item())
-    weight_second_fro = float(torch.linalg.vector_norm(w_second).item())
-
-    total_bpe_contrib_l2 = 0.0
-    total_second_contrib_l2 = 0.0
-    total_combined_l2 = 0.0
-    total_tokens = 0
-
-    for tok_in, vq_in, tok_y, attention_mask in loader:
-        tok_in = tok_in.to(device)
-        vq_in = vq_in.to(device)
-        attention_mask = attention_mask.to(device)
-
-        # [B, T, d_model]
-        bpe_h = model.tok_emb(tok_in)
-
-        if model.input_mode == "bpe2":
-            if model.tok_emb2 is None:
-                raise RuntimeError(
-                    "tok_emb2 is missing in bpe2 mode"
-                )
-            second_h = model.tok_emb2(tok_in)
-
-        elif model.input_mode in {"vqw", "vq_shuffle"}:
-            second_h = model.vq_proj(
-                model.vq_emb(vq_in)
-            )
-
-        elif model.input_mode == "zero":
-            second_h = torch.zeros_like(bpe_h)
-
-        else:
-            raise RuntimeError(
-                f"unsupported input_mode: {model.input_mode}"
-            )
-
-        # input_proj(cat([bpe_h, second_h])) is equivalent to:
-        #
-        #   bpe_h    @ W_bpe.T
-        # + second_h @ W_second.T
-        # + bias
-        #
-        # Bias is excluded because we want to compare the two channels.
-        bpe_contrib = F.linear(
-            bpe_h,
-            w_bpe,
-            bias=None,
-        )
-
-        second_contrib = F.linear(
-            second_h,
-            w_second,
-            bias=None,
-        )
-
-        combined_contrib = bpe_contrib + second_contrib
-
-        valid = attention_mask
-
-        bpe_l2 = torch.linalg.vector_norm(
-            bpe_contrib,
-            dim=-1,
-        )
-
-        second_l2 = torch.linalg.vector_norm(
-            second_contrib,
-            dim=-1,
-        )
-
-        combined_l2 = torch.linalg.vector_norm(
-            combined_contrib,
-            dim=-1,
-        )
-
-        total_bpe_contrib_l2 += float(
-            bpe_l2[valid].sum().item()
-        )
-        total_second_contrib_l2 += float(
-            second_l2[valid].sum().item()
-        )
-        total_combined_l2 += float(
-            combined_l2[valid].sum().item()
-        )
-        total_tokens += int(valid.sum().item())
-
-    mean_bpe_contrib_l2 = (
-        total_bpe_contrib_l2 / max(total_tokens, 1)
-    )
-
-    mean_second_contrib_l2 = (
-        total_second_contrib_l2 / max(total_tokens, 1)
-    )
-
-    mean_combined_l2 = (
-        total_combined_l2 / max(total_tokens, 1)
-    )
-
-    weight_ratio = (
-        weight_second_fro / max(weight_bpe_fro, 1e-12)
-    )
-
-    contribution_ratio = (
-        mean_second_contrib_l2
-        / max(mean_bpe_contrib_l2, 1e-12)
-    )
-
-    return {
-        "weight_bpe_fro": weight_bpe_fro,
-        "weight_second_fro": weight_second_fro,
-        "weight_second_over_bpe": weight_ratio,
-        "mean_bpe_contrib_l2": mean_bpe_contrib_l2,
-        "mean_second_contrib_l2": mean_second_contrib_l2,
-        "mean_combined_l2": mean_combined_l2,
-        "contrib_second_over_bpe": contribution_ratio,
-        "count": total_tokens,
     }
 
 
@@ -428,6 +509,12 @@ def main():
     ap.add_argument("--max_len", type=int, default=255)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tie_weights", action="store_true")
+    ap.add_argument(
+        "--vq_loss_weight",
+        type=float,
+        default=0.1,
+        help="weight for next-VQ auxiliary loss",
+    )
     ap.add_argument(
         "--input_mode",
         type=str,
@@ -566,11 +653,9 @@ def main():
     valid_loader = make_loader(valid_ds, False)
     test_loader = make_loader(test_ds, False)
 
-    model = BPEPlusSC0LM(
+    model = BPESC0TwoStreamLM(
         centers=centers,
         token_vocab_size=token_vocab_size,
-        input_mode=args.input_mode,
-        vq_input_weight=args.vq_input_weight,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -589,83 +674,173 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        running_loss = 0.0
+
+        running_total_loss = 0.0
+        running_bpe_loss = 0.0
+        running_vq_loss = 0.0
         running_count = 0
 
-        pbar = tqdm(train_loader, desc=f"[train] epoch {epoch}/{args.epochs}")
-        for tok_in, vq_in, tok_y, attention_mask in pbar:
+        pbar = tqdm(
+            train_loader,
+            desc=f"[train] epoch {epoch}/{args.epochs}",
+        )
+
+        for (
+                tok_in,
+                vq_in,
+                tok_y,
+                vq_y,
+                attention_mask,
+        ) in pbar:
             tok_in = tok_in.to(device)
             vq_in = vq_in.to(device)
             tok_y = tok_y.to(device)
+            vq_y = vq_y.to(device)
             attention_mask = attention_mask.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(tok_in, vq_in, key_padding_mask=~attention_mask)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
+
+            output = model(
+                tok_in,
+                vq_in,
+                key_padding_mask=~attention_mask,
+            )
+
+            bpe_logits = output["bpe_logits"]
+            vq_logits = output["vq_logits"]
+
+            bpe_loss = F.cross_entropy(
+                bpe_logits.reshape(
+                    -1,
+                    bpe_logits.size(-1),
+                ),
                 tok_y.reshape(-1),
                 ignore_index=-100,
             )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
 
-            n_valid_tokens = int(tok_y.ne(-100).sum().item())
-            running_loss += float(loss.item()) * n_valid_tokens
-            running_count += n_valid_tokens
-            pbar.set_postfix(
-                bpe=f"{running_loss / max(running_count, 1):.4f}"
+            vq_loss = F.cross_entropy(
+                vq_logits.reshape(
+                    -1,
+                    vq_logits.size(-1),
+                ),
+                vq_y.reshape(-1),
+                ignore_index=-100,
             )
 
-        valid_metrics = evaluate(model, valid_loader, device)
-        test_metrics = evaluate(model, test_loader, device)
-        input_stats = analyze_input_contributions(
+            total_loss = (
+                    bpe_loss
+                    + args.vq_loss_weight * vq_loss
+            )
+
+            total_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0,
+            )
+
+            optimizer.step()
+
+            n_valid_tokens = int(
+                tok_y.ne(-100).sum().item()
+            )
+
+            running_total_loss += (
+                    float(total_loss.item())
+                    * n_valid_tokens
+            )
+
+            running_bpe_loss += (
+                    float(bpe_loss.item())
+                    * n_valid_tokens
+            )
+
+            running_vq_loss += (
+                    float(vq_loss.item())
+                    * n_valid_tokens
+            )
+
+            running_count += n_valid_tokens
+
+            pbar.set_postfix(
+                total=(
+                    f"{running_total_loss / max(running_count, 1):.4f}"
+                ),
+                bpe=(
+                    f"{running_bpe_loss / max(running_count, 1):.4f}"
+                ),
+                vq=(
+                    f"{running_vq_loss / max(running_count, 1):.4f}"
+                ),
+            )
+
+        valid_metrics = evaluate(
             model,
             valid_loader,
             device,
         )
+
+        test_metrics = evaluate(
+            model,
+            test_loader,
+            device,
+        )
+
         print(
             f"[epoch {epoch}] "
             f"valid_bpe_ppl={valid_metrics['bpe_ppl']:.4f} "
             f"valid_bpe_top1={valid_metrics['bpe_top1']:.4f} "
             f"valid_bpe_top5={valid_metrics['bpe_top5']:.4f} "
+            f"valid_vq_ppl={valid_metrics['vq_ppl']:.4f} "
+            f"valid_vq_top1={valid_metrics['vq_top1']:.4f} "
+            f"valid_vq_top5={valid_metrics['vq_top5']:.4f} "
             f"test_bpe_ppl={test_metrics['bpe_ppl']:.4f} "
             f"test_bpe_top1={test_metrics['bpe_top1']:.4f} "
-            f"test_bpe_top5={test_metrics['bpe_top5']:.4f}"
-        )
-        print(
-            f"[input stats epoch {epoch}] "
-            f"weight_bpe={input_stats['weight_bpe_fro']:.6f} "
-            f"weight_second={input_stats['weight_second_fro']:.6f} "
-            f"weight_ratio={input_stats['weight_second_over_bpe']:.6f} "
-            f"contrib_bpe={input_stats['mean_bpe_contrib_l2']:.6f} "
-            f"contrib_second={input_stats['mean_second_contrib_l2']:.6f} "
-            f"contrib_ratio={input_stats['contrib_second_over_bpe']:.6f}"
+            f"test_bpe_top5={test_metrics['bpe_top5']:.4f} "
+            f"test_vq_ppl={test_metrics['vq_ppl']:.4f} "
+            f"test_vq_top1={test_metrics['vq_top1']:.4f} "
+            f"test_vq_top5={test_metrics['vq_top5']:.4f}"
         )
         record = {
             "epoch": epoch,
-            "train_bpe_loss": running_loss / max(running_count, 1),
+
+            "train_total_loss": (
+                    running_total_loss / max(running_count, 1)
+            ),
+
+            "train_bpe_loss": (
+                    running_bpe_loss / max(running_count, 1)
+            ),
+
+            "train_vq_loss": (
+                    running_vq_loss / max(running_count, 1)
+            ),
+
+            "vq_loss_weight": args.vq_loss_weight,
             "valid": valid_metrics,
             "test": test_metrics,
-            "input_stats": input_stats,
         }
         history.append(record)
 
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "input_mode": args.input_mode,
+            "architecture": "bpe_sc0_two_stream",
             "history": history,
+
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
             "tok_pad_id": tok_pad_id,
             "vq_pad_id": vq_pad_id,
+
             "data_source": args.data,
             "codebook_source": args.codebook,
             "vq_centers_frozen": True,
+
+            "vq_loss_weight": args.vq_loss_weight,
+
             "last_valid": valid_metrics,
             "last_test": test_metrics,
-            "last_input_stats": input_stats,
         }
         torch.save(checkpoint, args.out)
 
