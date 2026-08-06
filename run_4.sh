@@ -24,8 +24,8 @@ git pull
 # ============================================================
 # 共通設定
 # ============================================================
-CENTER_SCALE=1.0
-CENTER_LABEL=1
+CENTER_SCALE=0
+CENTER_LABEL=0
 
 BPE_VOCAB_LABEL=50257
 VQ_CODEBOOK_LABEL=100k
