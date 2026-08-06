@@ -429,6 +429,7 @@ python "${AR_SCRIPT}" \
   --use_vqw "${USE_VQW}" \
   --vqw_init_scale "${VQW_INIT_SCALE}" \
   --out "${FINAL_PATH}" \
+  --max_len 255 \
   2>&1 | tee "${LOG_PATH}"
 
 # ============================================================

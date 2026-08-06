@@ -47,16 +47,8 @@ class DistancePairedWindowDataset(Dataset):
         self.max_context = int(max_context)
 
         token_ids_flat = token_ids_flat.long().reshape(-1)
-
-        # [11, N]
-        hop_vq_ids = torch.stack(
-            [
-                x.long().reshape(-1)
-                for x in hop_vq_ids_flat
-            ],
-            dim=0,
-        )
-
+        # HOP10のID列だけを使用
+        hop10_vq_ids = hop_vq_ids_flat[10].long().reshape(-1)
         all_tok = []
         all_vq = []
         all_hop = []
@@ -69,10 +61,13 @@ class DistancePairedWindowDataset(Dataset):
             -1,
             dtype=torch.long,
         )
-        # [11] = 11,10,...,1
+        # max_context=255なら [255,254,...,1]
 
-        fixed_hops = distances - 1
-        # [11] = 10,9,...,0
+        # targetから11個以上離れた位置だけHOP10を使う
+        use_hop10_by_distance = distances.ge(11)
+        # [255]の場合:
+        # distance 255..11 -> True
+        # distance 10..1   -> False
 
         for sample in samples:
             start = int(sample["start"])
@@ -100,29 +95,35 @@ class DistancePairedWindowDataset(Dataset):
 
             tok = token_ids_flat[safe_pos]
 
-            hops = fixed_hops[None, :].expand(
-                target_pos.numel(),
+            # 各source位置に対応するHOP10 VQ ID
+            vq = hop10_vq_ids[safe_pos]
+
+            # [T, max_context]
+            hop10_valid = (
+                    valid
+                    & use_hop10_by_distance[None, :]
+            )
+
+            # HOP10を使う位置は10、それ以外は-1
+            hops = torch.full_like(
+                source_pos,
                 -1,
             )
 
-            vq = hop_vq_ids[
-                hops,
-                safe_pos,
-            ]
+            hops = hops.masked_fill(
+                hop10_valid,
+                10,
+            )
+
+            # HOP10を使わない位置のVQ IDはpadding
+            vq = vq.masked_fill(
+                ~hop10_valid,
+                vq_pad_id,
+            )
 
             tok = tok.masked_fill(
                 ~valid,
                 tok_pad_id,
-            )
-
-            vq = vq.masked_fill(
-                ~valid,
-                vq_pad_id,
-            )
-
-            hops = hops.masked_fill(
-                ~valid,
-                -1,
             )
 
             all_tok.append(tok)
@@ -974,7 +975,7 @@ def main():
         hop_vq_ids_flat=hop_vq_ids_flat,
         tok_pad_id=tok_pad_id,
         vq_pad_id=vq_pad_id,
-        max_context=11,
+        max_context=args.max_len,
     )
 
     valid_ds = DistancePairedWindowDataset(
@@ -983,7 +984,7 @@ def main():
         hop_vq_ids_flat=hop_vq_ids_flat,
         tok_pad_id=tok_pad_id,
         vq_pad_id=vq_pad_id,
-        max_context=11,
+        max_context=args.max_len,
     )
 
     test_ds = DistancePairedWindowDataset(
@@ -992,7 +993,7 @@ def main():
         hop_vq_ids_flat=hop_vq_ids_flat,
         tok_pad_id=tok_pad_id,
         vq_pad_id=vq_pad_id,
-        max_context=11,
+        max_context=args.max_len,
     )
 
     def make_loader(dataset, shuffle):
@@ -1019,8 +1020,8 @@ def main():
         dropout=args.dropout,
 
         # 入力は最大11位置
-        max_len=11,
-
+        max_len=args.max_len,
+        
         tie_weights=args.tie_weights,
         use_vqw=bool(args.use_vqw),
         vqw_init_scale=args.vqw_init_scale,
