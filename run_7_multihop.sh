@@ -55,7 +55,7 @@ esac
 
 CENTER_SCALE="${CENTER_SCALE:-0}"
 USE_VQW="${USE_VQW:-1}"
-
+VQW_INIT_SCALE="${VQW_INIT_SCALE:-0.1}"
 case "${USE_VQW}" in
   0|1)
     ;;
@@ -427,6 +427,7 @@ python "${AR_SCRIPT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
   --use_vqw "${USE_VQW}" \
+  --vqw_init_scale "${VQW_INIT_SCALE}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 

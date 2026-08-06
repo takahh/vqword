@@ -208,11 +208,12 @@ class DistanceAwareVQAttention(nn.Module):
     """
 
     def __init__(
-        self,
-        d_model,
-        n_heads,
-        dropout=0.1,
-        num_hops=11,
+            self,
+            d_model,
+            n_heads,
+            dropout=0.1,
+            num_hops=11,
+            vqw_init_scale=0.1,
     ):
         super().__init__()
 
@@ -226,6 +227,12 @@ class DistanceAwareVQAttention(nn.Module):
         self.n_heads = int(n_heads)
         self.head_dim = self.d_model // self.n_heads
         self.num_hops = int(num_hops)
+
+        # Learnable VQW contribution scale.
+        # Start smaller than 1.0 so that BPE attention remains dominant initially.
+        self.vqw_scale = nn.Parameter(
+            torch.tensor(float(vqw_init_scale))
+        )
 
         # Standard BPE-hidden-state attention projections
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
@@ -428,7 +435,8 @@ class DistanceAwareVQAttention(nn.Module):
 
                 vqw_output = vqw_output + contribution
 
-            output = output + vqw_output
+            # output = output + vqw_output
+            output = output + self.vqw_scale * vqw_output
 
         output = self._merge_heads(output)
         output = self.out_proj(output)
@@ -442,6 +450,7 @@ class DistanceAwareVQTransformerBlock(nn.Module):
         n_heads,
         dropout=0.1,
         num_hops=11,
+        vqw_init_scale=0.1,
     ):
         super().__init__()
 
@@ -452,6 +461,7 @@ class DistanceAwareVQTransformerBlock(nn.Module):
             n_heads=n_heads,
             dropout=dropout,
             num_hops=num_hops,
+            vqw_init_scale=vqw_init_scale,
         )
 
         self.dropout1 = nn.Dropout(dropout)
@@ -496,17 +506,18 @@ class DistanceAwareVQTransformerBlock(nn.Module):
 
 class BPEMultiHopInputCatLM(nn.Module):
     def __init__(
-        self,
-        hop_centers,
-        token_vocab_size,
-        target_vq_vocab_size,
-        d_model=256,
-        n_layers=6,
-        n_heads=8,
-        dropout=0.1,
-        max_len=255,
-        tie_weights=False,
-        use_vqw=False,
+            self,
+            hop_centers,
+            token_vocab_size,
+            target_vq_vocab_size,
+            d_model=256,
+            n_layers=6,
+            n_heads=8,
+            dropout=0.1,
+            max_len=255,
+            tie_weights=False,
+            use_vqw=False,
+            vqw_init_scale=0.1,
     ):
         super().__init__()
 
@@ -548,6 +559,7 @@ class BPEMultiHopInputCatLM(nn.Module):
                 n_heads=n_heads,
                 dropout=dropout,
                 num_hops=self.num_hops,
+                vqw_init_scale=vqw_init_scale,
             )
             for _ in range(n_layers)
         ])
@@ -724,6 +736,12 @@ def main():
         help="HOP0 ... HOP10 TinyStories VQ ID files",
     )
     ap.add_argument(
+        "--vqw_init_scale",
+        type=float,
+        default=0.1,
+        help="Initial learnable scale for the VQW attention contribution.",
+    )
+    ap.add_argument(
         "--hop_codebooks",
         nargs=11,
         required=True,
@@ -853,6 +871,7 @@ def main():
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
     print(f"[use VQW] {bool(args.use_vqw)}")
+    print(f"[VQW initial scale] {args.vqw_init_scale}")
 
     random.shuffle(samples)
     n = len(samples)
@@ -917,7 +936,8 @@ def main():
         dropout=args.dropout,
         max_len=args.max_len,
         tie_weights=args.tie_weights,
-        use_vqw=args.use_vqw,
+        use_vqw=bool(args.use_vqw),
+        vqw_init_scale=args.vqw_init_scale,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -1049,6 +1069,18 @@ def main():
             best_valid = valid_metrics["bpe_ppl"]
             torch.save(checkpoint, best_path)
             print(f"[save best] {best_path}")
+        vqw_scales = [
+            float(block.attention.vqw_scale.detach().cpu().item())
+            for block in model.shared_blocks
+        ]
+
+        print(
+            "[VQW scales] "
+            + " ".join(
+                f"L{i}={scale:.6f}"
+                for i, scale in enumerate(vqw_scales)
+            )
+        )
 
     print(f"[save final] {args.out}")
 
