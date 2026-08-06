@@ -54,7 +54,16 @@ esac
 # ============================================================
 
 CENTER_SCALE="${CENTER_SCALE:-0}"
+USE_VQW="${USE_VQW:-1}"
 
+case "${USE_VQW}" in
+  0|1)
+    ;;
+  *)
+    echo "[error] USE_VQW must be 0 or 1"
+    exit 1
+    ;;
+esac
 BPE_VOCAB_LABEL=50257
 IVF_NLIST=256
 DISCRETIZATION_SEED=0
@@ -103,7 +112,7 @@ done
 # Output names
 # ============================================================
 
-RUN="ar_inputcat_bpeonly_multihop_bpe${BPE_VOCAB_LABEL}_bilateral00to10_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_$(date +%Y%m%d_%H%M%S)"
+RUN="ar_inputcat_bpeonly_multihop_usevqw${USE_VQW}_bpe${BPE_VOCAB_LABEL}_bilateral00to10_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_$(date +%Y%m%d_%H%M%S)"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
@@ -381,14 +390,19 @@ echo "[start input-CAT BPE-only AR training]"
 echo
 echo "Input:"
 echo "  BPE[t] embedding"
-echo "  + aggregated HOP0..HOP10 frozen-center context"
-echo
+
+if [ "${USE_VQW}" -eq 1 ]; then
+  echo "  + aggregated HOP0..HOP10 frozen-center context"
+else
+  echo "  + zero VQ context"
+fi
 echo "Fusion:"
 echo "  CAT(BPE embedding, multi-hop VQ context)"
 echo "  -> learned projection"
 echo "  -> shared causal Transformer"
 echo "  -> BPE[t+1]"
 echo
+echo "use VQW              = ${USE_VQW}"
 echo "VQ prediction head   = disabled"
 echo "VQ auxiliary loss    = disabled"
 echo "center scale         = ${CENTER_SCALE}"
@@ -412,6 +426,7 @@ python "${AR_SCRIPT}" \
   --dropout "${DROPOUT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
+  --use_vqw "${USE_VQW}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 

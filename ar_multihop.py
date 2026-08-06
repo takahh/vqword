@@ -205,13 +205,13 @@ class BPEMultiHopInputCatLM(nn.Module):
         dropout=0.1,
         max_len=255,
         tie_weights=False,
-        disable_vq_input=False,
+        use_vqw=False,
     ):
         super().__init__()
 
         if len(hop_centers) != 11:
             raise ValueError("Expected 11 HOP center matrices")
-        self.disable_vq_input = disable_vq_input
+        self.use_vqw = use_vqw
         self.num_hops = 11
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(target_vq_vocab_size)
@@ -345,7 +345,7 @@ class BPEMultiHopInputCatLM(nn.Module):
         # Comparison baseline:
         # keep the same CAT/projection architecture,
         # but remove all information from the VQ stream.
-        if self.disable_vq_input:
+        if not self.use_vqw:
             context_h = torch.zeros_like(context_h)
 
         # ---------------- Input CAT and shared processing ----------------
@@ -463,9 +463,11 @@ def main():
         default="ar_bpe_multihop_input_cat_bpe_only.pt",
     )
     ap.add_argument(
-        "--disable_vq_input",
-        action="store_true",
-        help="Ignore all VQ inputs and use zeros instead.",
+        "--use_vqw",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Use VQ context as input (1=yes, 0=no).",
     )
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=30)
@@ -579,8 +581,8 @@ def main():
     print("[architecture] input CAT(BPE, multi-hop VQ) + shared Transformer + BPE head only")
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
-    print(f"[disable VQ input] {args.disable_vq_input}")
-
+    print(f"[use VQW] {bool(args.use_vqw)}")
+    
     random.shuffle(samples)
     n = len(samples)
     n_train = int(0.8 * n)
