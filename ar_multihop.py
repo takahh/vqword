@@ -692,24 +692,11 @@ class BPEVQWDistancePairAddLM(nn.Module):
         # attention内部では使わない
         # --------------------------------------------------
 
-        dummy_vqw_features = [
-            torch.zeros_like(shared_h)
-            for _ in range(self.num_hops)
-        ]
-
-        dummy_hop_valid = torch.zeros(
-            batch_size,
-            seq_len,
-            self.num_hops,
-            dtype=torch.bool,
-            device=shared_h.device,
-        )
-
         for block in self.shared_blocks:
             shared_h = block(
                 x=shared_h,
-                vqw_features=dummy_vqw_features,
-                hop_valid=dummy_hop_valid,
+                vqw_features=None,
+                hop_valid=None,
                 use_vqw=False,
                 key_padding_mask=key_padding_mask,
             )
