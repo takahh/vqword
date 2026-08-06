@@ -90,7 +90,7 @@ fi
 # HOP 0〜10
 # ============================================================
 
-for HOP in $(seq 0 10); do
+for HOP in 50; do
   HOP2=$(printf "%02d" "${HOP}")
 
   BASE_TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_LABEL}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
@@ -321,5 +321,5 @@ done
 
 echo
 echo "============================================================"
-echo "[all HOP 0-10 completed]"
+echo "[HOP 50 completed]"
 echo "============================================================"
