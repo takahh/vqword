@@ -601,20 +601,10 @@ class BPEMultiHopInputCatLM(nn.Module):
             diagonal=1,
         )
 
-        # ---------------- BPE representation ----------------
+        # BPE embeddings
         bpe_x = self.tok_emb(tok_in)
 
-        # ---------------- Multi-hop VQ aggregation ----------------
-        # -----------------------------------------------------
-        # BPE representation
-        # -----------------------------------------------------
-
-        bpe_x = self.tok_emb(tok_in)
-
-        # -----------------------------------------------------
-        # Query-aligned HOP-specific VQW representations
-        # -----------------------------------------------------
-
+        # HOPごとのVQW表現
         vqw_features = []
 
         for hop in range(self.num_hops):
@@ -623,26 +613,15 @@ class BPEMultiHopInputCatLM(nn.Module):
             center_h = self.center_embeddings[hop](ids)
             projected_h = self.hop_projections[hop](center_h)
 
-            valid_h = hop_valid[
-                :,
-                :,
-                hop,
-            ].unsqueeze(-1).to(projected_h.dtype)
-
+            valid_h = hop_valid[:, :, hop].unsqueeze(-1).to(projected_h.dtype)
             projected_h = projected_h * valid_h
 
             vqw_features.append(projected_h)
 
-        # -----------------------------------------------------
-        # BPE sequence input
-        # -----------------------------------------------------
-
+        # Transformer input
         shared_h = bpe_x + self.pos_emb(pos)
 
-        # -----------------------------------------------------
-        # Distance-aware Transformer
-        # -----------------------------------------------------
-
+        # 厳密な距離対応ブロック
         for block in self.shared_blocks:
             shared_h = block(
                 x=shared_h,
@@ -653,33 +632,14 @@ class BPEMultiHopInputCatLM(nn.Module):
             )
 
         shared_h = self.shared_norm(shared_h)
-        # Comparison baseline:
-        # keep the same CAT/projection architecture,
-        # but remove all information from the VQ stream.
-        if not self.use_vqw:
-            context_h = torch.zeros_like(context_h)
 
-        # ---------------- Input CAT and shared processing ----------------
-        shared_x = torch.cat([bpe_x, context_h], dim=-1)
-        shared_x = self.input_fusion_proj(shared_x)
-        shared_x = self.input_fusion_norm(shared_x)
-        shared_x = shared_x + self.pos_emb(pos)
-
-        shared_h = self.shared_transformer(
-            shared_x,
-            mask=causal_mask,
-            src_key_padding_mask=key_padding_mask,
-        )
-        shared_h = self.shared_norm(shared_h)
-
-        # ---------------- BPE prediction only ----------------
+        # BPE prediction
         bpe_logits = self.bpe_head(shared_h) + self.bpe_bias
 
         return {
             "bpe_logits": bpe_logits,
             "shared_hidden": shared_h,
             "bpe_input": bpe_x,
-            "vq_context_hidden": context_h,
         }
 
 
