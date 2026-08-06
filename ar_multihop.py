@@ -192,6 +192,307 @@ class FrozenCenterEmbedding(nn.Module):
             padding_idx=self.padding_idx,
         )
 
+class DistanceAwareVQAttention(nn.Module):
+    """
+    Causal self-attention with query-key-distance-aware VQW values.
+
+    For prediction row q:
+
+        key q     -> HOP0 VQW
+        key q-1   -> HOP1 VQW
+        ...
+        key q-10  -> HOP10 VQW
+
+    BPE values participate at every causal key position.
+    VQW values participate only for distances 0..10.
+    """
+
+    def __init__(
+        self,
+        d_model,
+        n_heads,
+        dropout=0.1,
+        num_hops=11,
+    ):
+        super().__init__()
+
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f"d_model={d_model} must be divisible by "
+                f"n_heads={n_heads}"
+            )
+
+        self.d_model = int(d_model)
+        self.n_heads = int(n_heads)
+        self.head_dim = self.d_model // self.n_heads
+        self.num_hops = int(num_hops)
+
+        # Standard BPE-hidden-state attention projections
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.bpe_v_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # VQW contribution for each relative distance/HOP
+        self.vqw_v_projections = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False)
+            for _ in range(self.num_hops)
+        ])
+
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def _split_heads(self, x):
+        """
+        [B, L, D] -> [B, H, L, Dh]
+        """
+        batch_size, seq_len, _ = x.shape
+
+        return (
+            x.view(
+                batch_size,
+                seq_len,
+                self.n_heads,
+                self.head_dim,
+            )
+            .transpose(1, 2)
+        )
+
+    def _merge_heads(self, x):
+        """
+        [B, H, L, Dh] -> [B, L, D]
+        """
+        batch_size, _, seq_len, _ = x.shape
+
+        return (
+            x.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, seq_len, self.d_model)
+        )
+
+    def forward(
+        self,
+        x,
+        vqw_features,
+        hop_valid,
+        use_vqw=True,
+        key_padding_mask=None,
+    ):
+        """
+        x:
+            [B, L, D]
+
+        vqw_features:
+            list of 11 tensors.
+            vqw_features[h] has shape [B, L, D].
+
+            At prediction row q, vqw_features[h][:, q]
+            already represents the VQW from source position q-h.
+
+        hop_valid:
+            [B, L, 11]
+
+        key_padding_mask:
+            [B, L], True means padding.
+        """
+
+        batch_size, seq_len, _ = x.shape
+
+        # -----------------------------------------------------
+        # Standard attention Q, K and BPE Value
+        # -----------------------------------------------------
+
+        q = self._split_heads(self.q_proj(x))
+        k = self._split_heads(self.k_proj(x))
+        bpe_v = self._split_heads(self.bpe_v_proj(x))
+
+        # [B, H, Q, K]
+        scores = torch.matmul(
+            q,
+            k.transpose(-2, -1),
+        ) / math.sqrt(self.head_dim)
+
+        # Standard causal mask:
+        # query q may see key k only when k <= q.
+        causal_mask = torch.triu(
+            torch.ones(
+                seq_len,
+                seq_len,
+                dtype=torch.bool,
+                device=x.device,
+            ),
+            diagonal=1,
+        )
+
+        scores = scores.masked_fill(
+            causal_mask[None, None, :, :],
+            float("-inf"),
+        )
+
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(
+                key_padding_mask[:, None, None, :],
+                float("-inf"),
+            )
+
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # -----------------------------------------------------
+        # Ordinary BPE Value contribution
+        # -----------------------------------------------------
+
+        # [B, H, Q, Dh]
+        output = torch.matmul(attn_weights, bpe_v)
+
+        # -----------------------------------------------------
+        # Exact distance-dependent VQW contribution
+        # -----------------------------------------------------
+
+        if use_vqw:
+            vqw_output = torch.zeros_like(output)
+
+            for hop in range(self.num_hops):
+                # Valid query positions for this HOP:
+                #
+                # hop=0:
+                #   query 0..L-1, key=query
+                #
+                # hop=1:
+                #   query 1..L-1, key=query-1
+                #
+                # hop=10:
+                #   query 10..L-1, key=query-10
+
+                if hop >= seq_len:
+                    break
+
+                query_index = torch.arange(
+                    hop,
+                    seq_len,
+                    device=x.device,
+                )
+
+                key_index = query_index - hop
+
+                # Attention weight for exactly this distance:
+                #
+                # [B, H, L-hop]
+                distance_weight = attn_weights[
+                    :,
+                    :,
+                    query_index,
+                    key_index,
+                ]
+
+                # vqw_features[hop][:, q] is already the
+                # source q-hop HOP-hop representation.
+                vqw_h = self.vqw_v_projections[hop](
+                    vqw_features[hop]
+                )
+
+                # Keep only valid query rows for this HOP.
+                vqw_h = vqw_h[:, query_index, :]
+
+                # [B, H, L-hop, Dh]
+                vqw_h = self._split_heads(vqw_h)
+
+                valid_h = hop_valid[
+                    :,
+                    query_index,
+                    hop,
+                ]
+
+                # [B, 1, L-hop, 1]
+                valid_h = valid_h[
+                    :,
+                    None,
+                    :,
+                    None,
+                ].to(vqw_h.dtype)
+
+                contribution = (
+                    distance_weight.unsqueeze(-1)
+                    * vqw_h
+                    * valid_h
+                )
+
+                # Add left padding in the query-position dimension.
+                #
+                # hop=0: no padding
+                # hop=1: one empty query row at the beginning
+                # hop=2: two empty query rows at the beginning
+                contribution = F.pad(
+                    contribution,
+                    pad=(0, 0, hop, 0),
+                )
+
+                vqw_output = vqw_output + contribution
+
+            output = output + vqw_output
+
+        output = self._merge_heads(output)
+        output = self.out_proj(output)
+
+        return output
+
+class DistanceAwareVQTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        n_heads,
+        dropout=0.1,
+        num_hops=11,
+    ):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(d_model)
+
+        self.attention = DistanceAwareVQAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+            num_hops=num_hops,
+        )
+
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+        )
+
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x,
+        vqw_features,
+        hop_valid,
+        use_vqw=True,
+        key_padding_mask=None,
+    ):
+        # Pre-norm attention
+        attention_input = self.norm1(x)
+
+        attention_output = self.attention(
+            x=attention_input,
+            vqw_features=vqw_features,
+            hop_valid=hop_valid,
+            use_vqw=use_vqw,
+            key_padding_mask=key_padding_mask,
+        )
+
+        x = x + self.dropout1(attention_output)
+
+        # Pre-norm feed-forward
+        ffn_output = self.ffn(self.norm2(x))
+        x = x + self.dropout2(ffn_output)
+
+        return x
 
 class BPEMultiHopInputCatLM(nn.Module):
     def __init__(
@@ -235,31 +536,22 @@ class BPEMultiHopInputCatLM(nn.Module):
             nn.Linear(centers.size(1), d_model, bias=False)
             for centers in hop_centers
         ])
-        self.hop_gates = nn.Parameter(torch.zeros(self.num_hops))
-        self.vq_context_norm = nn.LayerNorm(d_model)
 
-        # CAT([BPE embedding, multi-hop VQ context]) -> d_model
-        self.input_fusion_proj = nn.Linear(
-            2 * d_model,
-            d_model,
-            bias=True,
-        )
-        self.input_fusion_norm = nn.LayerNorm(d_model)
         self.pos_emb = nn.Embedding(max_len, d_model)
 
         # ---------------- Shared Transformer ----------------
-        shared_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=4 * d_model,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.shared_transformer = nn.TransformerEncoder(
-            shared_layer,
-            num_layers=n_layers,
-        )
+        self.pos_emb = nn.Embedding(max_len, d_model)
+
+        self.shared_blocks = nn.ModuleList([
+            DistanceAwareVQTransformerBlock(
+                d_model=d_model,
+                n_heads=n_heads,
+                dropout=dropout,
+                num_hops=self.num_hops,
+            )
+            for _ in range(n_layers)
+        ])
+
         self.shared_norm = nn.LayerNorm(d_model)
 
         # ---------------- BPE output head only ----------------
@@ -313,35 +605,54 @@ class BPEMultiHopInputCatLM(nn.Module):
         bpe_x = self.tok_emb(tok_in)
 
         # ---------------- Multi-hop VQ aggregation ----------------
-        context_h = torch.zeros(
-            batch_size,
-            seq_len,
-            self.d_model,
-            device=tok_in.device,
-            dtype=bpe_x.dtype,
-        )
+        # -----------------------------------------------------
+        # BPE representation
+        # -----------------------------------------------------
 
-        gate_values = F.softplus(self.hop_gates)
-        valid_count = hop_valid.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1)
+        bpe_x = self.tok_emb(tok_in)
+
+        # -----------------------------------------------------
+        # Query-aligned HOP-specific VQW representations
+        # -----------------------------------------------------
+
+        vqw_features = []
 
         for hop in range(self.num_hops):
             ids = vq_context[:, :, hop]
-            center_h = self.center_embeddings[hop](ids)
-            projected = self.hop_projections[hop](center_h)
-            valid = hop_valid[:, :, hop].unsqueeze(-1)
 
-            context_h = context_h + (
-                gate_values[hop]
-                * projected
-                * valid
+            center_h = self.center_embeddings[hop](ids)
+            projected_h = self.hop_projections[hop](center_h)
+
+            valid_h = hop_valid[
+                :,
+                :,
+                hop,
+            ].unsqueeze(-1).to(projected_h.dtype)
+
+            projected_h = projected_h * valid_h
+
+            vqw_features.append(projected_h)
+
+        # -----------------------------------------------------
+        # BPE sequence input
+        # -----------------------------------------------------
+
+        shared_h = bpe_x + self.pos_emb(pos)
+
+        # -----------------------------------------------------
+        # Distance-aware Transformer
+        # -----------------------------------------------------
+
+        for block in self.shared_blocks:
+            shared_h = block(
+                x=shared_h,
+                vqw_features=vqw_features,
+                hop_valid=hop_valid,
+                use_vqw=self.use_vqw,
+                key_padding_mask=key_padding_mask,
             )
 
-        context_h = context_h / valid_count.sqrt()
-        context_h = self.vq_context_norm(context_h)
-
+        shared_h = self.shared_norm(shared_h)
         # Comparison baseline:
         # keep the same CAT/projection architecture,
         # but remove all information from the VQ stream.
