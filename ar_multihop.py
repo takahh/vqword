@@ -1128,7 +1128,6 @@ def main():
             "test": test_metrics,
         }
         history.append(record)
-
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
