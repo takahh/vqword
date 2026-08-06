@@ -34,202 +34,121 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-
 class DistancePairedWindowDataset(Dataset):
-    """
-    1サンプル = 1つの次BPE予測。
-
-    target位置 t に対して、最大11個の過去位置を使用する。
-
-        source t-1  -> HOP0
-        source t-2  -> HOP1
-        ...
-        source t-11 -> HOP10
-
-    各入力位置では、
-
-        BPE[source] + scale[hop] * VQW_hop[source]
-
-    を作る。
-    """
-
     def __init__(
         self,
         samples,
         token_ids_flat,
         hop_vq_ids_flat,
+        tok_pad_id,
+        vq_pad_id,
         max_context=11,
     ):
-        if len(hop_vq_ids_flat) != 11:
-            raise ValueError("Exactly 11 HOP ID tensors are required")
-
-        self.token_ids_flat = token_ids_flat.long().reshape(-1)
-
-        self.hop_vq_ids_flat = [
-            ids.long().reshape(-1)
-            for ids in hop_vq_ids_flat
-        ]
-
         self.max_context = int(max_context)
-        self.examples = []
 
-        for hop, ids in enumerate(self.hop_vq_ids_flat):
-            if ids.numel() != self.token_ids_flat.numel():
-                raise ValueError(
-                    f"HOP{hop}: VQ/token length mismatch: "
-                    f"{ids.numel()} vs "
-                    f"{self.token_ids_flat.numel()}"
-                )
+        token_ids_flat = token_ids_flat.long().reshape(-1)
 
-        # 各文章内の各target位置を独立サンプルにする
+        # [11, N]
+        hop_vq_ids = torch.stack(
+            [
+                x.long().reshape(-1)
+                for x in hop_vq_ids_flat
+            ],
+            dim=0,
+        )
+
+        all_tok = []
+        all_vq = []
+        all_hop = []
+        all_y = []
+        all_mask = []
+
+        distances = torch.arange(
+            max_context,
+            0,
+            -1,
+            dtype=torch.long,
+        )
+        # [11] = 11,10,...,1
+
+        fixed_hops = distances - 1
+        # [11] = 10,9,...,0
+
         for sample in samples:
             start = int(sample["start"])
             end = int(sample["end"])
 
-            # targetはstart+1からend-1まで
-            for target_position in range(start + 1, end):
-                self.examples.append(
-                    (start, target_position)
-                )
+            if end - start <= 1:
+                continue
+
+            target_pos = torch.arange(
+                start + 1,
+                end,
+                dtype=torch.long,
+            )
+            # [T]
+
+            source_pos = (
+                target_pos[:, None]
+                - distances[None, :]
+            )
+            # [T, 11]
+
+            valid = source_pos.ge(start)
+
+            safe_pos = source_pos.clamp_min(start)
+
+            tok = token_ids_flat[safe_pos]
+
+            hops = fixed_hops[None, :].expand(
+                target_pos.numel(),
+                -1,
+            )
+
+            vq = hop_vq_ids[
+                hops,
+                safe_pos,
+            ]
+
+            tok = tok.masked_fill(
+                ~valid,
+                tok_pad_id,
+            )
+
+            vq = vq.masked_fill(
+                ~valid,
+                vq_pad_id,
+            )
+
+            hops = hops.masked_fill(
+                ~valid,
+                -1,
+            )
+
+            all_tok.append(tok)
+            all_vq.append(vq)
+            all_hop.append(hops)
+            all_y.append(token_ids_flat[target_pos])
+            all_mask.append(valid)
+
+        self.tok_in = torch.cat(all_tok, dim=0)
+        self.vq_in = torch.cat(all_vq, dim=0)
+        self.hop_ids = torch.cat(all_hop, dim=0)
+        self.tok_y = torch.cat(all_y, dim=0)
+        self.attention_mask = torch.cat(all_mask, dim=0)
 
     def __len__(self):
-        return len(self.examples)
+        return self.tok_y.size(0)
 
     def __getitem__(self, index):
-        sample_start, target_position = self.examples[index]
-
-        # 最大11個前まで。ただし文章先頭を越えない
-        source_start = max(
-            sample_start,
-            target_position - self.max_context,
+        return (
+            self.tok_in[index],
+            self.vq_in[index],
+            self.hop_ids[index],
+            self.tok_y[index],
+            self.attention_mask[index],
         )
 
-        # 過去BPE位置
-        source_positions = torch.arange(
-            source_start,
-            target_position,
-            dtype=torch.long,
-        )
-
-        # ターゲットからの距離
-        #
-        # target-1 -> distance=1 -> HOP0
-        # target-2 -> distance=2 -> HOP1
-        # ...
-        distances = target_position - source_positions
-        hop_ids = distances - 1
-
-        if hop_ids.min().item() < 0:
-            raise RuntimeError("Negative HOP index")
-
-        if hop_ids.max().item() >= 11:
-            raise RuntimeError(
-                f"HOP index exceeds 10: "
-                f"{hop_ids.max().item()}"
-            )
-
-        # 各source位置のBPE
-        tok_in = self.token_ids_flat[source_positions]
-
-        # 各source位置に対応するVQW ID
-        vq_in = torch.empty_like(tok_in)
-
-        for local_position in range(source_positions.numel()):
-            source_position = int(
-                source_positions[local_position].item()
-            )
-            hop = int(hop_ids[local_position].item())
-
-            vq_in[local_position] = (
-                self.hop_vq_ids_flat[hop][source_position]
-            )
-
-        tok_y = self.token_ids_flat[target_position]
-
-        return {
-            "tok_in": tok_in,
-            "vq_in": vq_in,
-            "hop_ids": hop_ids,
-            "tok_y": tok_y,
-        }
-
-def collate_batch(
-    batch,
-    tok_pad_id,
-    vq_pad_id,
-    hop_pad_id=-1,
-):
-    batch_size = len(batch)
-
-    max_len = max(
-        item["tok_in"].numel()
-        for item in batch
-    )
-
-    tok_in = torch.full(
-        (batch_size, max_len),
-        tok_pad_id,
-        dtype=torch.long,
-    )
-
-    vq_in = torch.full(
-        (batch_size, max_len),
-        vq_pad_id,
-        dtype=torch.long,
-    )
-
-    hop_ids = torch.full(
-        (batch_size, max_len),
-        hop_pad_id,
-        dtype=torch.long,
-    )
-
-    attention_mask = torch.zeros(
-        (batch_size, max_len),
-        dtype=torch.bool,
-    )
-
-    # 今回は1サンプルにつきターゲット1個
-    tok_y = torch.empty(
-        batch_size,
-        dtype=torch.long,
-    )
-
-    for batch_index, item in enumerate(batch):
-        length = item["tok_in"].numel()
-
-        # 左padding
-        offset = max_len - length
-
-        tok_in[
-            batch_index,
-            offset:,
-        ] = item["tok_in"]
-
-        vq_in[
-            batch_index,
-            offset:,
-        ] = item["vq_in"]
-
-        hop_ids[
-            batch_index,
-            offset:,
-        ] = item["hop_ids"]
-
-        attention_mask[
-            batch_index,
-            offset:,
-        ] = True
-
-        tok_y[batch_index] = item["tok_y"]
-
-    return (
-        tok_in,
-        vq_in,
-        hop_ids,
-        tok_y,
-        attention_mask,
-    )
 
 class FrozenCenterEmbedding(nn.Module):
     def __init__(self, centers):
@@ -700,48 +619,25 @@ class BPEVQWDistancePairAddLM(nn.Module):
         vqw_x = torch.zeros_like(bpe_x)
 
         if self.use_vqw:
-            for hop in range(self.num_hops):
-                # この位置でHOP hを使うか
-                position_mask = hop_ids.eq(hop)
+            for column in range(seq_len):
+                # 固定長11の場合:
+                # column 0  -> HOP10
+                # column 10 -> HOP0
+                hop = seq_len - 1 - column
 
-                if not position_mask.any():
-                    continue
+                ids_h = vq_in[:, column]
 
-                # このHOPでない位置はpadding IDに置換
-                ids_h = torch.where(
-                    position_mask,
-                    vq_in,
-                    torch.full_like(
-                        vq_in,
-                        self.vq_pad_id,
-                    ),
-                )
-
-                # 凍結center lookup
                 center_h = self.center_embeddings[hop](ids_h)
+                projected_h = self.hop_projections[hop](center_h)
 
-                # HOP固有projection
-                projected_h = self.hop_projections[hop](
-                    center_h
+                valid_h = hop_ids[:, column].eq(hop)
+                projected_h = (
+                        projected_h
+                        * valid_h.unsqueeze(-1).to(projected_h.dtype)
                 )
 
-                # 該当位置だけ残す
-                mask_h = (
-                    position_mask
-                    .unsqueeze(-1)
-                    .to(projected_h.dtype)
-                )
-
-                projected_h = projected_h * mask_h
-
-                # 重み付き単純和
-                #
-                # ただし各位置では該当HOPが1つだけなので、
-                # 実際には1個だけが加わる
-                vqw_x = (
-                        vqw_x
-                        + self.vqw_scales[hop]
-                        * projected_h
+                vqw_x[:, column, :] = (
+                        self.vqw_scales[hop] * projected_h
                 )
 
         # --------------------------------------------------
@@ -1042,6 +938,8 @@ def main():
         samples=train_samples,
         token_ids_flat=token_ids_flat,
         hop_vq_ids_flat=hop_vq_ids_flat,
+        tok_pad_id=tok_pad_id,
+        vq_pad_id=vq_pad_id,
         max_context=11,
     )
 
@@ -1049,6 +947,8 @@ def main():
         samples=valid_samples,
         token_ids_flat=token_ids_flat,
         hop_vq_ids_flat=hop_vq_ids_flat,
+        tok_pad_id=tok_pad_id,
+        vq_pad_id=vq_pad_id,
         max_context=11,
     )
 
@@ -1056,6 +956,8 @@ def main():
         samples=test_samples,
         token_ids_flat=token_ids_flat,
         hop_vq_ids_flat=hop_vq_ids_flat,
+        tok_pad_id=tok_pad_id,
+        vq_pad_id=vq_pad_id,
         max_context=11,
     )
 
@@ -1066,11 +968,7 @@ def main():
             shuffle=shuffle,
             num_workers=4,
             pin_memory=True,
-            collate_fn=lambda batch: collate_batch(
-                batch,
-                tok_pad_id,
-                vq_pad_id,
-            ),
+            persistent_workers=True,
         )
 
     train_loader = make_loader(train_ds, True)
