@@ -520,13 +520,7 @@ class BPEVQWDistancePairAddLM(nn.Module):
         self.tok_pad_id = self.token_vocab_size
         self.vq_pad_id = self.vq_vocab_size
         self.d_model = int(d_model)
-        # HOP0〜HOP10それぞれの学習可能な加算重み
-        self.vqw_scales = nn.Parameter(
-            torch.full(
-                (self.num_hops,),
-                float(vqw_init_scale),
-            )
-        )
+
         # ---------------- BPE input ----------------
         self.tok_emb = nn.Embedding(
             self.token_vocab_size + 1,
@@ -543,9 +537,13 @@ class BPEVQWDistancePairAddLM(nn.Module):
             nn.Linear(centers.size(1), d_model, bias=False)
             for centers in hop_centers
         ])
-
-        self.pos_emb = nn.Embedding(max_len, d_model)
-
+        # BPE 256次元 + HOP10 VQW 256次元
+        # を連結して256次元へ戻す
+        self.input_fusion = nn.Linear(
+            2 * d_model,
+            d_model,
+            bias=True,
+        )
         # ---------------- Shared Transformer ----------------
         self.pos_emb = nn.Embedding(max_len, d_model)
 
@@ -629,39 +627,62 @@ class BPEVQWDistancePairAddLM(nn.Module):
         # 各位置に対応するVQW embedding
         # --------------------------------------------------
 
+        # --------------------------------------------------
+        # HOP10だけを使用
+        #
+        # 11個前の位置:
+        #     CAT(BPE, HOP10 VQW)
+        #
+        # その他の位置:
+        #     CAT(BPE, zero)
+        # --------------------------------------------------
+
         vqw_x = torch.zeros_like(bpe_x)
 
         if self.use_vqw:
-            for column in range(seq_len):
-                # 固定長11の場合:
-                # column 0  -> HOP10
-                # column 10 -> HOP0
-                hop = seq_len - 1 - column
+            # [B, L]
+            # 通常はcolumn 0だけTrue。
+            # 文頭付近で11個前が存在しない場合は全てFalse。
+            hop10_valid = hop_ids.eq(10)
 
-                ids_h = vq_in[:, column]
+            # HOP10以外の位置をpadding IDにする
+            hop10_ids = vq_in.masked_fill(
+                ~hop10_valid,
+                self.vq_pad_id,
+            )
 
-                center_h = self.center_embeddings[hop](ids_h)
-                projected_h = self.hop_projections[hop](center_h)
+            # HOP10コードブックだけを参照
+            hop10_center = self.center_embeddings[10](
+                hop10_ids
+            )
 
-                valid_h = hop_ids[:, column].eq(hop)
-                projected_h = (
-                        projected_h
-                        * valid_h.unsqueeze(-1).to(projected_h.dtype)
-                )
+            hop10_projected = self.hop_projections[10](
+                hop10_center
+            )
 
-                vqw_x[:, column, :] = (
-                        self.vqw_scales[hop] * projected_h
-                )
+            # 念のためHOP10以外を厳密にゼロ化
+            vqw_x = (
+                    hop10_projected
+                    * hop10_valid.unsqueeze(-1).to(
+                hop10_projected.dtype
+            )
+            )
 
         # --------------------------------------------------
-        # 入力時点で単純和
+        # CAT(BPE, HOP10-VQW) -> Linear -> position追加
         # --------------------------------------------------
+
+        fused_input = torch.cat(
+            [bpe_x, vqw_x],
+            dim=-1,
+        )
+        # [B, L, 2 * d_model]
 
         shared_h = (
-                bpe_x
-                + vqw_x
+                self.input_fusion(fused_input)
                 + self.pos_emb(pos)
         )
+        # [B, L, d_model]
 
         # --------------------------------------------------
         # 通常のcausal Transformer
@@ -1111,7 +1132,7 @@ def main():
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "architecture": "bpe_vqw_distance_pair_weighted_input_add",
+            "architecture": "bpe_hop10_distance11_input_cat",
             "history": history,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
@@ -1131,20 +1152,7 @@ def main():
             best_valid = valid_metrics["bpe_ppl"]
             torch.save(checkpoint, best_path)
             print(f"[save best] {best_path}")
-        vqw_scales = (
-            model.vqw_scales
-            .detach()
-            .cpu()
-            .tolist()
-        )
 
-        print(
-            "[input VQW scales] "
-            + " ".join(
-                f"HOP{hop}={scale:.6f}"
-                for hop, scale in enumerate(vqw_scales)
-            )
-        )
     print(f"[save final] {args.out}")
 
 
