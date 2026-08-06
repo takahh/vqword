@@ -1021,7 +1021,7 @@ def main():
 
         # 入力は最大11位置
         max_len=args.max_len,
-        
+
         tie_weights=args.tie_weights,
         use_vqw=bool(args.use_vqw),
         vqw_init_scale=args.vqw_init_scale,
@@ -1064,7 +1064,20 @@ def main():
             hop_ids = hop_ids.to(device)
             tok_y = tok_y.to(device)
             attention_mask = attention_mask.to(device)
+            print("[debug dataset]")
+            print("tok shape:", train_ds.tok_in.shape)
+            print("vq shape:", train_ds.vq_in.shape)
+            print("hop shape:", train_ds.hop_ids.shape)
 
+            print(
+                "HOP10 positions/sample:",
+                train_ds.hop_ids[100].eq(10).sum().item(),
+            )
+
+            print(
+                "No-VQ positions/sample:",
+                train_ds.hop_ids[100].eq(-1).sum().item(),
+            )
             optimizer.zero_grad(set_to_none=True)
 
             output = model(
