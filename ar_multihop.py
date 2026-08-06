@@ -683,10 +683,8 @@ def evaluate(model, loader, device):
             tok_y,
             attention_mask,
     ) in tqdm(loader, desc="[eval]", leave=False):
-
         tok_in = tok_in.to(device)
         vq_in = vq_in.to(device)
-        hop_ids = hop_ids.to(device)
         tok_y = tok_y.to(device)
         attention_mask = attention_mask.to(device)
 
