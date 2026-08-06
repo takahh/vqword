@@ -319,8 +319,21 @@ class DistanceAwareVQAttention(nn.Module):
             )
 
         attn_weights = torch.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
 
+        # 全keyがmaskされたpadding queryで発生するNaNを除去
+        attn_weights = torch.nan_to_num(
+            attn_weights,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        # padding queryの出力自体も0にする
+        if key_padding_mask is not None:
+            query_valid = (~key_padding_mask)[:, None, :, None]
+            attn_weights = attn_weights * query_valid.to(attn_weights.dtype)
+
+        attn_weights = self.attn_dropout(attn_weights)
         # -----------------------------------------------------
         # Ordinary BPE Value contribution
         # -----------------------------------------------------
