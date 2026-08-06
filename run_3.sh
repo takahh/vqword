@@ -51,8 +51,8 @@ if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-if (( HOP < 0 || HOP > 10 )); then
-  echo "[error] HOP must be between 0 and 10: ${HOP}"
+if (( HOP < 0 || HOP > 50 )); then
+  echo "[error] HOP must be between 0 and 50: ${HOP}"
   exit 1
 fi
 
