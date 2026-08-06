@@ -582,7 +582,7 @@ def main():
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
     print(f"[use VQW] {bool(args.use_vqw)}")
-    
+
     random.shuffle(samples)
     n = len(samples)
     n_train = int(0.8 * n)
@@ -646,7 +646,7 @@ def main():
         dropout=args.dropout,
         max_len=args.max_len,
         tie_weights=args.tie_weights,
-        disable_vq_input=args.disable_vq_input,
+        use_vqw=args.use_vqw,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
