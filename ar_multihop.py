@@ -205,12 +205,13 @@ class BPEMultiHopInputCatLM(nn.Module):
         dropout=0.1,
         max_len=255,
         tie_weights=False,
+        disable_vq_input=False,
     ):
         super().__init__()
 
         if len(hop_centers) != 11:
             raise ValueError("Expected 11 HOP center matrices")
-
+        self.disable_vq_input = disable_vq_input
         self.num_hops = 11
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(target_vq_vocab_size)
@@ -341,6 +342,12 @@ class BPEMultiHopInputCatLM(nn.Module):
         context_h = context_h / valid_count.sqrt()
         context_h = self.vq_context_norm(context_h)
 
+        # Comparison baseline:
+        # keep the same CAT/projection architecture,
+        # but remove all information from the VQ stream.
+        if self.disable_vq_input:
+            context_h = torch.zeros_like(context_h)
+
         # ---------------- Input CAT and shared processing ----------------
         shared_x = torch.cat([bpe_x, context_h], dim=-1)
         shared_x = self.input_fusion_proj(shared_x)
@@ -455,7 +462,11 @@ def main():
         "--out",
         default="ar_bpe_multihop_input_cat_bpe_only.pt",
     )
-
+    ap.add_argument(
+        "--disable_vq_input",
+        action="store_true",
+        help="Ignore all VQ inputs and use zeros instead.",
+    )
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -568,6 +579,7 @@ def main():
     print("[architecture] input CAT(BPE, multi-hop VQ) + shared Transformer + BPE head only")
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
+    print(f"[disable VQ input] {args.disable_vq_input}")
 
     random.shuffle(samples)
     n = len(samples)
@@ -632,6 +644,7 @@ def main():
         dropout=args.dropout,
         max_len=args.max_len,
         tie_weights=args.tie_weights,
+        disable_vq_input=args.disable_vq_input,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
