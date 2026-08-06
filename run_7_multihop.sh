@@ -66,7 +66,7 @@ LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
 
-AR_SCRIPT="/vqword/ar_singlehop.py"
+AR_SCRIPT="/vqword/ar_multihop.py"
 HOP2=$(printf "%02d" "${HOP}")
 TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 DATA_FILE="tinystories_vqword_${TAG}_ids.pt"
