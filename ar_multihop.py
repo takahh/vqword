@@ -266,14 +266,29 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         )
 
     def forward(
-        self,
-        x,
-        vqw_features,
-        vqw_valid,
-        key_padding_mask=None,
+            self,
+            x,
+            vqw_features,
+            vqw_valid,
+            key_padding_mask=None,
     ):
         B, L, _ = x.shape
         device = x.device
+
+        # =====================================================
+        # INPUT CAT
+        # =====================================================
+        # 現在のTransformer hiddenと、その位置自身のVQWをまずCAT
+        #
+        # [B,L,D] + [B,L,D] -> [B,L,2D]
+        fused = torch.cat(
+            [x, vqw_features],
+            dim=-1,
+        )
+
+        # headが参照する成分を分離
+        bpe_part = fused[..., :self.d_model]
+        vqw_part = fused[..., self.d_model:]
 
         pos = torch.arange(L, device=device)
         qpos = pos[:, None]
@@ -284,17 +299,17 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         # =====================================================
 
         qb = self._split_heads(
-            self.q_bpe_proj(x),
+            self.q_bpe_proj(bpe_part),
             self.n_bpe_heads,
         )
 
         kb = self._split_heads(
-            self.k_bpe_proj(x),
+            self.k_bpe_proj(bpe_part),
             self.n_bpe_heads,
         )
 
         vb = self._split_heads(
-            self.v_bpe_proj(x),
+            self.v_bpe_proj(bpe_part),
             self.n_bpe_heads,
         )
 
@@ -342,20 +357,20 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         # VQW HEADS
         # =====================================================
 
-        # Queryはx=BPE/shared hiddenから作る
+        # VQW headでもQueryはBPE/shared hiddenから作る
         qv = self._split_heads(
-            self.q_vqw_proj(x),
+            self.q_vqw_proj(bpe_part),
             self.n_vqw_heads,
         )
 
         # K/VだけVQWから作る
         kv = self._split_heads(
-            self.k_vqw_proj(vqw_features),
+            self.k_vqw_proj(vqw_part),
             self.n_vqw_heads,
         )
 
         vv = self._split_heads(
-            self.v_vqw_proj(vqw_features),
+            self.v_vqw_proj(vqw_part),
             self.n_vqw_heads,
         )
 
