@@ -49,6 +49,21 @@ FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
 FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 {hop}"
+    echo
+    echo "Example:"
+    echo "  $0 100"
+    exit 1
+fi
+
+HOP="$1"
+
+if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
+    echo "[error] hop must be a non-negative integer: ${HOP}"
+    exit 1
+fi
+
 # ============================================================
 # BPE tokenizerを一度だけ取得・展開
 # ============================================================
@@ -90,33 +105,32 @@ fi
 # HOP 0〜10
 # ============================================================
 
-for HOP in 50; do
-  HOP2=$(printf "%02d" "${HOP}")
+HOP2=$(printf "%02d" "${HOP}")
 
-  BASE_TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_LABEL}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_LABEL}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 
-  VQ_CKPT="wikitext103_vqword_${BASE_TAG}.pt"
-  VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
+VQ_CKPT="wikitext103_vqword_${BASE_TAG}.pt"
+VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
 
-  OUT="tinystories_vqword_${BASE_TAG}_ids.pt"
-  OUT_PATH="/vqword/${OUT}"
+OUT="tinystories_vqword_${BASE_TAG}_ids.pt"
+OUT_PATH="/vqword/${OUT}"
 
-  echo
-  echo "============================================================"
-  echo "[HOP ${HOP}]"
-  echo "checkpoint = ${VQ_CKPT}"
-  echo "output     = ${OUT}"
-  echo "============================================================"
+echo
+echo "============================================================"
+echo "[HOP ${HOP}]"
+echo "checkpoint = ${VQ_CKPT}"
+echo "output     = ${OUT}"
+echo "============================================================"
 
-  rm -f "${VQ_CKPT_PATH}"
-  rm -f "${OUT_PATH}"
-  rm -f "${OUT_PATH}.part"*
+rm -f "${VQ_CKPT_PATH}"
+rm -f "${OUT_PATH}"
+rm -f "${OUT_PATH}.part"*
 
-  # ----------------------------------------------------------
-  # checkpoint取得
-  # ----------------------------------------------------------
+# ----------------------------------------------------------
+# checkpoint取得
+# ----------------------------------------------------------
 
-  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
@@ -317,7 +331,6 @@ EOF
 
   # 次のHOP用に巨大checkpointだけ削除
   rm -f "${VQ_CKPT_PATH}"
-done
 
 echo
 echo "============================================================"
