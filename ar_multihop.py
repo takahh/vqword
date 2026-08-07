@@ -211,28 +211,48 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         bpe_dim = self.n_bpe_heads * self.head_dim
         vqw_dim = self.n_vqw_heads * self.head_dim
 
-        # QueryはBPE/shared hiddenからのみ作る
+        # 8 head, d_model=256
+        #
+        # head_dim = 32
+        # BPE 4 heads = 128
+        # VQW 4 heads = 128
+
+        # BPE heads
         self.q_bpe_proj = nn.Linear(
-            d_model, bpe_dim, bias=False
-        )
-        self.q_vqw_proj = nn.Linear(
-            d_model, vqw_dim, bias=False
+            d_model,
+            bpe_dim,
+            bias=False,
         )
 
-        # BPE headsのK/V
         self.k_bpe_proj = nn.Linear(
-            d_model, bpe_dim, bias=False
-        )
-        self.v_bpe_proj = nn.Linear(
-            d_model, bpe_dim, bias=False
+            d_model,
+            bpe_dim,
+            bias=False,
         )
 
-        # VQW headsのK/V
-        self.k_vqw_proj = nn.Linear(
-            d_model, vqw_dim, bias=False
+        self.v_bpe_proj = nn.Linear(
+            d_model,
+            bpe_dim,
+            bias=False,
         )
+
+        # VQW heads
+        self.q_vqw_proj = nn.Linear(
+            d_model,
+            vqw_dim,
+            bias=False,
+        )
+
+        self.k_vqw_proj = nn.Linear(
+            d_model,
+            vqw_dim,
+            bias=False,
+        )
+
         self.v_vqw_proj = nn.Linear(
-            d_model, vqw_dim, bias=False
+            d_model,
+            vqw_dim,
+            bias=False,
         )
 
         self.vqw_scale = nn.Parameter(
@@ -268,29 +288,29 @@ class HeadSplitDistanceAwareAttention(nn.Module):
     def forward(
             self,
             x,
-            vqw_features,
+            fused_source,
             vqw_valid,
             key_padding_mask=None,
     ):
         B, L, _ = x.shape
         device = x.device
 
-        # =====================================================
-        # INPUT CAT
-        # =====================================================
-        # 現在のTransformer hiddenと、その位置自身のVQWをまずCAT
-        #
-        # [B,L,D] + [B,L,D] -> [B,L,2D]
-        fused = torch.cat(
-            [x, vqw_features],
-            dim=-1,
+        # ==========================================
+        # CATされた512次元を二つに分ける
+        # ==========================================
+        bpe_source = fused_source[
+            ..., :self.d_model
+        ]
+
+        vqw_source = fused_source[
+            ..., self.d_model:
+        ]
+
+        pos = torch.arange(
+            L,
+            device=device,
         )
 
-        # headが参照する成分を分離
-        bpe_part = fused[..., :self.d_model]
-        vqw_part = fused[..., self.d_model:]
-
-        pos = torch.arange(L, device=device)
         qpos = pos[:, None]
         kpos = pos[None, :]
 
@@ -299,17 +319,17 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         # =====================================================
 
         qb = self._split_heads(
-            self.q_bpe_proj(bpe_part),
+            self.q_bpe_proj(x),
             self.n_bpe_heads,
         )
 
         kb = self._split_heads(
-            self.k_bpe_proj(bpe_part),
+            self.k_bpe_proj(bpe_source),
             self.n_bpe_heads,
         )
 
         vb = self._split_heads(
-            self.v_bpe_proj(bpe_part),
+            self.v_bpe_proj(bpe_source),
             self.n_bpe_heads,
         )
 
@@ -319,7 +339,9 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         ) / math.sqrt(self.head_dim)
 
         # 普通のcausal
-        bpe_allowed = kpos <= qpos
+        bpe_allowed = (
+                kpos <= qpos
+        )
 
         bpe_scores = bpe_scores.masked_fill(
             ~bpe_allowed[None, None, :, :],
@@ -359,18 +381,18 @@ class HeadSplitDistanceAwareAttention(nn.Module):
 
         # VQW headでもQueryはBPE/shared hiddenから作る
         qv = self._split_heads(
-            self.q_vqw_proj(bpe_part),
+            self.q_vqw_proj(x),
             self.n_vqw_heads,
         )
 
         # K/VだけVQWから作る
         kv = self._split_heads(
-            self.k_vqw_proj(vqw_part),
+            self.k_vqw_proj(vqw_source),
             self.n_vqw_heads,
         )
 
         vv = self._split_heads(
-            self.v_vqw_proj(vqw_part),
+            self.v_vqw_proj(vqw_source),
             self.n_vqw_heads,
         )
 
@@ -392,8 +414,8 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         # -----------------------------------------
 
         vqw_allowed = (
-            qpos - kpos
-        ) >= self.hop
+                              qpos - kpos
+                      ) >= self.hop
 
         vqw_scores = vqw_scores.masked_fill(
             ~vqw_allowed[None, None, :, :],
@@ -497,17 +519,17 @@ class SingleHopTransformerBlock(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
 
     def forward(
-        self,
-        x,
-        vqw_features,
-        vqw_valid,
-        key_padding_mask=None,
+            self,
+            x,
+            fused_source,
+            vqw_valid,
+            key_padding_mask=None,
     ):
         h = self.norm1(x)
 
         attn_out = self.attention(
             x=h,
-            vqw_features=vqw_features,
+            fused_source=fused_source,
             vqw_valid=vqw_valid,
             key_padding_mask=key_padding_mask,
         )
@@ -565,7 +587,24 @@ class BPEVQWDistancePairAddLM(nn.Module):
             d_model,
             padding_idx=self.tok_pad_id,
         )
-        self.bpe_projection = nn.Linear(d_model, d_model, bias=False)
+        if d_model % 2 != 0:
+            raise ValueError("d_model must be even")
+
+        self.part_dim = d_model // 2
+
+        # BPE -> 128
+        self.bpe_projection = nn.Linear(
+            d_model,
+            self.part_dim,
+            bias=False,
+        )
+
+        # VQW -> 128
+        self.vqw_projection = nn.Linear(
+            centers.size(1),
+            self.part_dim,
+            bias=False,
+        )
 
         # VQW frozen centers -> Linear
         self.center_embedding = FrozenCenterEmbedding(centers)
@@ -610,20 +649,18 @@ class BPEVQWDistancePairAddLM(nn.Module):
             device=tok_in.device,
         )[None, :]
 
-        # -------------------------
-        # BPE
-        # -------------------------
+        # ==========================================
+        # 1. BPE -> NN
+        # ==========================================
         bpe_x = self.bpe_projection(
             self.tok_emb(tok_in)
         )
+        # [B,L,256]
 
-        # -------------------------
-        # HOP50 VQW
-        # 元位置のまま。絶対にshiftしない
-        # -------------------------
-        vqw_valid = vq_in.ne(
-            self.vq_pad_id
-        )
+        # ==========================================
+        # 2. VQW -> NN
+        # ==========================================
+        vqw_valid = vq_in.ne(self.vq_pad_id)
 
         if self.use_vqw:
             vqw_x = self.vqw_projection(
@@ -632,35 +669,44 @@ class BPEVQWDistancePairAddLM(nn.Module):
 
             vqw_x = (
                     vqw_x
-                    * vqw_valid.unsqueeze(-1).to(
-                vqw_x.dtype
+                    * vqw_valid.unsqueeze(-1).to(vqw_x.dtype)
             )
-            )
-
         else:
             vqw_x = torch.zeros_like(bpe_x)
-            vqw_valid = torch.zeros_like(
-                vqw_valid
-            )
+            vqw_valid = torch.zeros_like(vqw_valid)
 
-        # Transformerへの基本入力はBPE
+        # ==========================================
+        # 3. 本当にCAT
+        # ==========================================
+        # [B,L,256] + [B,L,256]
+        #      ↓
+        # [B,L,512]
+        fused_source = torch.cat(
+            [bpe_x, vqw_x],
+            dim=-1,
+        )
+
+        # ==========================================
+        # 4. Query/residualはBPEだけ
+        # ==========================================
+        # ここにVQWを直接入れるとリークする
         shared_h = (
                 bpe_x
                 + self.pos_emb(pos)
         )
 
-        # VQWは元位置のまま別経路で渡す
+        # ==========================================
+        # 5. Transformer
+        # ==========================================
         for block in self.shared_blocks:
             shared_h = block(
                 x=shared_h,
-                vqw_features=vqw_x,
+                fused_source=fused_source,
                 vqw_valid=vqw_valid,
                 key_padding_mask=key_padding_mask,
             )
 
-        shared_h = self.shared_norm(
-            shared_h
-        )
+        shared_h = self.shared_norm(shared_h)
 
         bpe_logits = (
                 self.bpe_head(shared_h)
@@ -673,6 +719,7 @@ class BPEVQWDistancePairAddLM(nn.Module):
             "bpe_input": bpe_x,
             "vqw_input": vqw_x,
         }
+
 
 @torch.no_grad()
 def evaluate(model, loader, device):
