@@ -165,451 +165,142 @@ class FrozenCenterEmbedding(nn.Module):
         )
 
 
-class SingleHopDistanceAwareAttention(nn.Module):
-    """
-    通常のcausal attention。
+class CausalTransformerBlock(nn.Module):
+    """Standard pre-norm causal Transformer block."""
 
-    BPE value:
-        全causal keyから利用
-
-    selected-HOP VQ value:
-        query-key距離が指定HOP以上のkeyだけ利用
-
-    query qはtoken q+1を予測するため、
-    q-k >= HOPなら、選択HOPの右文脈が予測対象へ届かない。
-    """
-
-    def __init__(
-        self,
-        d_model,
-        n_heads,
-        dropout=0.1,
-        vqw_init_scale=0.1,
-        hop=10,
-    ):
+    def __init__(self, d_model, n_heads, dropout=0.1):
         super().__init__()
-
-        self.hop = int(hop)
-        if self.hop < 0:
-            raise ValueError(f"hop must be non-negative: {self.hop}")
-
-        if d_model % n_heads != 0:
-            raise ValueError(
-                f"d_model={d_model} must be divisible by "
-                f"n_heads={n_heads}"
-            )
-
-        self.d_model = int(d_model)
-        self.n_heads = int(n_heads)
-        self.head_dim = self.d_model // self.n_heads
-
-        self.q_proj = nn.Linear(
-            d_model,
-            d_model,
-            bias=False,
-        )
-
-        self.k_proj = nn.Linear(
-            d_model,
-            d_model,
-            bias=False,
-        )
-
-        self.bpe_v_proj = nn.Linear(
-            d_model,
-            d_model,
-            bias=False,
-        )
-
-        self.vqw_v_proj = nn.Linear(
-            d_model,
-            d_model,
-            bias=False,
-        )
-
-        # BPE outputとVQW outputをCATしてd_modelへ戻す
-        self.out_proj = nn.Linear(
-            2 * d_model,
-            d_model,
-            bias=True,
-        )
-
-        self.vqw_scale = nn.Parameter(
-            torch.tensor(float(vqw_init_scale))
-        )
-
-        self.attn_dropout = nn.Dropout(dropout)
-
-    def _split_heads(self, x):
-        batch_size, seq_len, _ = x.shape
-
-        return (
-            x.view(
-                batch_size,
-                seq_len,
-                self.n_heads,
-                self.head_dim,
-            )
-            .transpose(1, 2)
-        )
-
-    def _merge_heads(self, x):
-        batch_size, _, seq_len, _ = x.shape
-
-        return (
-            x.transpose(1, 2)
-            .contiguous()
-            .view(
-                batch_size,
-                seq_len,
-                self.d_model,
-            )
-        )
-
-    def forward(
-        self,
-        x,
-        vqw_features,
-        vqw_valid,
-        key_padding_mask=None,
-    ):
-        """
-        x:
-            [B,L,D]
-
-        vqw_features:
-            各入力位置自身のselected-HOP特徴 [B,L,D]
-
-        vqw_valid:
-            実在するVQ ID位置 [B,L]
-        """
-
-        _, seq_len, _ = x.shape
-        device = x.device
-
-        q = self._split_heads(self.q_proj(x))
-        k = self._split_heads(self.k_proj(x))
-        bpe_v = self._split_heads(self.bpe_v_proj(x))
-        vqw_v = self._split_heads(
-            self.vqw_v_proj(vqw_features)
-        )
-
-        scores = torch.matmul(
-            q,
-            k.transpose(-2, -1),
-        ) / math.sqrt(self.head_dim)
-
-        positions = torch.arange(
-            seq_len,
-            device=device,
-        )
-
-        query_pos = positions[:, None]
-        key_pos = positions[None, :]
-
-        # 通常causal条件: key <= query
-        causal_allowed = key_pos.le(query_pos)
-
-        scores = scores.masked_fill(
-            ~causal_allowed[None, None, :, :],
-            float("-inf"),
-        )
-
-        if key_padding_mask is not None:
-            scores = scores.masked_fill(
-                key_padding_mask[:, None, None, :],
-                float("-inf"),
-            )
-
-        attn_weights = torch.softmax(
-            scores,
-            dim=-1,
-        )
-
-        attn_weights = torch.nan_to_num(
-            attn_weights,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-        if key_padding_mask is not None:
-            query_valid = (
-                ~key_padding_mask
-            )[:, None, :, None]
-
-            attn_weights = (
-                attn_weights
-                * query_valid.to(attn_weights.dtype)
-            )
-
-        attn_weights = self.attn_dropout(
-            attn_weights
-        )
-
-        # 通常BPE value
-        bpe_output = torch.matmul(
-            attn_weights,
-            bpe_v,
-        )
-
-        # q-k >= hop のときだけselected-HOP VQWを利用
-        hop_allowed = (
-            query_pos - key_pos
-        ).ge(self.hop)
-
-        vqw_weights = (
-            attn_weights
-            * hop_allowed[
-                None,
-                None,
-                :,
-                :,
-            ].to(attn_weights.dtype)
-        )
-
-        # VQ IDが実在しないpadding keyも除外
-        vqw_weights = (
-            vqw_weights
-            * vqw_valid[
-                :,
-                None,
-                None,
-                :,
-            ].to(vqw_weights.dtype)
-        )
-
-        vqw_output = torch.matmul(
-            vqw_weights,
-            vqw_v,
-        )
-
-        bpe_output = self._merge_heads(
-            bpe_output
-        )
-
-        vqw_output = self._merge_heads(
-            vqw_output
-        )
-
-        # CAT方式
-        combined = torch.cat(
-            [
-                bpe_output,
-                self.vqw_scale * vqw_output,
-            ],
-            dim=-1,
-        )
-
-        return self.out_proj(combined)
-
-class SingleHopTransformerBlock(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        n_heads,
-        dropout=0.1,
-        vqw_init_scale=0.1,
-        hop=10,
-    ):
-        super().__init__()
-
         self.norm1 = nn.LayerNorm(d_model)
-
-        self.attention = SingleHopDistanceAwareAttention(
-            d_model=d_model,
-            n_heads=n_heads,
+        self.attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
             dropout=dropout,
-            vqw_init_scale=vqw_init_scale,
-            hop=hop,
+            batch_first=True,
         )
-
         self.dropout1 = nn.Dropout(dropout)
-
         self.norm2 = nn.LayerNorm(d_model)
-
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(4 * d_model, d_model),
         )
-
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        x,
-        vqw_features,
-        vqw_valid,
-        key_padding_mask=None,
-    ):
-        attention_output = self.attention(
-            x=self.norm1(x),
-            vqw_features=vqw_features,
-            vqw_valid=vqw_valid,
+    def forward(self, x, causal_mask, key_padding_mask=None):
+        h = self.norm1(x)
+        attn_output, _ = self.attention(
+            query=h,
+            key=h,
+            value=h,
+            attn_mask=causal_mask,
             key_padding_mask=key_padding_mask,
+            need_weights=False,
         )
-
-        x = x + self.dropout1(attention_output)
-
-        ffn_output = self.ffn(
-            self.norm2(x)
-        )
-
-        x = x + self.dropout2(ffn_output)
-
+        x = x + self.dropout1(attn_output)
+        x = x + self.dropout2(self.ffn(self.norm2(x)))
         return x
 
-
-class DistanceAwareVQTransformerBlock(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        n_heads,
-        dropout=0.1,
-        num_hops=11,
-        vqw_init_scale=0.1,
-    ):
-        super().__init__()
-
-        self.norm1 = nn.LayerNorm(d_model)
-
-        self.attention = DistanceAwareVQAttention(
-            d_model=d_model,
-            n_heads=n_heads,
-            dropout=dropout,
-            num_hops=num_hops,
-            vqw_init_scale=vqw_init_scale,
-        )
-
-        self.dropout1 = nn.Dropout(dropout)
-
-        self.norm2 = nn.LayerNorm(d_model)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * d_model, d_model),
-        )
-
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        x,
-        vqw_features,
-        hop_valid,
-        use_vqw=True,
-        key_padding_mask=None,
-    ):
-        # Pre-norm attention
-        attention_input = self.norm1(x)
-
-        attention_output = self.attention(
-            x=attention_input,
-            vqw_features=vqw_features,
-            hop_valid=hop_valid,
-            use_vqw=use_vqw,
-            key_padding_mask=key_padding_mask,
-        )
-
-        x = x + self.dropout1(attention_output)
-
-        # Pre-norm feed-forward
-        ffn_output = self.ffn(self.norm2(x))
-        x = x + self.dropout2(ffn_output)
-
-        return x
 
 class BPEVQWDistancePairAddLM(nn.Module):
+    """
+    Projection -> CAT -> MLP -> causal Transformer.
+
+    To keep the same no-leak condition as the previous distance-aware
+    attention, VQW at source position k is shifted to input position k+hop.
+    Therefore query q can only receive VQW sources k <= q-hop.
+    """
+
     def __init__(
-            self,
-            centers,
-            token_vocab_size,
-            target_vq_vocab_size,
-            d_model=256,
-            n_layers=6,
-            n_heads=8,
-            dropout=0.1,
-            max_len=255,
-            tie_weights=False,
-            use_vqw=False,
-            vqw_init_scale=0.1,
-            hop=10,
+        self,
+        centers,
+        token_vocab_size,
+        target_vq_vocab_size,
+        d_model=256,
+        n_layers=6,
+        n_heads=8,
+        dropout=0.1,
+        max_len=255,
+        tie_weights=False,
+        use_vqw=False,
+        vqw_init_scale=0.1,
+        hop=10,
     ):
         super().__init__()
 
-        self.use_vqw = use_vqw
+        self.use_vqw = bool(use_vqw)
         self.hop = int(hop)
         if self.hop < 0:
             raise ValueError(f"hop must be non-negative: {self.hop}")
+
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(target_vq_vocab_size)
         self.tok_pad_id = self.token_vocab_size
         self.vq_pad_id = self.vq_vocab_size
         self.d_model = int(d_model)
+        self.tie_weights = bool(tie_weights)
 
-        # ---------------- BPE input ----------------
+        # BPE -> Linear
         self.tok_emb = nn.Embedding(
             self.token_vocab_size + 1,
             d_model,
             padding_idx=self.tok_pad_id,
         )
+        self.bpe_projection = nn.Linear(d_model, d_model, bias=False)
 
-        # ---------------- Multi-hop VQ input ----------------
+        # VQW frozen centers -> Linear
         self.center_embedding = FrozenCenterEmbedding(centers)
-        self.hop_projection = nn.Linear(
+        self.vqw_projection = nn.Linear(
             centers.size(1), d_model, bias=False
         )
-        # BPE 256次元 + selected-HOP VQW 256次元
-        # を連結して256次元へ戻す
-        self.input_fusion = nn.Linear(
-            2 * d_model,
-            d_model,
-            bias=True,
+        self.vqw_scale = nn.Parameter(
+            torch.tensor(float(vqw_init_scale))
         )
-        # ---------------- Shared Transformer ----------------
-        self.pos_emb = nn.Embedding(max_len, d_model)
 
+        # CAT -> MLP -> d_model
+        self.input_fusion = nn.Sequential(
+            nn.Linear(2 * d_model, 2 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        self.pos_emb = nn.Embedding(max_len, d_model)
         self.shared_blocks = nn.ModuleList([
-            SingleHopTransformerBlock(
+            CausalTransformerBlock(
                 d_model=d_model,
                 n_heads=n_heads,
                 dropout=dropout,
-                vqw_init_scale=vqw_init_scale,
-                hop=self.hop,
             )
             for _ in range(n_layers)
         ])
-
         self.shared_norm = nn.LayerNorm(d_model)
 
-        # ---------------- BPE output head only ----------------
-        # shared Transformerの出力から直接BPE[t+1]を予測
-        self.bpe_head = nn.Linear(
-            d_model,
-            self.token_vocab_size,
-            bias=False,
-        )
-
+        if not self.tie_weights:
+            self.bpe_head = nn.Linear(
+                d_model, self.token_vocab_size, bias=False
+            )
         self.bpe_bias = nn.Parameter(
             torch.zeros(self.token_vocab_size)
         )
 
-        if tie_weights:
-            self.bpe_head.weight = self.tok_emb.weight[
-                :self.token_vocab_size
-            ]
+    def _shift_vqw(self, vqw_x, vqw_valid):
+        """Move VQW[k] to position k+hop to enforce q-k >= hop."""
+        if self.hop == 0:
+            return vqw_x, vqw_valid
 
-    def forward(
-            self,
-            tok_in,
-            vq_in,
-            key_padding_mask=None,
-    ):
-        batch_size, seq_len = tok_in.shape
+        shifted_x = torch.zeros_like(vqw_x)
+        shifted_valid = torch.zeros_like(vqw_valid)
+
+        if self.hop < vqw_x.size(1):
+            shifted_x[:, self.hop:, :] = vqw_x[:, :-self.hop, :]
+            shifted_valid[:, self.hop:] = vqw_valid[:, :-self.hop]
+
+        return shifted_x, shifted_valid
+
+    def forward(self, tok_in, vq_in, key_padding_mask=None):
+        _, seq_len = tok_in.shape
 
         if seq_len > self.pos_emb.num_embeddings:
             raise ValueError(
@@ -617,56 +308,58 @@ class BPEVQWDistancePairAddLM(nn.Module):
                 f"{self.pos_emb.num_embeddings}"
             )
 
-        pos = torch.arange(
-            seq_len,
-            device=tok_in.device,
-        )[None, :]
+        pos = torch.arange(seq_len, device=tok_in.device)[None, :]
 
-        bpe_x = self.tok_emb(tok_in)
+        # BPE -> Linear
+        bpe_x = self.bpe_projection(self.tok_emb(tok_in))
 
-        vqw_valid = vq_in.ne(self.vq_pad_id)
-
+        # VQW -> Linear, then shift by HOP for leakage prevention
+        raw_vqw_valid = vq_in.ne(self.vq_pad_id)
         if self.use_vqw:
-            hop_center = self.center_embedding(vq_in)
-            vqw_x = self.hop_projection(hop_center)
-
-            vqw_x = (
-                    vqw_x
-                    * vqw_valid.unsqueeze(-1).to(
-                vqw_x.dtype
-            )
-            )
+            vqw_x = self.vqw_projection(self.center_embedding(vq_in))
+            vqw_x = vqw_x * raw_vqw_valid.unsqueeze(-1).to(vqw_x.dtype)
+            vqw_x, vqw_valid = self._shift_vqw(vqw_x, raw_vqw_valid)
+            vqw_x = self.vqw_scale * vqw_x
         else:
             vqw_x = torch.zeros_like(bpe_x)
-            vqw_valid = torch.zeros_like(
-                vqw_valid
-            )
+            vqw_valid = torch.zeros_like(raw_vqw_valid)
 
-        # 最初のhiddenはBPEのみ
-        shared_h = bpe_x + self.pos_emb(pos)
+        # Projection -> CAT -> MLP
+        fused_x = self.input_fusion(torch.cat([bpe_x, vqw_x], dim=-1))
+        shared_h = fused_x + self.pos_emb(pos)
+
+        # True above diagonal means masked for MultiheadAttention.
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=tok_in.device, dtype=torch.bool),
+            diagonal=1,
+        )
 
         for block in self.shared_blocks:
             shared_h = block(
                 x=shared_h,
-                vqw_features=vqw_x,
-                vqw_valid=vqw_valid,
+                causal_mask=causal_mask,
                 key_padding_mask=key_padding_mask,
             )
 
         shared_h = self.shared_norm(shared_h)
 
-        # [B,L,V]
-        bpe_logits = (
-                self.bpe_head(shared_h)
-                + self.bpe_bias
-        )
+        if self.tie_weights:
+            bpe_logits = F.linear(
+                shared_h,
+                self.tok_emb.weight[:self.token_vocab_size],
+                self.bpe_bias,
+            )
+        else:
+            bpe_logits = self.bpe_head(shared_h) + self.bpe_bias
 
         return {
             "bpe_logits": bpe_logits,
             "hidden": shared_h,
             "bpe_input": bpe_x,
             "vqw_input": vqw_x,
+            "vqw_valid": vqw_valid,
         }
+
 
 @torch.no_grad()
 def evaluate(model, loader, device):
@@ -851,7 +544,7 @@ def main():
         reference.get("token_vocab_size", 50257)
     )
 
-    print("[architecture] input CAT(BPE, single-HOP VQ) + shared Transformer + BPE head only")
+    print("[architecture] BPE->Linear, VQW->Linear, CAT->MLP, causal Transformer, BPE head")
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
     print(f"[use VQW] {bool(args.use_vqw)}")
@@ -1031,7 +724,7 @@ def main():
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "architecture": "bpe_singlehop_distance_input_cat",
+            "architecture": "bpe_vqw_projection_cat_mlp_causal",
             "history": history,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
