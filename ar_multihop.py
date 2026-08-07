@@ -288,7 +288,7 @@ class HeadSplitDistanceAwareAttention(nn.Module):
     def forward(
             self,
             x,
-            fused_source,
+            vqw_features,
             vqw_valid,
             key_padding_mask=None,
     ):
@@ -298,13 +298,6 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         # ==========================================
         # CATされた512次元を二つに分ける
         # ==========================================
-        bpe_source = fused_source[
-            ..., :self.d_model
-        ]
-
-        vqw_source = fused_source[
-            ..., self.d_model:
-        ]
 
         pos = torch.arange(
             L,
@@ -324,12 +317,12 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         )
 
         kb = self._split_heads(
-            self.k_bpe_proj(bpe_source),
+            self.k_bpe_proj(x),
             self.n_bpe_heads,
         )
 
         vb = self._split_heads(
-            self.v_bpe_proj(bpe_source),
+            self.v_bpe_proj(x),
             self.n_bpe_heads,
         )
 
@@ -387,12 +380,12 @@ class HeadSplitDistanceAwareAttention(nn.Module):
 
         # K/VだけVQWから作る
         kv = self._split_heads(
-            self.k_vqw_proj(vqw_source),
+            self.k_vqw_proj(vqw_features),
             self.n_vqw_heads,
         )
 
         vv = self._split_heads(
-            self.v_vqw_proj(vqw_source),
+            self.v_vqw_proj(vqw_features),
             self.n_vqw_heads,
         )
 
@@ -521,7 +514,7 @@ class SingleHopTransformerBlock(nn.Module):
     def forward(
             self,
             x,
-            fused_source,
+            vqw_features,
             vqw_valid,
             key_padding_mask=None,
     ):
@@ -529,7 +522,7 @@ class SingleHopTransformerBlock(nn.Module):
 
         attn_out = self.attention(
             x=h,
-            fused_source=fused_source,
+            vqw_features=vqw_features,
             vqw_valid=vqw_valid,
             key_padding_mask=key_padding_mask,
         )
@@ -669,27 +662,15 @@ class BPEVQWDistancePairAddLM(nn.Module):
         # [B,L,256] + [B,L,256]
         #      ↓
         # [B,L,512]
-        fused_source = torch.cat(
-            [bpe_x, vqw_x],
-            dim=-1,
-        )
-
-        # ==========================================
-        # 4. Query/residualはBPEだけ
-        # ==========================================
-        # ここにVQWを直接入れるとリークする
         shared_h = (
                 bpe_x
                 + self.pos_emb(pos)
         )
 
-        # ==========================================
-        # 5. Transformer
-        # ==========================================
         for block in self.shared_blocks:
             shared_h = block(
                 x=shared_h,
-                fused_source=fused_source,
+                vqw_features=vqw_x,
                 vqw_valid=vqw_valid,
                 key_padding_mask=key_padding_mask,
             )
