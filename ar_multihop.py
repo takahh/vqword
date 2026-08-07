@@ -165,40 +165,344 @@ class FrozenCenterEmbedding(nn.Module):
         )
 
 
-class CausalTransformerBlock(nn.Module):
-    """Standard pre-norm causal Transformer block."""
+class HeadSplitDistanceAwareAttention(nn.Module):
+    """
+    Head 0 .. n_bpe_heads-1:
+        BPE K/V, normal causal attention
 
-    def __init__(self, d_model, n_heads, dropout=0.1):
+    Remaining heads:
+        VQW K/V, only q-k >= hop
+
+    Queryは全headともBPE/shared hiddenから作る。
+    これによりquery位置自身のVQWからのリークを防ぐ。
+    """
+
+    def __init__(
+        self,
+        d_model,
+        n_heads,
+        dropout=0.1,
+        hop=50,
+        n_vqw_heads=None,
+        vqw_init_scale=0.1,
+    ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attention = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
+
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f"d_model={d_model} must be divisible by n_heads={n_heads}"
+            )
+
+        self.d_model = int(d_model)
+        self.n_heads = int(n_heads)
+        self.head_dim = d_model // n_heads
+        self.hop = int(hop)
+
+        # 8 headsならデフォルト4 BPE + 4 VQW
+        if n_vqw_heads is None:
+            n_vqw_heads = n_heads // 2
+
+        self.n_vqw_heads = int(n_vqw_heads)
+        self.n_bpe_heads = n_heads - self.n_vqw_heads
+
+        if self.n_bpe_heads <= 0 or self.n_vqw_heads <= 0:
+            raise ValueError("Need at least one BPE head and one VQW head")
+
+        bpe_dim = self.n_bpe_heads * self.head_dim
+        vqw_dim = self.n_vqw_heads * self.head_dim
+
+        # QueryはBPE/shared hiddenからのみ作る
+        self.q_bpe_proj = nn.Linear(
+            d_model, bpe_dim, bias=False
         )
+        self.q_vqw_proj = nn.Linear(
+            d_model, vqw_dim, bias=False
+        )
+
+        # BPE headsのK/V
+        self.k_bpe_proj = nn.Linear(
+            d_model, bpe_dim, bias=False
+        )
+        self.v_bpe_proj = nn.Linear(
+            d_model, bpe_dim, bias=False
+        )
+
+        # VQW headsのK/V
+        self.k_vqw_proj = nn.Linear(
+            d_model, vqw_dim, bias=False
+        )
+        self.v_vqw_proj = nn.Linear(
+            d_model, vqw_dim, bias=False
+        )
+
+        self.vqw_scale = nn.Parameter(
+            torch.tensor(float(vqw_init_scale))
+        )
+
+        # 全headsをCATした後256次元へ
+        self.out_proj = nn.Linear(
+            d_model,
+            d_model,
+            bias=True,
+        )
+
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def _split_heads(self, x, n_heads):
+        B, L, _ = x.shape
+
+        return (
+            x.view(B, L, n_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+
+    def _merge_heads(self, x):
+        B, H, L, HD = x.shape
+
+        return (
+            x.transpose(1, 2)
+            .contiguous()
+            .view(B, L, H * HD)
+        )
+
+    def forward(
+        self,
+        x,
+        vqw_features,
+        vqw_valid,
+        key_padding_mask=None,
+    ):
+        B, L, _ = x.shape
+        device = x.device
+
+        pos = torch.arange(L, device=device)
+        qpos = pos[:, None]
+        kpos = pos[None, :]
+
+        # =====================================================
+        # BPE HEADS
+        # =====================================================
+
+        qb = self._split_heads(
+            self.q_bpe_proj(x),
+            self.n_bpe_heads,
+        )
+
+        kb = self._split_heads(
+            self.k_bpe_proj(x),
+            self.n_bpe_heads,
+        )
+
+        vb = self._split_heads(
+            self.v_bpe_proj(x),
+            self.n_bpe_heads,
+        )
+
+        bpe_scores = torch.matmul(
+            qb,
+            kb.transpose(-2, -1),
+        ) / math.sqrt(self.head_dim)
+
+        # 普通のcausal
+        bpe_allowed = kpos <= qpos
+
+        bpe_scores = bpe_scores.masked_fill(
+            ~bpe_allowed[None, None, :, :],
+            float("-inf"),
+        )
+
+        if key_padding_mask is not None:
+            bpe_scores = bpe_scores.masked_fill(
+                key_padding_mask[:, None, None, :],
+                float("-inf"),
+            )
+
+        bpe_attn = torch.softmax(
+            bpe_scores,
+            dim=-1,
+        )
+
+        bpe_attn = torch.nan_to_num(
+            bpe_attn,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        bpe_attn = self.attn_dropout(
+            bpe_attn
+        )
+
+        bpe_out = torch.matmul(
+            bpe_attn,
+            vb,
+        )
+
+        # =====================================================
+        # VQW HEADS
+        # =====================================================
+
+        # Queryはx=BPE/shared hiddenから作る
+        qv = self._split_heads(
+            self.q_vqw_proj(x),
+            self.n_vqw_heads,
+        )
+
+        # K/VだけVQWから作る
+        kv = self._split_heads(
+            self.k_vqw_proj(vqw_features),
+            self.n_vqw_heads,
+        )
+
+        vv = self._split_heads(
+            self.v_vqw_proj(vqw_features),
+            self.n_vqw_heads,
+        )
+
+        vqw_scores = torch.matmul(
+            qv,
+            kv.transpose(-2, -1),
+        ) / math.sqrt(self.head_dim)
+
+        # -----------------------------------------
+        # HOP50:
+        #
+        # target=t
+        # query=t-1
+        #
+        # k=t-51
+        # q-k=50
+        #
+        # → 51個目からVQW使用
+        # -----------------------------------------
+
+        vqw_allowed = (
+            qpos - kpos
+        ) >= self.hop
+
+        vqw_scores = vqw_scores.masked_fill(
+            ~vqw_allowed[None, None, :, :],
+            float("-inf"),
+        )
+
+        # VQ IDが存在しない位置
+        vqw_scores = vqw_scores.masked_fill(
+            ~vqw_valid[:, None, None, :],
+            float("-inf"),
+        )
+
+        if key_padding_mask is not None:
+            vqw_scores = vqw_scores.masked_fill(
+                key_padding_mask[:, None, None, :],
+                float("-inf"),
+            )
+
+        vqw_attn = torch.softmax(
+            vqw_scores,
+            dim=-1,
+        )
+
+        # VQWを1個も利用できないqueryでは
+        # softmax(-inf...)がnanになるので0にする
+        vqw_attn = torch.nan_to_num(
+            vqw_attn,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        vqw_attn = self.attn_dropout(
+            vqw_attn
+        )
+
+        vqw_out = torch.matmul(
+            vqw_attn,
+            vv,
+        )
+
+        vqw_out = (
+            self.vqw_scale * vqw_out
+        )
+
+        # =====================================================
+        # HEAD CAT
+        # =====================================================
+
+        # [B, BPE_heads, L, HD]
+        # [B, VQW_heads, L, HD]
+        #
+        # ↓ head軸でCAT
+        #
+        # [B, total_heads, L, HD]
+
+        all_heads = torch.cat(
+            [bpe_out, vqw_out],
+            dim=1,
+        )
+
+        merged = self._merge_heads(
+            all_heads
+        )
+
+        return self.out_proj(merged)
+
+class SingleHopTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        n_heads,
+        dropout=0.1,
+        vqw_init_scale=0.1,
+        hop=50,
+    ):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(d_model)
+
+        self.attention = HeadSplitDistanceAwareAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+            hop=hop,
+            n_vqw_heads=n_heads // 2,
+            vqw_init_scale=vqw_init_scale,
+        )
+
         self.dropout1 = nn.Dropout(dropout)
+
         self.norm2 = nn.LayerNorm(d_model)
+
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(4 * d_model, d_model),
         )
+
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, causal_mask, key_padding_mask=None):
+    def forward(
+        self,
+        x,
+        vqw_features,
+        vqw_valid,
+        key_padding_mask=None,
+    ):
         h = self.norm1(x)
-        attn_output, _ = self.attention(
-            query=h,
-            key=h,
-            value=h,
-            attn_mask=causal_mask,
+
+        attn_out = self.attention(
+            x=h,
+            vqw_features=vqw_features,
+            vqw_valid=vqw_valid,
             key_padding_mask=key_padding_mask,
-            need_weights=False,
         )
-        x = x + self.dropout1(attn_output)
-        x = x + self.dropout2(self.ffn(self.norm2(x)))
+
+        x = x + self.dropout1(attn_out)
+
+        x = x + self.dropout2(
+            self.ffn(self.norm2(x))
+        )
+
         return x
 
 
@@ -257,30 +561,14 @@ class BPEVQWDistancePairAddLM(nn.Module):
             torch.tensor(float(vqw_init_scale))
         )
 
-        # learnable scalar gate
-        # position-wise scalar gate
-        # [B,L,2D] -> [B,L,1]
-        self.vqw_gate = nn.Linear(
-            2 * d_model,
-            1,
-            bias=True,
-        )
-
-        # 初期gateをだいたい0.1にしたい場合
-        initial_gate = float(vqw_init_scale)
-        initial_gate = min(max(initial_gate, 1e-6), 1.0 - 1e-6)
-
-        with torch.no_grad():
-            self.vqw_gate.weight.zero_()
-            self.vqw_gate.bias.fill_(
-                math.log(initial_gate / (1.0 - initial_gate))
-            )
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.shared_blocks = nn.ModuleList([
-            CausalTransformerBlock(
+            SingleHopTransformerBlock(
                 d_model=d_model,
                 n_heads=n_heads,
                 dropout=dropout,
+                vqw_init_scale=vqw_init_scale,
+                hop=self.hop,
             )
             for _ in range(n_layers)
         ])
@@ -294,102 +582,82 @@ class BPEVQWDistancePairAddLM(nn.Module):
             torch.zeros(self.token_vocab_size)
         )
 
-    def _shift_vqw(self, vqw_x, vqw_valid):
-        """Move VQW[k] to position k+hop to enforce q-k >= hop."""
-        if self.hop == 0:
-            return vqw_x, vqw_valid
-
-        shifted_x = torch.zeros_like(vqw_x)
-        shifted_valid = torch.zeros_like(vqw_valid)
-
-        if self.hop < vqw_x.size(1):
-            shifted_x[:, self.hop:, :] = vqw_x[:, :-self.hop, :]
-            shifted_valid[:, self.hop:] = vqw_valid[:, :-self.hop]
-
-        return shifted_x, shifted_valid
-
-    def forward(self, tok_in, vq_in, key_padding_mask=None):
+    def forward(
+            self,
+            tok_in,
+            vq_in,
+            key_padding_mask=None,
+    ):
         _, seq_len = tok_in.shape
 
-        if seq_len > self.pos_emb.num_embeddings:
-            raise ValueError(
-                f"sequence length {seq_len} exceeds max_len "
-                f"{self.pos_emb.num_embeddings}"
+        pos = torch.arange(
+            seq_len,
+            device=tok_in.device,
+        )[None, :]
+
+        # -------------------------
+        # BPE
+        # -------------------------
+        bpe_x = self.bpe_projection(
+            self.tok_emb(tok_in)
+        )
+
+        # -------------------------
+        # HOP50 VQW
+        # 元位置のまま。絶対にshiftしない
+        # -------------------------
+        vqw_valid = vq_in.ne(
+            self.vq_pad_id
+        )
+
+        if self.use_vqw:
+            vqw_x = self.vqw_projection(
+                self.center_embedding(vq_in)
             )
 
-        pos = torch.arange(seq_len, device=tok_in.device)[None, :]
+            vqw_x = (
+                    vqw_x
+                    * vqw_valid.unsqueeze(-1).to(
+                vqw_x.dtype
+            )
+            )
 
-        # BPE -> Linear
-        bpe_x = self.bpe_projection(self.tok_emb(tok_in))
-
-        # VQW -> Linear, then shift by HOP for leakage prevention
-        raw_vqw_valid = vq_in.ne(self.vq_pad_id)
-        if self.use_vqw:
-            vqw_x = self.vqw_projection(self.center_embedding(vq_in))
-            vqw_x = vqw_x * raw_vqw_valid.unsqueeze(-1).to(vqw_x.dtype)
-            vqw_x, vqw_valid = self._shift_vqw(vqw_x, raw_vqw_valid)
-            vqw_x = self.vqw_scale * vqw_x
         else:
             vqw_x = torch.zeros_like(bpe_x)
-            vqw_valid = torch.zeros_like(raw_vqw_valid)
+            vqw_valid = torch.zeros_like(
+                vqw_valid
+            )
 
-        # position-wise scalar gate
-        # gate_input: [B,L,2D]
-        gate_input = torch.cat(
-            [bpe_x, vqw_x],
-            dim=-1,
-        )
-
-        # gate: [B,L,1]
-        gate = torch.sigmoid(
-            self.vqw_gate(gate_input)
-        )
-
-        # VQWが存在しない位置ではgate=0
-        gate = (
-                gate
-                * vqw_valid.unsqueeze(-1).to(gate.dtype)
-        )
-
+        # Transformerへの基本入力はBPE
         shared_h = (
                 bpe_x
-                + gate * vqw_x
                 + self.pos_emb(pos)
         )
 
-        # True above diagonal means masked for MultiheadAttention.
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=tok_in.device, dtype=torch.bool),
-            diagonal=1,
-        )
-
+        # VQWは元位置のまま別経路で渡す
         for block in self.shared_blocks:
             shared_h = block(
                 x=shared_h,
-                causal_mask=causal_mask,
+                vqw_features=vqw_x,
+                vqw_valid=vqw_valid,
                 key_padding_mask=key_padding_mask,
             )
 
-        shared_h = self.shared_norm(shared_h)
+        shared_h = self.shared_norm(
+            shared_h
+        )
 
-        if self.tie_weights:
-            bpe_logits = F.linear(
-                shared_h,
-                self.tok_emb.weight[:self.token_vocab_size],
-                self.bpe_bias,
-            )
-        else:
-            bpe_logits = self.bpe_head(shared_h) + self.bpe_bias
+        bpe_logits = (
+                self.bpe_head(shared_h)
+                + self.bpe_bias
+        )
 
         return {
             "bpe_logits": bpe_logits,
             "hidden": shared_h,
             "bpe_input": bpe_x,
             "vqw_input": vqw_x,
-            "vqw_valid": vqw_valid,
-            "gate": gate,
         }
-
 
 @torch.no_grad()
 def evaluate(model, loader, device):
@@ -741,6 +1009,7 @@ def main():
             f"test_bpe_top1={test_metrics['bpe_top1']:.4f} "
             f"test_bpe_top5={test_metrics['bpe_top5']:.4f}"
         )
+
         record = {
             "epoch": epoch,
             "train_bpe_loss": (
