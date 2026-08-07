@@ -741,7 +741,6 @@ def main():
             f"test_bpe_top1={test_metrics['bpe_top1']:.4f} "
             f"test_bpe_top5={test_metrics['bpe_top5']:.4f}"
         )
-        print(f"[gate] {torch.sigmoid(model.vqw_gate).item():.4f}")
         record = {
             "epoch": epoch,
             "train_bpe_loss": (
