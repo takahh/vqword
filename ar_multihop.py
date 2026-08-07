@@ -257,14 +257,8 @@ class BPEVQWDistancePairAddLM(nn.Module):
             torch.tensor(float(vqw_init_scale))
         )
 
-        # CAT -> MLP -> d_model
-        self.input_fusion = nn.Sequential(
-            nn.Linear(2 * d_model, 2 * d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(2 * d_model, d_model),
-            nn.LayerNorm(d_model),
-        )
+        # learnable scalar gate
+        self.vqw_gate = nn.Parameter(torch.tensor(0.0))
 
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.shared_blocks = nn.ModuleList([
@@ -324,9 +318,13 @@ class BPEVQWDistancePairAddLM(nn.Module):
             vqw_x = torch.zeros_like(bpe_x)
             vqw_valid = torch.zeros_like(raw_vqw_valid)
 
-        # Projection -> CAT -> MLP
-        fused_x = self.input_fusion(torch.cat([bpe_x, vqw_x], dim=-1))
-        shared_h = fused_x + self.pos_emb(pos)
+        gate = torch.sigmoid(self.vqw_gate)
+
+        shared_h = (
+                bpe_x +
+                gate * vqw_x +
+                self.pos_emb(pos)
+        )
 
         # True above diagonal means masked for MultiheadAttention.
         causal_mask = torch.triu(
@@ -711,7 +709,7 @@ def main():
             f"test_bpe_top1={test_metrics['bpe_top1']:.4f} "
             f"test_bpe_top5={test_metrics['bpe_top5']:.4f}"
         )
-
+        print(f"[gate] {torch.sigmoid(model.vqw_gate).item():.4f}")
         record = {
             "epoch": epoch,
             "train_bpe_loss": (
