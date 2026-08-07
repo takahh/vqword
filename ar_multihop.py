@@ -587,32 +587,20 @@ class BPEVQWDistancePairAddLM(nn.Module):
             d_model,
             padding_idx=self.tok_pad_id,
         )
-        if d_model % 2 != 0:
-            raise ValueError("d_model must be even")
-
-        self.part_dim = d_model // 2
-
-        # BPE -> 128
+        # BPE -> 256
         self.bpe_projection = nn.Linear(
             d_model,
-            self.part_dim,
+            d_model,
             bias=False,
         )
 
-        # VQW -> 128
+        # VQW -> 256
+        self.center_embedding = FrozenCenterEmbedding(centers)
+
         self.vqw_projection = nn.Linear(
             centers.size(1),
-            self.part_dim,
+            d_model,
             bias=False,
-        )
-
-        # VQW frozen centers -> Linear
-        self.center_embedding = FrozenCenterEmbedding(centers)
-        self.vqw_projection = nn.Linear(
-            centers.size(1), d_model, bias=False
-        )
-        self.vqw_scale = nn.Parameter(
-            torch.tensor(float(vqw_init_scale))
         )
 
         self.pos_emb = nn.Embedding(max_len, d_model)
