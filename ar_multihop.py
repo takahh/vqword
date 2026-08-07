@@ -258,8 +258,23 @@ class BPEVQWDistancePairAddLM(nn.Module):
         )
 
         # learnable scalar gate
-        self.vqw_gate = nn.Parameter(torch.tensor(0.0))
+        # position-wise scalar gate
+        # [B,L,2D] -> [B,L,1]
+        self.vqw_gate = nn.Linear(
+            2 * d_model,
+            1,
+            bias=True,
+        )
 
+        # 初期gateをだいたい0.1にしたい場合
+        initial_gate = float(vqw_init_scale)
+        initial_gate = min(max(initial_gate, 1e-6), 1.0 - 1e-6)
+
+        with torch.no_grad():
+            self.vqw_gate.weight.zero_()
+            self.vqw_gate.bias.fill_(
+                math.log(initial_gate / (1.0 - initial_gate))
+            )
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.shared_blocks = nn.ModuleList([
             CausalTransformerBlock(
@@ -318,12 +333,28 @@ class BPEVQWDistancePairAddLM(nn.Module):
             vqw_x = torch.zeros_like(bpe_x)
             vqw_valid = torch.zeros_like(raw_vqw_valid)
 
-        gate = torch.sigmoid(self.vqw_gate)
+        # position-wise scalar gate
+        # gate_input: [B,L,2D]
+        gate_input = torch.cat(
+            [bpe_x, vqw_x],
+            dim=-1,
+        )
+
+        # gate: [B,L,1]
+        gate = torch.sigmoid(
+            self.vqw_gate(gate_input)
+        )
+
+        # VQWが存在しない位置ではgate=0
+        gate = (
+                gate
+                * vqw_valid.unsqueeze(-1).to(gate.dtype)
+        )
 
         shared_h = (
-                bpe_x +
-                gate * vqw_x +
-                self.pos_emb(pos)
+                bpe_x
+                + gate * vqw_x
+                + self.pos_emb(pos)
         )
 
         # True above diagonal means masked for MultiheadAttention.
@@ -356,6 +387,7 @@ class BPEVQWDistancePairAddLM(nn.Module):
             "bpe_input": bpe_x,
             "vqw_input": vqw_x,
             "vqw_valid": vqw_valid,
+            "gate": gate,
         }
 
 
