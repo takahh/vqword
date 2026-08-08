@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Input-CAT BPE-only autoregressive language model.
+Input-add BPE-only autoregressive language model.
 
 Inputs:
     BPE[t] embedding
     Single-HOP VQ context from one frozen center table
 
 Fusion:
-    CAT(BPE embedding, aggregated multi-hop VQ context)
-    -> learned projection
+    BPE attention output + scale * VQW attention output
+    -> learned output projection
     -> shared causal Transformer
     -> BPE[t+1] head only
 
@@ -208,6 +208,12 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         if self.n_bpe_heads <= 0 or self.n_vqw_heads <= 0:
             raise ValueError("Need at least one BPE head and one VQW head")
 
+        if self.n_bpe_heads != self.n_vqw_heads:
+            raise ValueError(
+                "ADD fusion requires equal numbers of BPE and VQW heads: "
+                f"bpe={self.n_bpe_heads}, vqw={self.n_vqw_heads}"
+            )
+
         bpe_dim = self.n_bpe_heads * self.head_dim
         vqw_dim = self.n_vqw_heads * self.head_dim
 
@@ -259,9 +265,9 @@ class HeadSplitDistanceAwareAttention(nn.Module):
             torch.tensor(float(vqw_init_scale))
         )
 
-        # 全headsをCATした後256次元へ
+        # BPE/VQW headsを要素ごとにADDした後、d_model次元へ
         self.out_proj = nn.Linear(
-            d_model,
+            bpe_dim,
             d_model,
             bias=True,
         )
@@ -294,10 +300,6 @@ class HeadSplitDistanceAwareAttention(nn.Module):
     ):
         B, L, _ = x.shape
         device = x.device
-
-        # ==========================================
-        # CATされた512次元を二つに分ける
-        # ==========================================
 
         pos = torch.arange(
             L,
@@ -450,29 +452,18 @@ class HeadSplitDistanceAwareAttention(nn.Module):
             vv,
         )
 
-        vqw_out = (
-            self.vqw_scale * vqw_out
-        )
-
         # =====================================================
-        # HEAD CAT
+        # BPE + VQW
         # =====================================================
 
-        # [B, BPE_heads, L, HD]
-        # [B, VQW_heads, L, HD]
-        #
-        # ↓ head軸でCAT
-        #
-        # [B, total_heads, L, HD]
-
-        all_heads = torch.cat(
-            [bpe_out, vqw_out],
-            dim=1,
+        # 両枝は同じ [B, n_branch_heads, L, head_dim]。
+        # VQWを使えないqueryではvqw_out=0なのでBPEだけが残る。
+        fused_heads = (
+            bpe_out
+            + self.vqw_scale * vqw_out
         )
 
-        merged = self._merge_heads(
-            all_heads
-        )
+        merged = self._merge_heads(fused_heads)
 
         return self.out_proj(merged)
 
@@ -538,11 +529,9 @@ class SingleHopTransformerBlock(nn.Module):
 
 class BPEVQWDistancePairAddLM(nn.Module):
     """
-    Projection -> CAT -> MLP -> causal Transformer.
-
-    To keep the same no-leak condition as the previous distance-aware
-    attention, VQW at source position k is shifted to input position k+hop.
-    Therefore query q can only receive VQW sources k <= q-hop.
+    BPE and VQW use separate attention branches. Their outputs are fused by
+    BPE + scale * VQW before the attention output projection. The distance
+    mask guarantees that query q only receives VQW sources k <= q-hop.
     """
 
     def __init__(
@@ -656,12 +645,8 @@ class BPEVQWDistancePairAddLM(nn.Module):
             vqw_x = torch.zeros_like(bpe_x)
             vqw_valid = torch.zeros_like(vqw_valid)
 
-        # ==========================================
-        # 3. 本当にCAT
-        # ==========================================
-        # [B,L,256] + [B,L,256]
-        #      ↓
-        # [B,L,512]
+        # Transformer input itself is BPE + position.
+        # BPE/VQW fusion occurs inside each attention block by ADD.
         shared_h = (
                 bpe_x
                 + self.pos_emb(pos)
@@ -873,7 +858,7 @@ def main():
         reference.get("token_vocab_size", 50257)
     )
 
-    print("[architecture] BPE->Linear, VQW->Linear, CAT->MLP, causal Transformer, BPE head")
+    print("[architecture] BPE attention + scaled VQW attention, causal Transformer, BPE head")
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
     print(f"[use VQW] {bool(args.use_vqw)}")
@@ -1053,7 +1038,7 @@ def main():
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "architecture": "bpe_vqw_projection_cat_mlp_causal",
+            "architecture": "bpe_vqw_attention_add_causal",
             "history": history,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
@@ -1080,3 +1065,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
