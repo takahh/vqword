@@ -639,30 +639,45 @@ class BPEVQWDistancePairAddLM(nn.Module):
         # 1. BPE -> embeddingのみ（追加NNなし）
         # ==========================================
         # BPE embedding -> learned NN
-        bpe_x = self.bpe_projection(
-            self.tok_emb(tok_in)
-        )
+        # 元のBPE embedding
+        tok_e = self.tok_emb(tok_in)
+
+        # 通常BPE headへ渡す特徴
+        bpe_x = self.bpe_projection(tok_e)
+
         # ==========================================
-        # 2. VQW -> frozen center -> learned NN
+        # 2. HOP制限付き第2枝
         # ==========================================
-        vqw_valid = vq_in.ne(self.vq_pad_id)
 
         if self.use_vqw:
-            # center_embedding内でL2正規化済み
+            # VQW条件：
+            # frozen VQW center -> dedicated Linear
+            second_valid = vq_in.ne(self.vq_pad_id)
+
             vqw_center = self.center_embedding(vq_in)
 
-            # VQW側だけ学習可能なLinearを通す
-            vqw_x = self.vqw_projection(vqw_center)
-
-            # bias=Falseなのでpaddingは元々0のままだが、
-            # 無効位置を明示的に0にしておく
-            vqw_x = (
-                    vqw_x
-                    * vqw_valid.unsqueeze(-1).to(vqw_x.dtype)
+            second_x = self.vqw_projection(
+                vqw_center
             )
+
+            second_x = (
+                    second_x
+                    * second_valid.unsqueeze(-1).to(second_x.dtype)
+            )
+
         else:
-            vqw_x = torch.zeros_like(bpe_x)
-            vqw_valid = torch.zeros_like(vqw_valid)
+            # BPE control条件：
+            # BPE embedding -> dedicated Linear
+            second_valid = tok_in.ne(self.tok_pad_id)
+
+            second_x = self.distant_bpe_projection(
+                tok_e
+            )
+
+            second_x = (
+                    second_x
+                    * second_valid.unsqueeze(-1).to(second_x.dtype)
+            )
 
         # Transformer本体への入力はBPE + positional embedding。
         # VQWは別枝として各attention blockへ渡す。
@@ -674,8 +689,8 @@ class BPEVQWDistancePairAddLM(nn.Module):
         for block in self.shared_blocks:
             shared_h = block(
                 x=shared_h,
-                vqw_features=vqw_x,
-                vqw_valid=vqw_valid,
+                vqw_features=second_x,
+                vqw_valid=second_valid,
                 key_padding_mask=key_padding_mask,
             )
 
