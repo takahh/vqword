@@ -212,9 +212,11 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         self.n_vqw_heads = int(n_vqw_heads)
         self.n_bpe_heads = n_heads - self.n_vqw_heads
 
-        if self.n_bpe_heads <= 0 or self.n_vqw_heads <= 0:
-            raise ValueError("Need at least one BPE head and one VQW head")
+        if self.n_bpe_heads <= 0:
+            raise ValueError("Need at least one BPE head")
 
+        if self.n_vqw_heads < 0:
+            raise ValueError("n_vqw_heads must be non-negative")
         bpe_dim = self.n_bpe_heads * self.head_dim
         vqw_dim = self.n_vqw_heads * self.head_dim
 
@@ -224,43 +226,48 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         # BPE 4 heads = 128
         # VQW 4 heads = 128
 
-        # BPE heads
         self.q_bpe_proj = nn.Linear(
             d_model,
             bpe_dim,
             bias=False,
         )
-
         self.k_bpe_proj = nn.Linear(
             d_model,
             bpe_dim,
             bias=False,
         )
-
         self.v_bpe_proj = nn.Linear(
             d_model,
             bpe_dim,
             bias=False,
         )
 
-        # VQW heads
-        self.q_vqw_proj = nn.Linear(
-            d_model,
-            vqw_dim,
-            bias=False,
-        )
+        # VQW headsはuse_vqw=1の場合のみ作成
+        if self.n_vqw_heads > 0:
+            self.q_vqw_proj = nn.Linear(
+                d_model,
+                vqw_dim,
+                bias=False,
+            )
+            self.k_vqw_proj = nn.Linear(
+                d_model,
+                vqw_dim,
+                bias=False,
+            )
+            self.v_vqw_proj = nn.Linear(
+                d_model,
+                vqw_dim,
+                bias=False,
+            )
 
-        self.k_vqw_proj = nn.Linear(
-            d_model,
-            vqw_dim,
-            bias=False,
-        )
-
-        self.v_vqw_proj = nn.Linear(
-            d_model,
-            vqw_dim,
-            bias=False,
-        )
+            self.vqw_scale = nn.Parameter(
+                torch.tensor(float(vqw_init_scale))
+            )
+        else:
+            self.q_vqw_proj = None
+            self.k_vqw_proj = None
+            self.v_vqw_proj = None
+            self.register_parameter("vqw_scale", None)
 
         self.vqw_scale = nn.Parameter(
             torch.tensor(float(vqw_init_scale))
@@ -485,12 +492,13 @@ class HeadSplitDistanceAwareAttention(nn.Module):
 
 class SingleHopTransformerBlock(nn.Module):
     def __init__(
-        self,
-        d_model,
-        n_heads,
-        dropout=0.1,
-        vqw_init_scale=0.1,
-        hop=50,
+            self,
+            d_model,
+            n_heads,
+            dropout=0.1,
+            vqw_init_scale=0.1,
+            hop=50,
+            n_vqw_heads=None,
     ):
         super().__init__()
 
@@ -501,7 +509,7 @@ class SingleHopTransformerBlock(nn.Module):
             n_heads=n_heads,
             dropout=dropout,
             hop=hop,
-            n_vqw_heads=n_heads // 2,
+            n_vqw_heads=n_vqw_heads,
             vqw_init_scale=vqw_init_scale,
         )
 
@@ -606,6 +614,10 @@ class BPEVQWDistancePairAddLM(nn.Module):
         )
 
         self.pos_emb = nn.Embedding(max_len, d_model)
+        if self.use_vqw:
+            attention_vqw_heads = n_heads // 2
+        else:
+            attention_vqw_heads = 0
         self.shared_blocks = nn.ModuleList([
             SingleHopTransformerBlock(
                 d_model=d_model,
@@ -613,6 +625,7 @@ class BPEVQWDistancePairAddLM(nn.Module):
                 dropout=dropout,
                 vqw_init_scale=vqw_init_scale,
                 hop=self.hop,
+                n_vqw_heads=attention_vqw_heads,
             )
             for _ in range(n_layers)
         ])
