@@ -148,9 +148,17 @@ class SequenceARDataset(Dataset):
 class FrozenCenterEmbedding(nn.Module):
     def __init__(self, centers):
         super().__init__()
-        centers = F.normalize(centers.float(), dim=-1)
+
+        # L2正規化せず、生のcodebook centerを使用
+        centers = centers.float()
+
         self.padding_idx = int(centers.size(0))
-        zero = torch.zeros(1, centers.size(1), dtype=centers.dtype)
+        zero = torch.zeros(
+            1,
+            centers.size(1),
+            dtype=centers.dtype,
+        )
+
         self.register_buffer(
             "weight",
             torch.cat([centers, zero], dim=0),
@@ -163,7 +171,6 @@ class FrozenCenterEmbedding(nn.Module):
             self.weight,
             padding_idx=self.padding_idx,
         )
-
 
 class HeadSplitDistanceAwareAttention(nn.Module):
     """
@@ -574,13 +581,18 @@ class BPEVQWDistancePairAddLM(nn.Module):
         self.d_model = int(d_model)
         self.tie_weights = bool(tie_weights)
 
-        # BPE -> Linear
         self.tok_emb = nn.Embedding(
             self.token_vocab_size + 1,
             d_model,
             padding_idx=self.tok_pad_id,
         )
 
+        # BPE側の学習可能なNN
+        self.bpe_projection = nn.Linear(
+            d_model,
+            d_model,
+            bias=False,
+        )
         # VQW codebook center自体は固定。
         # L2正規化したcenterだけ、学習可能なLinearへ通す。
         center_dim = int(centers.size(1))
@@ -630,7 +642,10 @@ class BPEVQWDistancePairAddLM(nn.Module):
         # ==========================================
         # 1. BPE -> embeddingのみ（追加NNなし）
         # ==========================================
-        bpe_x = self.tok_emb(tok_in)
+        # BPE embedding -> learned NN
+        bpe_x = self.bpe_projection(
+            self.tok_emb(tok_in)
+        )
 
         # ==========================================
         # 2. VQW -> frozen center -> learned NN
