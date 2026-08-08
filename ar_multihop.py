@@ -646,7 +646,6 @@ class BPEVQWDistancePairAddLM(nn.Module):
         bpe_x = self.bpe_projection(
             self.tok_emb(tok_in)
         )
-
         # ==========================================
         # 2. VQW -> frozen center -> learned NN
         # ==========================================
