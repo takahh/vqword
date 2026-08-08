@@ -149,8 +149,11 @@ class FrozenCenterEmbedding(nn.Module):
     def __init__(self, centers):
         super().__init__()
 
-        # L2正規化せず、生のcodebook centerを使用
-        centers = centers.float()
+        centers = F.normalize(
+            centers.float(),
+            p=2,
+            dim=-1,
+        )
 
         self.padding_idx = int(centers.size(0))
         zero = torch.zeros(
