@@ -269,10 +269,6 @@ class HeadSplitDistanceAwareAttention(nn.Module):
             self.v_vqw_proj = None
             self.register_parameter("vqw_scale", None)
 
-        self.vqw_scale = nn.Parameter(
-            torch.tensor(float(vqw_init_scale))
-        )
-
         # 全headsをCATした後256次元へ
         self.out_proj = nn.Linear(
             d_model,
@@ -381,108 +377,87 @@ class HeadSplitDistanceAwareAttention(nn.Module):
             bpe_attn,
             vb,
         )
-
         # =====================================================
-        # VQW HEADS
+        # VQW HEADS / HEAD CAT
         # =====================================================
 
-        # VQW headでもQueryはBPE/shared hiddenから作る
-        qv = self._split_heads(
-            self.q_vqw_proj(x),
-            self.n_vqw_heads,
-        )
+        if self.n_vqw_heads > 0:
+            # VQW headでもQueryはBPE/shared hiddenから作る
+            qv = self._split_heads(
+                self.q_vqw_proj(x),
+                self.n_vqw_heads,
+            )
 
-        # K/VだけVQWから作る
-        kv = self._split_heads(
-            self.k_vqw_proj(vqw_features),
-            self.n_vqw_heads,
-        )
+            # K/VはVQW特徴から作る
+            kv = self._split_heads(
+                self.k_vqw_proj(vqw_features),
+                self.n_vqw_heads,
+            )
 
-        vv = self._split_heads(
-            self.v_vqw_proj(vqw_features),
-            self.n_vqw_heads,
-        )
+            vv = self._split_heads(
+                self.v_vqw_proj(vqw_features),
+                self.n_vqw_heads,
+            )
 
-        vqw_scores = torch.matmul(
-            qv,
-            kv.transpose(-2, -1),
-        ) / math.sqrt(self.head_dim)
+            vqw_scores = torch.matmul(
+                qv,
+                kv.transpose(-2, -1),
+            ) / math.sqrt(self.head_dim)
 
-        # -----------------------------------------
-        # HOP50:
-        #
-        # target=t
-        # query=t-1
-        #
-        # k=t-51
-        # q-k=50
-        #
-        # → 51個目からVQW使用
-        # -----------------------------------------
+            vqw_allowed = (
+                                  qpos - kpos
+                          ) >= self.hop
 
-        vqw_allowed = (
-                              qpos - kpos
-                      ) >= self.hop
-
-        vqw_scores = vqw_scores.masked_fill(
-            ~vqw_allowed[None, None, :, :],
-            float("-inf"),
-        )
-
-        # VQ IDが存在しない位置
-        vqw_scores = vqw_scores.masked_fill(
-            ~vqw_valid[:, None, None, :],
-            float("-inf"),
-        )
-
-        if key_padding_mask is not None:
             vqw_scores = vqw_scores.masked_fill(
-                key_padding_mask[:, None, None, :],
+                ~vqw_allowed[None, None, :, :],
                 float("-inf"),
             )
 
-        vqw_attn = torch.softmax(
-            vqw_scores,
-            dim=-1,
-        )
+            vqw_scores = vqw_scores.masked_fill(
+                ~vqw_valid[:, None, None, :],
+                float("-inf"),
+            )
 
-        # VQWを1個も利用できないqueryでは
-        # softmax(-inf...)がnanになるので0にする
-        vqw_attn = torch.nan_to_num(
-            vqw_attn,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
+            if key_padding_mask is not None:
+                vqw_scores = vqw_scores.masked_fill(
+                    key_padding_mask[:, None, None, :],
+                    float("-inf"),
+                )
 
-        vqw_attn = self.attn_dropout(
-            vqw_attn
-        )
+            vqw_attn = torch.softmax(
+                vqw_scores,
+                dim=-1,
+            )
 
-        vqw_out = torch.matmul(
-            vqw_attn,
-            vv,
-        )
+            vqw_attn = torch.nan_to_num(
+                vqw_attn,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
 
-        vqw_out = (
-            self.vqw_scale * vqw_out
-        )
+            vqw_attn = self.attn_dropout(
+                vqw_attn
+            )
 
-        # =====================================================
-        # HEAD CAT
-        # =====================================================
+            vqw_out = torch.matmul(
+                vqw_attn,
+                vv,
+            )
 
-        # [B, BPE_heads, L, HD]
-        # [B, VQW_heads, L, HD]
-        #
-        # ↓ head軸でCAT
-        #
-        # [B, total_heads, L, HD]
+            vqw_out = (
+                    self.vqw_scale * vqw_out
+            )
 
-        all_heads = torch.cat(
-            [bpe_out, vqw_out],
-            dim=1,
-        )
+            # 4 BPE heads + 4 VQW heads
+            all_heads = torch.cat(
+                [bpe_out, vqw_out],
+                dim=1,
+            )
+
+        else:
+            # 8 BPE heads + 0 VQW heads
+            all_heads = bpe_out
 
         merged = self._merge_heads(
             all_heads
