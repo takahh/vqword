@@ -705,7 +705,10 @@ class BPEVQWDistancePairAddLM(nn.Module):
             "bpe_logits": bpe_logits,
             "hidden": shared_h,
             "bpe_input": bpe_x,
-            "vqw_input": vqw_x,
+            "second_input": second_x,
+
+            # 古い解析コードとの互換性用
+            "vqw_input": second_x,
         }
 
 
