@@ -574,7 +574,15 @@ class BPEVQWDistancePairAddLM(nn.Module):
         )
 
         # BPE側の学習可能なNN
+        # 通常BPE attention用
         self.bpe_projection = nn.Linear(
+            d_model,
+            d_model,
+            bias=False,
+        )
+
+        # HOP制限付きBPE control枝用
+        self.distant_bpe_projection = nn.Linear(
             d_model,
             d_model,
             bias=False,
@@ -592,10 +600,7 @@ class BPEVQWDistancePairAddLM(nn.Module):
         )
 
         self.pos_emb = nn.Embedding(max_len, d_model)
-        if self.use_vqw:
-            attention_vqw_heads = n_heads // 2
-        else:
-            attention_vqw_heads = 0
+        attention_vqw_heads = n_heads // 2
         self.shared_blocks = nn.ModuleList([
             SingleHopTransformerBlock(
                 d_model=d_model,
