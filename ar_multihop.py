@@ -580,23 +580,18 @@ class BPEVQWDistancePairAddLM(nn.Module):
             d_model,
             padding_idx=self.tok_pad_id,
         )
-        # BPE -> 256
-        self.bpe_projection = nn.Linear(
-            d_model,
+
+        # VQW codebook center自体は固定。
+        # L2正規化したcenterだけ、学習可能なLinearへ通す。
+        center_dim = int(centers.size(1))
+
+        self.center_embedding = FrozenCenterEmbedding(centers)
+
+        self.vqw_projection = nn.Linear(
+            center_dim,
             d_model,
             bias=False,
         )
-
-        # VQW centerはlearned NNを通さず、そのまま使用する。
-        # FrozenCenterEmbedding内のL2 normalizeだけは維持される。
-        # したがってcodebook centerの次元はd_modelと一致する必要がある。
-        if int(centers.size(1)) != self.d_model:
-            raise ValueError(
-                "NN-only-to-BPE requires center_dim == d_model: "
-                f"center_dim={centers.size(1)}, d_model={self.d_model}"
-            )
-
-        self.center_embedding = FrozenCenterEmbedding(centers)
 
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.shared_blocks = nn.ModuleList([
@@ -633,21 +628,24 @@ class BPEVQWDistancePairAddLM(nn.Module):
         )[None, :]
 
         # ==========================================
-        # 1. BPE -> NN
+        # 1. BPE -> embeddingのみ（追加NNなし）
         # ==========================================
-        bpe_x = self.bpe_projection(
-            self.tok_emb(tok_in)
-        )
-        # [B,L,256]
+        bpe_x = self.tok_emb(tok_in)
 
         # ==========================================
-        # 2. VQW -> frozen center only（入力NNなし）
+        # 2. VQW -> frozen center -> learned NN
         # ==========================================
         vqw_valid = vq_in.ne(self.vq_pad_id)
 
         if self.use_vqw:
-            vqw_x = self.center_embedding(vq_in)
+            # center_embedding内でL2正規化済み
+            vqw_center = self.center_embedding(vq_in)
 
+            # VQW側だけ学習可能なLinearを通す
+            vqw_x = self.vqw_projection(vqw_center)
+
+            # bias=Falseなのでpaddingは元々0のままだが、
+            # 無効位置を明示的に0にしておく
             vqw_x = (
                     vqw_x
                     * vqw_valid.unsqueeze(-1).to(vqw_x.dtype)
@@ -869,14 +867,12 @@ def main():
         reference.get("token_vocab_size", 50257)
     )
 
-    print("[architecture] BPE->Linear, VQW->normalized frozen center (no learned input projection), distance-aware causal Transformer, BPE head")
-    print(f"[token vocab size] {token_vocab_size}")
-    print(f"[VQ vocab size] {vq_vocab_size}")
-    print(f"[use VQW] {bool(args.use_vqw)}")
-    print(f"[VQW initial scale] {args.vqw_init_scale}")
-    print(f"[HOP] {args.hop}")
-    print(f"[VQ range] {vq_min}..{vq_max}, used={torch.unique(vq_ids_flat).numel():,}")
-
+    print(
+        "[architecture] "
+        "BPE->learned embedding only, "
+        "VQW->normalized frozen center->Linear, "
+        "distance-aware causal Transformer, BPE head"
+    )
     random.shuffle(samples)
     n = len(samples)
     n_train = int(0.8 * n)
