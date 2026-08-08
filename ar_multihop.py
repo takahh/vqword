@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Input-CAT BPE-only autoregressive language model.
+NN-only-to-BPE autoregressive language model.
 
 Inputs:
-    BPE[t] embedding
-    Single-HOP VQ context from one frozen center table
+    learned projection of BPE[t] embedding
+    normalized frozen Single-HOP VQ center (no learned input projection)
 
 Fusion:
-    CAT(BPE embedding, aggregated multi-hop VQ context)
-    -> learned projection
+    BPE branch and raw VQW-center branch
+    -> distance-aware attention
     -> shared causal Transformer
     -> BPE[t+1] head only
 
@@ -17,8 +17,8 @@ Frozen:
 
 Trainable:
     - BPE embedding
-    - selected-HOP projection and scale
-    - input fusion projection
+    - BPE input projection
+    - VQW attention scale
     - shared causal Transformer
     - BPE output head
 """
@@ -587,14 +587,16 @@ class BPEVQWDistancePairAddLM(nn.Module):
             bias=False,
         )
 
-        # VQW -> 256
-        self.center_embedding = FrozenCenterEmbedding(centers)
+        # VQW centerはlearned NNを通さず、そのまま使用する。
+        # FrozenCenterEmbedding内のL2 normalizeだけは維持される。
+        # したがってcodebook centerの次元はd_modelと一致する必要がある。
+        if int(centers.size(1)) != self.d_model:
+            raise ValueError(
+                "NN-only-to-BPE requires center_dim == d_model: "
+                f"center_dim={centers.size(1)}, d_model={self.d_model}"
+            )
 
-        self.vqw_projection = nn.Linear(
-            centers.size(1),
-            d_model,
-            bias=False,
-        )
+        self.center_embedding = FrozenCenterEmbedding(centers)
 
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.shared_blocks = nn.ModuleList([
@@ -639,14 +641,12 @@ class BPEVQWDistancePairAddLM(nn.Module):
         # [B,L,256]
 
         # ==========================================
-        # 2. VQW -> NN
+        # 2. VQW -> frozen center only（入力NNなし）
         # ==========================================
         vqw_valid = vq_in.ne(self.vq_pad_id)
 
         if self.use_vqw:
-            vqw_x = self.vqw_projection(
-                self.center_embedding(vq_in)
-            )
+            vqw_x = self.center_embedding(vq_in)
 
             vqw_x = (
                     vqw_x
@@ -656,12 +656,8 @@ class BPEVQWDistancePairAddLM(nn.Module):
             vqw_x = torch.zeros_like(bpe_x)
             vqw_valid = torch.zeros_like(vqw_valid)
 
-        # ==========================================
-        # 3. 本当にCAT
-        # ==========================================
-        # [B,L,256] + [B,L,256]
-        #      ↓
-        # [B,L,512]
+        # Transformer本体への入力はBPE + positional embedding。
+        # VQWは別枝として各attention blockへ渡す。
         shared_h = (
                 bpe_x
                 + self.pos_emb(pos)
@@ -873,7 +869,7 @@ def main():
         reference.get("token_vocab_size", 50257)
     )
 
-    print("[architecture] BPE->Linear, VQW->Linear, CAT->MLP, causal Transformer, BPE head")
+    print("[architecture] BPE->Linear, VQW->normalized frozen center (no learned input projection), distance-aware causal Transformer, BPE head")
     print(f"[token vocab size] {token_vocab_size}")
     print(f"[VQ vocab size] {vq_vocab_size}")
     print(f"[use VQW] {bool(args.use_vqw)}")
@@ -1053,7 +1049,7 @@ def main():
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "architecture": "bpe_vqw_projection_cat_mlp_causal",
+            "architecture": "bpe_projection_raw_vqw_distance_attention_causal",
             "history": history,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
@@ -1080,3 +1076,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
