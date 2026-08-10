@@ -17,16 +17,44 @@ FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
 if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 {100k} {ar_seed} {hop}"
+  echo "Usage: $0 {25k|50k|100k} {center_scale} {hop}"
   echo
-  echo "Example:"
-  echo "  CENTER_SCALE=0 USE_VQW=1 VQW_INIT_SCALE=0.1 $0 100k 0 50"
+  echo "Examples:"
+  echo "  USE_VQW=1 VQW_INIT_SCALE=0.1 $0 25k 0.3 25"
+  echo "  USE_VQW=0 AR_SEED=1 $0 50k 1.0 50"
   exit 1
 fi
 
 VQ_CODEBOOK_LABEL="$1"
-AR_SEED="$2"
+CENTER_SCALE="$2"
 HOP="$3"
+
+AR_SEED="${AR_SEED:-0}"
+
+case "${VQ_CODEBOOK_LABEL}" in
+  25k)  VQ_CODEBOOK_SIZE=25000 ;;
+  50k)  VQ_CODEBOOK_SIZE=50000 ;;
+  100k) VQ_CODEBOOK_SIZE=100000 ;;
+  *)
+    echo "[error] expected codebook label: 25k, 50k, or 100k"
+    exit 1
+    ;;
+esac
+
+if ! [[ "${CENTER_SCALE}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+  echo "[error] center_scale must be a non-negative number: ${CENTER_SCALE}"
+  exit 1
+fi
+
+if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
+  echo "[error] hop must be a non-negative integer: ${HOP}"
+  exit 1
+fi
+
+if ! [[ "${AR_SEED}" =~ ^[0-9]+$ ]]; then
+  echo "[error] AR_SEED must be a non-negative integer: ${AR_SEED}"
+  exit 1
+fi
 
 case "${VQ_CODEBOOK_LABEL}" in
   100k) VQ_CODEBOOK_SIZE=100000 ;;
@@ -42,7 +70,6 @@ if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-CENTER_SCALE="${CENTER_SCALE:-0}"
 USE_VQW="${USE_VQW:-1}"
 VQW_INIT_SCALE="${VQW_INIT_SCALE:-0.1}"
 case "${USE_VQW}" in
@@ -67,10 +94,14 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
 
 AR_SCRIPT="/vqword/ar_multihop.py"
+
 HOP2=$(printf "%02d" "${HOP}")
-TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_SCALE}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+
+RUN="ar_inputcat_bpeonly_singlehop${HOP2}_usevqw${USE_VQW}_bpe${BPE_VOCAB_LABEL}_center${CENTER_SCALE}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_$(date +%Y%m%d_%H%M%S)"
+
 DATA_FILE="tinystories_vqword_${TAG}_ids.pt"
 CODEBOOK_FILE="wikitext103_vqword_${TAG}.pt"
+
 DATA_PATH="/vqword/${DATA_FILE}"
 CODEBOOK_PATH="/vqword/${CODEBOOK_FILE}"
 
