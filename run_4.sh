@@ -24,12 +24,53 @@ git pull
 # ============================================================
 # 共通設定
 # ============================================================
-CENTER_SCALE=0
-CENTER_LABEL=0
-
 BPE_VOCAB_LABEL=50257
-VQ_CODEBOOK_LABEL=100k
-VQ_CODEBOOK_SIZE=100000
+
+if [ "$#" -ne 3 ]; then
+  echo "Usage: $0 {25k|50k} {center_scale} {hop}"
+  echo
+  echo "Example:"
+  echo "  $0 25k 0.3 25"
+  exit 1
+fi
+
+VQ_CODEBOOK_LABEL="$1"
+CENTER_SCALE="$2"
+HOP="$3"
+
+case "${VQ_CODEBOOK_LABEL}" in
+  25k)
+    VQ_CODEBOOK_SIZE=25000
+    ;;
+  50k)
+    VQ_CODEBOOK_SIZE=50000
+    ;;
+  *)
+    echo "[error] codebook must be 25k or 50k: ${VQ_CODEBOOK_LABEL}"
+    exit 1
+    ;;
+esac
+
+case "${CENTER_SCALE}" in
+  0.3|1|1.0)
+    ;;
+  *)
+    echo "[error] center_scale must be 0.3 or 1: ${CENTER_SCALE}"
+    exit 1
+    ;;
+esac
+
+if [ "${CENTER_SCALE}" = "1.0" ]; then
+  CENTER_LABEL=1
+else
+  CENTER_LABEL="${CENTER_SCALE}"
+fi
+
+if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
+  echo "[error] hop must be a non-negative integer: ${HOP}"
+  exit 1
+fi
+
 DISCRETIZATION_SEED=0
 
 IVF_NLIST=256
@@ -48,21 +89,6 @@ ASSIGN_SCRIPT="/vqword/assign_vqword_ids.py"
 FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
 FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
-
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 {hop}"
-    echo
-    echo "Example:"
-    echo "  $0 100"
-    exit 1
-fi
-
-HOP="$1"
-
-if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
-    echo "[error] hop must be a non-negative integer: ${HOP}"
-    exit 1
-fi
 
 # ============================================================
 # BPE tokenizerを一度だけ取得・展開
@@ -334,5 +360,5 @@ EOF
 
 echo
 echo "============================================================"
-echo "[HOP 50 completed]"
+echo "[completed] CB=${VQ_CODEBOOK_LABEL} center=${CENTER_SCALE} HOP=${HOP}"
 echo "============================================================"
