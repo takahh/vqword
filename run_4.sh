@@ -25,11 +25,11 @@ git pull
 # 共通設定
 # ============================================================
 BPE_VOCAB_LABEL=50257
-
 if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 {25k|50k} {center_scale} {hop}"
+  echo "Usage: $0 {10k|25k|50k} {center_scale} {hop}"
   echo
-  echo "Example:"
+  echo "Examples:"
+  echo "  $0 10k 1 10"
   echo "  $0 25k 0.3 25"
   exit 1
 fi
@@ -39,6 +39,9 @@ CENTER_SCALE="$2"
 HOP="$3"
 
 case "${VQ_CODEBOOK_LABEL}" in
+  10k)
+    VQ_CODEBOOK_SIZE=10000
+    ;;
   25k)
     VQ_CODEBOOK_SIZE=25000
     ;;
@@ -46,7 +49,7 @@ case "${VQ_CODEBOOK_LABEL}" in
     VQ_CODEBOOK_SIZE=50000
     ;;
   *)
-    echo "[error] codebook must be 25k or 50k: ${VQ_CODEBOOK_LABEL}"
+    echo "[error] codebook must be 10k, 25k or 50k: ${VQ_CODEBOOK_LABEL}"
     exit 1
     ;;
 esac
