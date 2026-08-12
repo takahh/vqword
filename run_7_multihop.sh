@@ -105,6 +105,7 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
 
 AR_SCRIPT="/vqword/ar_multihop.py"
+
 HOP2=$(printf "%02d" "${HOP}")
 
 TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_LABEL}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
@@ -114,6 +115,7 @@ CODEBOOK_FILE="wikitext103_vqword_${TAG}.pt"
 
 DATA_PATH="/vqword/${DATA_FILE}"
 CODEBOOK_PATH="/vqword/${CODEBOOK_FILE}"
+
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 RUN="ar_inputcat_bpeonly_singlehop${HOP2}_usevqw${USE_VQW}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
@@ -157,11 +159,11 @@ if [ ! -s "${AR_SCRIPT}" ]; then
 fi
 
 python - \
-  "${DATA_PATH}" \
-  "${CODEBOOK_PATH}" \
-  "${HOP}" \
-  "${VQ_CODEBOOK_SIZE}" \
-  "${CENTER_SCALE}" <<'PY'
+    "${DATA_PATH}" \
+    "${CODEBOOK_PATH}" \
+    "${HOP}" \
+    "${VQ_CODEBOOK_SIZE}" \
+    "${CENTER_SCALE}" <<'PY'
 
 import sys
 import torch
@@ -278,33 +280,33 @@ echo "============================================================"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python "${AR_SCRIPT}" \
-  --hop_data "${DATA_PATH}" \
-  --hop_codebook "${CODEBOOK_PATH}" \
-  --hop "${HOP}" \
-  --batch_size "${BATCH_SIZE}" \
-  --epochs "${EPOCHS}" \
-  --lr "${LR}" \
-  --weight_decay "${WEIGHT_DECAY}" \
-  --d_model "${D_MODEL}" \
-  --n_layers "${N_LAYERS}" \
-  --n_heads "${N_HEADS}" \
-  --dropout "${DROPOUT}" \
-  --max_len "${MAX_LEN}" \
-  --seed "${AR_SEED}" \
-  --use_vqw "${USE_VQW}" \
-  --vqw_init_scale "${VQW_INIT_SCALE}" \
-  --out "${FINAL_PATH}" \
-  2>&1 | tee "${LOG_PATH}"
+    --hop_data "${DATA_PATH}" \
+    --hop_codebook "${CODEBOOK_PATH}" \
+    --hop "${HOP}" \
+    --batch_size "${BATCH_SIZE}" \
+    --epochs "${EPOCHS}" \
+    --lr "${LR}" \
+    --weight_decay "${WEIGHT_DECAY}" \
+    --d_model "${D_MODEL}" \
+    --n_layers "${N_LAYERS}" \
+    --n_heads "${N_HEADS}" \
+    --dropout "${DROPOUT}" \
+    --max_len "${MAX_LEN}" \
+    --seed "${AR_SEED}" \
+    --use_vqw "${USE_VQW}" \
+    --vqw_init_scale "${VQW_INIT_SCALE}" \
+    --out "${FINAL_PATH}" \
+    2>&1 | tee "${LOG_PATH}"
 
 for PATH_TO_CHECK in \
-  "${FINAL_PATH}" \
-  "${BEST_PATH}" \
-  "${LOG_PATH}"
+    "${FINAL_PATH}" \
+    "${BEST_PATH}" \
+    "${LOG_PATH}"
 do
-  if [ ! -s "${PATH_TO_CHECK}" ]; then
-    echo "[error] missing output: ${PATH_TO_CHECK}"
-    exit 1
-  fi
+    if [ ! -s "${PATH_TO_CHECK}" ]; then
+        echo "[error] missing output: ${PATH_TO_CHECK}"
+        exit 1
+    fi
 done
 
 grep -E '^\[epoch [0-9]+\]|^\[save best\]|^\[save final\]' \
