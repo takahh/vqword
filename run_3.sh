@@ -227,9 +227,9 @@ OUT="wikitext103_vqword_${TAG}.pt"
 DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
 IDS="wikitext103_vqword_${TAG}_ids.pt"
 
-OUT="wikitext103_vqword_${TAG}.pt"
-DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
-IDS="wikitext103_vqword_${TAG}_ids.pt"
+OUT_PATH="/vqword/${OUT}"
+DICTIONARY_PATH="/vqword/${DICTIONARY}"
+IDS_PATH="/vqword/${IDS}"
 
 echo "============================================================"
 echo "[train VQWord]"
