@@ -11,7 +11,7 @@ set -euo pipefail
 #   FTP_PASS='...' bash run_vqword_multihop_wikitext.sh 100k 0.0
 #
 # Arguments:
-#   $1: VQW codebook size: 25k|50k|100k|200k|300k
+# 　$1: VQW codebook size: 10k|25k|50k|100k|200k|300k
 #   $2: center scale
 # ============================================================
 
@@ -36,11 +36,11 @@ cd /vqword
 git pull
 
 if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale} {hop}"
-  echo
-  echo "Example:"
-  echo "  FTP_PASS='your-password' $0 100k 0.0 5"
-  exit 1
+    echo "Usage: $0 {10k|25k|50k|100k|200k|300k} {center_scale} {hop}"
+    echo
+    echo "Example:"
+    echo "  FTP_PASS='your-password' $0 10k 1.0 10"
+    exit 1
 fi
 
 CB_SIZE="$1"
@@ -83,31 +83,35 @@ print(f"{value:g}")
 )"
 
 case "${CB_SIZE}" in
-  25k)
-    VQ_CODEBOOK_LABEL=25k
-    VQ_CODEBOOK_SIZE=25000
-    ;;
-  50k)
-    VQ_CODEBOOK_LABEL=50k
-    VQ_CODEBOOK_SIZE=50000
-    ;;
-  100k)
-    VQ_CODEBOOK_LABEL=100k
-    VQ_CODEBOOK_SIZE=100000
-    ;;
-  200k)
-    VQ_CODEBOOK_LABEL=200k
-    VQ_CODEBOOK_SIZE=200000
-    ;;
-  300k)
-    VQ_CODEBOOK_LABEL=300k
-    VQ_CODEBOOK_SIZE=300000
-    ;;
-  *)
-    echo "[error] Invalid codebook size: ${CB_SIZE}"
-    echo "Usage: $0 {25k|50k|100k|200k|300k} {center_scale}"
-    exit 1
-    ;;
+    10k)
+        VQ_CODEBOOK_LABEL=10k
+        VQ_CODEBOOK_SIZE=10000
+        ;;
+    25k)
+        VQ_CODEBOOK_LABEL=25k
+        VQ_CODEBOOK_SIZE=25000
+        ;;
+    50k)
+        VQ_CODEBOOK_LABEL=50k
+        VQ_CODEBOOK_SIZE=50000
+        ;;
+    100k)
+        VQ_CODEBOOK_LABEL=100k
+        VQ_CODEBOOK_SIZE=100000
+        ;;
+    200k)
+        VQ_CODEBOOK_LABEL=200k
+        VQ_CODEBOOK_SIZE=200000
+        ;;
+    300k)
+        VQ_CODEBOOK_LABEL=300k
+        VQ_CODEBOOK_SIZE=300000
+        ;;
+    *)
+        echo "[error] Invalid codebook size: ${CB_SIZE}"
+        echo "Usage: $0 {10k|25k|50k|100k|200k|300k} {center_scale} {hop}"
+        exit 1
+        ;;
 esac
 
 # ============================================================
@@ -223,9 +227,9 @@ OUT="wikitext103_vqword_${TAG}.pt"
 DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
 IDS="wikitext103_vqword_${TAG}_ids.pt"
 
-OUT_PATH="/vqword/${OUT}"
-DICTIONARY_PATH="/vqword/${DICTIONARY}"
-IDS_PATH="/vqword/${IDS}"
+OUT="wikitext103_vqword_${TAG}.pt"
+DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
+IDS="wikitext103_vqword_${TAG}_ids.pt"
 
 echo "============================================================"
 echo "[train VQWord]"
@@ -300,11 +304,11 @@ bye
 EOF_LFTP
 
 printf "%s\t%s\t%s\t%s\n" \
-  "${HOP}" \
-  "${OUT}" \
-  "${DICTIONARY}" \
-  "${IDS}" \
-  >> "${MANIFEST}"
+    "${HOP}" \
+    "${OUT}" \
+    "${DICTIONARY}" \
+    "${IDS}" \
+    >> "${MANIFEST}"
 
 echo "============================================================"
 echo "[completed hop ${HOP}]"
