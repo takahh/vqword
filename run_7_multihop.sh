@@ -19,9 +19,10 @@ FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
 if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 {25k|50k|100k} {center_scale} {hop}"
+  echo "Usage: $0 {10k|25k|50k|100k} {center_scale} {hop}"
   echo
   echo "Examples:"
+  echo "  USE_VQW=1 VQW_INIT_SCALE=1 $0 10k 1 10"
   echo "  USE_VQW=1 VQW_INIT_SCALE=0.1 $0 25k 0.3 25"
   echo "  USE_VQW=0 AR_SEED=1 $0 50k 1 50"
   exit 1
@@ -36,6 +37,9 @@ USE_VQW="${USE_VQW:-1}"
 VQW_INIT_SCALE="${VQW_INIT_SCALE:-0.1}"
 
 case "${VQ_CODEBOOK_LABEL}" in
+  10k)
+    VQ_CODEBOOK_SIZE=10000
+    ;;
   25k)
     VQ_CODEBOOK_SIZE=25000
     ;;
@@ -46,7 +50,7 @@ case "${VQ_CODEBOOK_LABEL}" in
     VQ_CODEBOOK_SIZE=100000
     ;;
   *)
-    echo "[error] expected codebook label: 25k, 50k, or 100k"
+    echo "[error] expected codebook label: 10k, 25k, 50k, or 100k"
     exit 1
     ;;
 esac
