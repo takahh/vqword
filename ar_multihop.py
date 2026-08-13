@@ -41,15 +41,16 @@ class SequenceARDataset(Dataset):
     tok_in[:, q] から tok_y[:, q] を予測する。
     tok_y[:, q] = tok_inの次トークン。
 
-    各入力位置には、その位置自身のselected-HOP VQ IDを保持する。
-    実際にどのqueryから使用可能かはattention内で距離制御する。
+    各入力位置には、その位置自身についてHOP 0..10で得た
+    11種類のVQ IDを保持する。実際に使うHOPはattention内で
+    query-key距離から選択する。
     """
 
     def __init__(
         self,
         samples,
         token_ids_flat,
-        vq_ids_flat,
+        vq_ids_flat_by_hop,
         tok_pad_id,
         vq_pad_id,
         max_len=255,
@@ -59,7 +60,17 @@ class SequenceARDataset(Dataset):
         self.vq_pad_id = int(vq_pad_id)
 
         token_ids_flat = token_ids_flat.long().reshape(-1)
-        vq_ids_flat = vq_ids_flat.long().reshape(-1)
+        if len(vq_ids_flat_by_hop) != 11:
+            raise ValueError("Expected VQ ID tensors for HOP 0..10")
+        vq_ids_flat_by_hop = [
+            ids.long().reshape(-1) for ids in vq_ids_flat_by_hop
+        ]
+        if any(ids.numel() != token_ids_flat.numel()
+               for ids in vq_ids_flat_by_hop):
+            raise ValueError("Token/VQ flattened lengths do not match")
+
+        self.token_ids_flat = token_ids_flat
+        self.vq_ids_flat_by_hop = vq_ids_flat_by_hop
 
         self.examples = []
 
@@ -84,66 +95,47 @@ class SequenceARDataset(Dataset):
                     end,
                 )
 
-                tokens = token_ids_flat[
-                    chunk_start:chunk_end
-                ]
-
-                if tokens.numel() < 2:
+                length = chunk_end - chunk_start - 1
+                if length < 1:
                     continue
-
-                tok_in = tokens[:-1]
-                tok_y = tokens[1:]
-
-                # 入力位置そのもののselected-HOP ID
-                vq_in = vq_ids_flat[
-                    chunk_start:chunk_end - 1
-                ]
-
-                length = tok_in.numel()
-
-                padded_tok_in = torch.full(
-                    (self.max_len,),
-                    self.tok_pad_id,
-                    dtype=torch.long,
-                )
-
-                padded_vq_in = torch.full(
-                    (self.max_len,),
-                    self.vq_pad_id,
-                    dtype=torch.long,
-                )
-
-                padded_tok_y = torch.full(
-                    (self.max_len,),
-                    -100,
-                    dtype=torch.long,
-                )
-
-                attention_mask = torch.zeros(
-                    self.max_len,
-                    dtype=torch.bool,
-                )
-
-                # 右padding
-                padded_tok_in[:length] = tok_in
-                padded_vq_in[:length] = vq_in
-                padded_tok_y[:length] = tok_y
-                attention_mask[:length] = True
-
-                self.examples.append(
-                    (
-                        padded_tok_in,
-                        padded_vq_in,
-                        padded_tok_y,
-                        attention_mask,
-                    )
-                )
+                self.examples.append((chunk_start, length))
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, index):
-        return self.examples[index]
+        chunk_start, length = self.examples[index]
+        input_end = chunk_start + length
+
+        padded_tok_in = torch.full(
+            (self.max_len,), self.tok_pad_id, dtype=torch.long
+        )
+        padded_vq_in = torch.full(
+            (11, self.max_len), self.vq_pad_id, dtype=torch.long
+        )
+        padded_tok_y = torch.full(
+            (self.max_len,), -100, dtype=torch.long
+        )
+        attention_mask = torch.zeros(self.max_len, dtype=torch.bool)
+
+        padded_tok_in[:length] = self.token_ids_flat[
+            chunk_start:input_end
+        ]
+        padded_tok_y[:length] = self.token_ids_flat[
+            chunk_start + 1:input_end + 1
+        ]
+        for hop_index, ids in enumerate(self.vq_ids_flat_by_hop):
+            padded_vq_in[hop_index, :length] = ids[
+                chunk_start:input_end
+            ]
+        attention_mask[:length] = True
+
+        return (
+            padded_tok_in,
+            padded_vq_in,
+            padded_tok_y,
+            attention_mask,
+        )
 
 class FrozenCenterEmbedding(nn.Module):
     def __init__(self, centers):
@@ -177,7 +169,8 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         BPE K/V, normal causal attention
 
     Remaining heads:
-        VQW K/V, only q-k >= hop
+        VQW K/V, with distance-dependent HOP:
+        distance 1..10 -> HOP 0..9, distance >=11 -> HOP10
 
     Queryは全headともBPE/shared hiddenから作る。
     これによりquery位置自身のVQWからのリークを防ぐ。
@@ -188,7 +181,6 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         d_model,
         n_heads,
         dropout=0.1,
-        hop=50,
         n_vqw_heads=None,
         vqw_init_scale=0.1,
     ):
@@ -202,7 +194,6 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         self.d_model = int(d_model)
         self.n_heads = int(n_heads)
         self.head_dim = d_model // n_heads
-        self.hop = int(hop)
 
         # 8 headsならデフォルト4 BPE + 4 VQW
         if n_vqw_heads is None:
@@ -387,35 +378,49 @@ class HeadSplitDistanceAwareAttention(nn.Module):
                 self.n_vqw_heads,
             )
 
-            # K/VはVQW特徴から作る
+            # vqw_features: [B, 11, L, D]
+            # K/V候補をHOPごとに作り、query-key距離で一つを選ぶ。
             kv = self._split_heads(
-                self.k_vqw_proj(vqw_features),
+                self.k_vqw_proj(vqw_features).reshape(B * 11, L, -1),
                 self.n_vqw_heads,
-            )
+            ).reshape(B, 11, self.n_vqw_heads, L, self.head_dim)
 
             vv = self._split_heads(
-                self.v_vqw_proj(vqw_features),
+                self.v_vqw_proj(vqw_features).reshape(B * 11, L, -1),
                 self.n_vqw_heads,
-            )
+            ).reshape(B, 11, self.n_vqw_heads, L, self.head_dim)
 
-            vqw_scores = torch.matmul(
-                qv,
-                kv.transpose(-2, -1),
-            ) / math.sqrt(self.head_dim)
-
-            vqw_allowed = (
-                                  qpos - kpos
-                          ) >= self.hop
-
-            vqw_scores = vqw_scores.masked_fill(
-                ~vqw_allowed[None, None, :, :],
+            distance = qpos - kpos
+            vqw_scores = torch.full(
+                (B, self.n_vqw_heads, L, L),
                 float("-inf"),
+                device=device,
+                dtype=qv.dtype,
             )
+            pair_masks = []
 
-            vqw_scores = vqw_scores.masked_fill(
-                ~vqw_valid[:, None, None, :],
-                float("-inf"),
-            )
+            # 各(q, k)ペアに対応するHOPのscoreだけを採用する。
+            # 巨大な[B,L,L,11,D]テンソルを作らないためHOPごとに処理。
+            for hop_index in range(11):
+                if hop_index < 10:
+                    pair_mask = distance.eq(hop_index + 1)
+                else:
+                    pair_mask = distance.ge(11)
+                pair_masks.append(pair_mask)
+
+                hop_scores = torch.matmul(
+                    qv,
+                    kv[:, hop_index].transpose(-2, -1),
+                ) / math.sqrt(self.head_dim)
+                allowed = (
+                    pair_mask[None, None, :, :]
+                    & vqw_valid[:, hop_index, None, None, :]
+                )
+                vqw_scores = torch.where(
+                    allowed,
+                    hop_scores,
+                    vqw_scores,
+                )
 
             if key_padding_mask is not None:
                 vqw_scores = vqw_scores.masked_fill(
@@ -439,10 +444,13 @@ class HeadSplitDistanceAwareAttention(nn.Module):
                 vqw_attn
             )
 
-            vqw_out = torch.matmul(
-                vqw_attn,
-                vv,
-            )
+            vqw_out = torch.zeros_like(qv)
+            for hop_index, pair_mask in enumerate(pair_masks):
+                hop_attn = vqw_attn * pair_mask[None, None, :, :]
+                vqw_out = vqw_out + torch.matmul(
+                    hop_attn,
+                    vv[:, hop_index],
+                )
 
             vqw_out = (
                     self.vqw_scale * vqw_out
@@ -471,7 +479,6 @@ class SingleHopTransformerBlock(nn.Module):
             n_heads,
             dropout=0.1,
             vqw_init_scale=0.1,
-            hop=50,
             n_vqw_heads=None,
     ):
         super().__init__()
@@ -482,7 +489,6 @@ class SingleHopTransformerBlock(nn.Module):
             d_model=d_model,
             n_heads=n_heads,
             dropout=dropout,
-            hop=hop,
             n_vqw_heads=n_vqw_heads,
             vqw_init_scale=vqw_init_scale,
         )
@@ -527,16 +533,16 @@ class SingleHopTransformerBlock(nn.Module):
 
 class BPEVQWDistancePairAddLM(nn.Module):
     """
-    Projection -> CAT -> MLP -> causal Transformer.
+    BPE causal Transformer with a distance-dependent VQW K/V branch.
 
-    To keep the same no-leak condition as the previous distance-aware
-    attention, VQW at source position k is shifted to input position k+hop.
-    Therefore query q can only receive VQW sources k <= q-hop.
+    For query q and key k, distance 1..10 selects HOP 0..9;
+    distance 11 or larger selects HOP10. Distance 0 is never allowed,
+    so the VQW branch cannot leak the current position.
     """
 
     def __init__(
         self,
-        centers,
+        centers_by_hop,
         token_vocab_size,
         target_vq_vocab_size,
         d_model=256,
@@ -547,15 +553,10 @@ class BPEVQWDistancePairAddLM(nn.Module):
         tie_weights=False,
         use_vqw=False,
         vqw_init_scale=0.1,
-        hop=10,
     ):
         super().__init__()
 
         self.use_vqw = bool(use_vqw)
-        self.hop = int(hop)
-        if self.hop < 0:
-            raise ValueError(f"hop must be non-negative: {self.hop}")
-
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(target_vq_vocab_size)
         self.tok_pad_id = self.token_vocab_size
@@ -585,9 +586,15 @@ class BPEVQWDistancePairAddLM(nn.Module):
         )
         # VQW codebook center自体は固定。
         # L2正規化したcenterだけ、学習可能なLinearへ通す。
-        center_dim = int(centers.size(1))
+        if len(centers_by_hop) != 11:
+            raise ValueError("Expected codebook centers for HOP 0..10")
+        center_dim = int(centers_by_hop[0].size(1))
+        if any(int(c.size(1)) != center_dim for c in centers_by_hop):
+            raise ValueError("All HOP codebooks must have the same center dimension")
 
-        self.center_embedding = FrozenCenterEmbedding(centers)
+        self.center_embeddings = nn.ModuleList([
+            FrozenCenterEmbedding(centers) for centers in centers_by_hop
+        ])
 
         self.vqw_projection = nn.Linear(
             center_dim,
@@ -603,7 +610,6 @@ class BPEVQWDistancePairAddLM(nn.Module):
                 n_heads=n_heads,
                 dropout=dropout,
                 vqw_init_scale=vqw_init_scale,
-                hop=self.hop,
                 n_vqw_heads=attention_vqw_heads,
             )
             for _ in range(n_layers)
@@ -650,7 +656,10 @@ class BPEVQWDistancePairAddLM(nn.Module):
             # frozen VQW center -> dedicated Linear
             second_valid = vq_in.ne(self.vq_pad_id)
 
-            vqw_center = self.center_embedding(vq_in)
+            vqw_center = torch.stack([
+                self.center_embeddings[hop_index](vq_in[:, hop_index])
+                for hop_index in range(11)
+            ], dim=1)
 
             second_x = self.vqw_projection(
                 vqw_center
@@ -674,6 +683,10 @@ class BPEVQWDistancePairAddLM(nn.Module):
                     second_x
                     * second_valid.unsqueeze(-1).to(second_x.dtype)
             )
+
+            # attention側の共通インターフェース [B, 11, L, D]
+            second_x = second_x[:, None, :, :].expand(-1, 11, -1, -1)
+            second_valid = second_valid[:, None, :].expand(-1, 11, -1)
 
         # Transformer本体への入力はBPE + positional embedding。
         # VQWは別枝として各attention blockへ渡す。
@@ -797,20 +810,20 @@ def main():
     ap = argparse.ArgumentParser()
 
     ap.add_argument(
-        "--hop_data",
+        "--hop_data_pattern",
         required=True,
-        help="Selected-HOP TinyStories VQ ID file",
+        help=(
+            "VQ ID path pattern for HOP 0..10. "
+            "Use {hop:02d}, e.g. /data/...bilateral{hop:02d}..._ids.pt"
+        ),
     )
     ap.add_argument(
-        "--hop_codebook",
+        "--hop_codebook_pattern",
         required=True,
-        help="Selected-HOP codebook checkpoint file",
-    )
-    ap.add_argument(
-        "--hop",
-        type=int,
-        required=True,
-        help="HOP number and minimum query-key distance for VQW use",
+        help=(
+            "Codebook path pattern for HOP 0..10. "
+            "Use {hop:02d}, e.g. /data/...bilateral{hop:02d}....pt"
+        ),
     )
     ap.add_argument(
         "--vqw_init_scale",
@@ -842,9 +855,6 @@ def main():
     ap.add_argument("--tie_weights", action="store_true")
 
     args = ap.parse_args()
-    if args.hop < 0:
-        raise ValueError(f"hop must be non-negative: {args.hop}")
-
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -855,37 +865,70 @@ def main():
     )
     print(f"[device] {device}")
 
-    reference = torch.load(
-        args.hop_data, map_location="cpu", weights_only=False
-    )
+    hop_data_paths = [
+        args.hop_data_pattern.format(hop=hop) for hop in range(11)
+    ]
+    hop_codebook_paths = [
+        args.hop_codebook_pattern.format(hop=hop) for hop in range(11)
+    ]
+
+    references = [
+        torch.load(path, map_location="cpu", weights_only=False)
+        for path in hop_data_paths
+    ]
+    reference = references[10]
     samples = list(reference["samples"])
     token_ids_flat = reference["token_ids_flat"].long().reshape(-1)
-    vq_ids_flat = reference["vq_ids_flat"].long().reshape(-1)
+    vq_ids_flat_by_hop = []
+    centers_by_hop = []
+    vq_vocab_sizes = []
 
-    recorded_hop = int(reference.get("hop", -1))
-    if recorded_hop != args.hop:
-        raise ValueError(
-            f"Expected HOP{args.hop} data, metadata says HOP{recorded_hop}"
-        )
+    reference_sample_bounds = [
+        (int(s["start"]), int(s["end"])) for s in samples
+    ]
+    for hop, (hop_reference, codebook_path) in enumerate(
+        zip(references, hop_codebook_paths)
+    ):
+        recorded_hop = int(hop_reference.get("hop", -1))
+        if recorded_hop != hop:
+            raise ValueError(
+                f"Expected HOP{hop} data, metadata says HOP{recorded_hop}"
+            )
+        hop_tokens = hop_reference["token_ids_flat"].long().reshape(-1)
+        if not torch.equal(hop_tokens, token_ids_flat):
+            raise ValueError(f"HOP{hop}: token_ids_flat differs from HOP10")
+        hop_bounds = [
+            (int(s["start"]), int(s["end"]))
+            for s in hop_reference["samples"]
+        ]
+        if hop_bounds != reference_sample_bounds:
+            raise ValueError(f"HOP{hop}: sample boundaries differ from HOP10")
 
-    raw = torch.load(
-        args.hop_codebook, map_location="cpu", weights_only=False
-    )
-    codebook_hop = int(raw.get("args", {}).get("hop", -1))
-    if codebook_hop != args.hop:
-        raise ValueError(
-            f"Expected HOP{args.hop} codebook, metadata says HOP{codebook_hop}"
+        raw = torch.load(
+            codebook_path, map_location="cpu", weights_only=False
         )
-    centers = raw["global_centers"].float()
-    vq_vocab_size = int(centers.size(0))
+        codebook_hop = int(raw.get("args", {}).get("hop", -1))
+        if codebook_hop != hop:
+            raise ValueError(
+                f"Expected HOP{hop} codebook, metadata says HOP{codebook_hop}"
+            )
+        centers = raw["global_centers"].float()
+        ids = hop_reference["vq_ids_flat"].long().reshape(-1)
+        vocab_size = int(centers.size(0))
+        vq_min = int(ids.min().item())
+        vq_max = int(ids.max().item())
+        if vq_min < 0 or vq_max >= vocab_size:
+            raise ValueError(
+                f"HOP{hop}: VQ IDs out of range: "
+                f"{vq_min}..{vq_max}, vocab={vocab_size}"
+            )
+        vq_ids_flat_by_hop.append(ids)
+        centers_by_hop.append(centers)
+        vq_vocab_sizes.append(vocab_size)
 
-    vq_min = int(vq_ids_flat.min().item())
-    vq_max = int(vq_ids_flat.max().item())
-    if vq_min < 0 or vq_max >= vq_vocab_size:
-        raise ValueError(
-            f"HOP{args.hop}: VQ IDs out of range: "
-            f"{vq_min}..{vq_max}, vocab={vq_vocab_size}"
-        )
+    if len(set(vq_vocab_sizes)) != 1:
+        raise ValueError(f"HOP codebook sizes differ: {vq_vocab_sizes}")
+    vq_vocab_size = vq_vocab_sizes[0]
 
     token_vocab_size = int(
         reference.get("token_vocab_size", 50257)
@@ -894,8 +937,8 @@ def main():
     print(
         "[architecture] "
         "BPE->learned embedding only, "
-        "VQW->normalized frozen center->Linear, "
-        "distance-aware causal Transformer, BPE head"
+        "VQW HOP0..10->frozen center->shared Linear, "
+        "distance-mapped causal Transformer, BPE head"
     )
     random.shuffle(samples)
     n = len(samples)
@@ -912,7 +955,7 @@ def main():
     train_ds = SequenceARDataset(
         samples=train_samples,
         token_ids_flat=token_ids_flat,
-        vq_ids_flat=vq_ids_flat,
+        vq_ids_flat_by_hop=vq_ids_flat_by_hop,
         tok_pad_id=tok_pad_id,
         vq_pad_id=vq_pad_id,
         max_len=args.max_len,
@@ -921,7 +964,7 @@ def main():
     valid_ds = SequenceARDataset(
         samples=valid_samples,
         token_ids_flat=token_ids_flat,
-        vq_ids_flat=vq_ids_flat,
+        vq_ids_flat_by_hop=vq_ids_flat_by_hop,
         tok_pad_id=tok_pad_id,
         vq_pad_id=vq_pad_id,
         max_len=args.max_len,
@@ -930,7 +973,7 @@ def main():
     test_ds = SequenceARDataset(
         samples=test_samples,
         token_ids_flat=token_ids_flat,
-        vq_ids_flat=vq_ids_flat,
+        vq_ids_flat_by_hop=vq_ids_flat_by_hop,
         tok_pad_id=tok_pad_id,
         vq_pad_id=vq_pad_id,
         max_len=args.max_len,
@@ -951,7 +994,7 @@ def main():
     test_loader = make_loader(test_ds, False)
 
     model = BPEVQWDistancePairAddLM(
-        centers=centers,
+        centers_by_hop=centers_by_hop,
         token_vocab_size=token_vocab_size,
         target_vq_vocab_size=vq_vocab_size,
         d_model=args.d_model,
@@ -965,7 +1008,6 @@ def main():
         tie_weights=args.tie_weights,
         use_vqw=bool(args.use_vqw),
         vqw_init_scale=args.vqw_init_scale,
-        hop=args.hop,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -1075,9 +1117,12 @@ def main():
             "vq_vocab_size": vq_vocab_size,
             "tok_pad_id": tok_pad_id,
             "vq_pad_id": vq_pad_id,
-            "hop": args.hop,
-            "hop_data_source": args.hop_data,
-            "hop_codebook_source": args.hop_codebook,
+            "hop_distance_mapping": {
+                "distance_1_to_10": "HOP0_to_HOP9",
+                "distance_11_plus": "HOP10",
+            },
+            "hop_data_sources": hop_data_paths,
+            "hop_codebook_sources": hop_codebook_paths,
             "vq_centers_frozen": True,
             "vq_used_as_input_only": True,
             "last_valid": valid_metrics,
@@ -1096,4 +1141,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
