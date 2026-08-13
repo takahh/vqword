@@ -977,7 +977,7 @@ def main():
     # Parent launcher: execute ten fully independent discretization runs.
     # Each child saves model/dictionary/ID data with a hop-specific filename.
     if args.all_hops:
-        if args.min_hop < 1 or args.max_hop < args.min_hop:
+        if args.min_hop < 0 or args.max_hop < args.min_hop:
             raise ValueError(
                 f"invalid hop range: min_hop={args.min_hop}, max_hop={args.max_hop}"
             )
