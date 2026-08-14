@@ -22,9 +22,9 @@ if [ "$#" -ne 3 ]; then
   echo "Usage: $0 {10k|25k|50k|100k} {center_scale} 10"
   echo
   echo "Examples:"
-  echo "  USE_VQW=1 PURE_BPE_MODE=0 VQW_INIT_SCALE=1 $0 10k 1 10"
-  echo "  USE_VQW=0 PURE_BPE_MODE=0 VQW_INIT_SCALE=1 $0 10k 1 10"
-  echo "  USE_VQW=0 PURE_BPE_MODE=1 $0 10k 1 10"
+  echo "  USE_VQW=1 PURE_BPE_MODE=0 SAMIDARE_HOP=1 VQW_INIT_SCALE=1 $0 10k 1 10"
+  echo "  USE_VQW=0 PURE_BPE_MODE=0 SAMIDARE_HOP=0 VQW_INIT_SCALE=1 $0 10k 1 10"
+  echo "  USE_VQW=0 PURE_BPE_MODE=1 SAMIDARE_HOP=0 $0 10k 1 10"
   exit 1
 fi
 
@@ -39,6 +39,7 @@ DISTANT_HOP="$3"
 AR_SEED="${AR_SEED:-0}"
 USE_VQW="${USE_VQW:-1}"
 PURE_BPE_MODE="${PURE_BPE_MODE:-0}"
+SAMIDARE_HOP="${SAMIDARE_HOP:-${USE_VQW}}"
 VQW_INIT_SCALE="${VQW_INIT_SCALE:-0.1}"
 
 # 距離1..9にはHOP1..9、距離10以上にはHOP10を使う。
@@ -89,8 +90,27 @@ case "${PURE_BPE_MODE}" in
     ;;
 esac
 
+case "${SAMIDARE_HOP}" in
+  0|1) ;;
+  *)
+    echo "[error] SAMIDARE_HOP must be 0 or 1"
+    exit 1
+    ;;
+esac
+
 if [ "${PURE_BPE_MODE}" = "1" ] && [ "${USE_VQW}" != "0" ]; then
   echo "[error] PURE_BPE_MODE=1 requires USE_VQW=0"
+  exit 1
+fi
+
+# SAMIDARE_HOP=0では代替HOP割り当てを定義せず、HOPは不使用。
+if [ "${USE_VQW}" = "1" ] && [ "${SAMIDARE_HOP}" != "1" ]; then
+  echo "[error] USE_VQW=1 requires SAMIDARE_HOP=1"
+  exit 1
+fi
+
+if [ "${USE_VQW}" = "0" ] && [ "${SAMIDARE_HOP}" != "0" ]; then
+  echo "[error] USE_VQW=0 requires SAMIDARE_HOP=0"
   exit 1
 fi
 
@@ -352,7 +372,7 @@ PY
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-RUN="ar_inputcat_bpeonly_multihop01to10_usevqw${USE_VQW}_purebpe${PURE_BPE_MODE}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
+RUN="ar_inputcat_bpeonly_multihop01to10_usevqw${USE_VQW}_purebpe${PURE_BPE_MODE}_samidare${SAMIDARE_HOP}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
@@ -370,6 +390,7 @@ echo "data pattern          = ${DATA_PATTERN}"
 echo "codebook pattern      = ${CODEBOOK_PATTERN}"
 echo "use VQW               = ${USE_VQW}"
 echo "pure BPE mode         = ${PURE_BPE_MODE}"
+echo "samidare HOP          = ${SAMIDARE_HOP}"
 echo "VQW initial scale     = ${VQW_INIT_SCALE}"
 echo "center scale          = ${CENTER_SCALE}"
 echo "codebook size         = ${VQ_CODEBOOK_SIZE}"
@@ -398,6 +419,7 @@ python "${AR_SCRIPT}" \
   --seed "${AR_SEED}" \
   --use_vqw "${USE_VQW}" \
   --pure_bpe_mode "${PURE_BPE_MODE}" \
+  --samidare_hop "${SAMIDARE_HOP}" \
   --vqw_init_scale "${VQW_INIT_SCALE}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
