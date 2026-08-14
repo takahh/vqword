@@ -19,7 +19,7 @@ FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
 if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 {10k|25k|50k|100k} {center_scale} 10"
+  echo "Usage: $0 {10k|25k|50k|100k} {center_scale} {1..10}"
   echo
   echo "Examples:"
   echo "  USE_VQW=1 PURE_BPE_MODE=0 SAMIDARE_HOP=1 VQW_INIT_SCALE=1 $0 10k 1 10"
@@ -42,10 +42,10 @@ PURE_BPE_MODE="${PURE_BPE_MODE:-0}"
 SAMIDARE_HOP="${SAMIDARE_HOP:-${USE_VQW}}"
 VQW_INIT_SCALE="${VQW_INIT_SCALE:-0.1}"
 
-# 距離1..9にはHOP1..9、距離10以上にはHOP10を使う。
-# 旧runnerとの3引数互換を保つため、第3引数は10だけを受け付ける。
-if [ "${DISTANT_HOP}" != "10" ]; then
-  echo "[error] this multi-HOP runner requires the third argument to be 10"
+# SAMIDARE_HOP=0では、第3引数のHOP未満の距離をマスクし、
+# 指定HOP距離以上だけで固定HOPを使う。
+if ! [[ "${DISTANT_HOP}" =~ ^([1-9]|10)$ ]]; then
+  echo "[error] distant_hop must be an integer from 1 to 10"
   exit 1
 fi
 
@@ -100,16 +100,6 @@ esac
 
 if [ "${PURE_BPE_MODE}" = "1" ] && [ "${USE_VQW}" != "0" ]; then
   echo "[error] PURE_BPE_MODE=1 requires USE_VQW=0"
-  exit 1
-fi
-
-if [ "${USE_VQW}" = "1" ] && [ "${SAMIDARE_HOP}" != "1" ]; then
-  echo "[error] USE_VQW=1 requires SAMIDARE_HOP=1"
-  exit 1
-fi
-
-if [ "${USE_VQW}" = "0" ] && [ "${SAMIDARE_HOP}" != "0" ]; then
-  echo "[error] USE_VQW=0 requires SAMIDARE_HOP=0"
   exit 1
 fi
 
@@ -371,7 +361,7 @@ PY
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-RUN="ar_inputcat_bpeonly_multihop01to10_usevqw${USE_VQW}_purebpe${PURE_BPE_MODE}_samidare${SAMIDARE_HOP}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
+RUN="ar_inputcat_bpeonly_multihop01to10_usevqw${USE_VQW}_purebpe${PURE_BPE_MODE}_samidare${SAMIDARE_HOP}_distanthop${DISTANT_HOP}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
@@ -383,13 +373,20 @@ LOG_PATH="/vqword/${RUN}.log"
 
 echo "============================================================"
 echo "[start multi-HOP BPE-only AR training]"
-echo "VQW distance mapping  = 1:HOP1 ... 9:HOP9, 10+:HOP10"
+if [ "${SAMIDARE_HOP}" = "1" ]; then
+  echo "VQW distance mapping  = 1:HOP1 ... 10:HOP10, 11+:HOP10"
+else
+  echo "VQW distance mapping  = distance ${DISTANT_HOP}+: fixed HOP${DISTANT_HOP}"
+fi
 echo "data HOP range        = HOP1..HOP10"
 echo "data pattern          = ${DATA_PATTERN}"
 echo "codebook pattern      = ${CODEBOOK_PATTERN}"
 echo "use VQW               = ${USE_VQW}"
 echo "pure BPE mode         = ${PURE_BPE_MODE}"
 echo "samidare HOP          = ${SAMIDARE_HOP}"
+echo "fixed distant HOP     = ${DISTANT_HOP}"
+echo "minimum key distance  = ${DISTANT_HOP} (when samidare=0)"
+echo "prediction-relative   = $((DISTANT_HOP + 1)) tokens back or earlier"
 echo "VQW initial scale     = ${VQW_INIT_SCALE}"
 echo "center scale          = ${CENTER_SCALE}"
 echo "codebook size         = ${VQ_CODEBOOK_SIZE}"
@@ -419,6 +416,7 @@ python "${AR_SCRIPT}" \
   --use_vqw "${USE_VQW}" \
   --pure_bpe_mode "${PURE_BPE_MODE}" \
   --samidare_hop "${SAMIDARE_HOP}" \
+  --distant_hop "${DISTANT_HOP}" \
   --vqw_init_scale "${VQW_INIT_SCALE}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"

@@ -184,6 +184,8 @@ class HeadSplitDistanceAwareAttention(nn.Module):
             n_vqw_heads=None,
             vqw_init_scale=0.1,
             disable_second_branch=False,
+            samidare_hop=True,
+            distant_hop=10,
     ):
         super().__init__()
 
@@ -192,6 +194,12 @@ class HeadSplitDistanceAwareAttention(nn.Module):
                 f"d_model={d_model} must be divisible by n_heads={n_heads}"
             )
         self.disable_second_branch = bool(disable_second_branch)
+        self.samidare_hop = bool(samidare_hop)
+        self.distant_hop = int(distant_hop)
+        if not 1 <= self.distant_hop <= 10:
+            raise ValueError(
+                f"distant_hop must be in 1..10: {self.distant_hop}"
+            )
         self.d_model = int(d_model)
         self.n_heads = int(n_heads)
         self.head_dim = d_model // n_heads
@@ -398,29 +406,57 @@ class HeadSplitDistanceAwareAttention(nn.Module):
                 device=device,
                 dtype=qv.dtype,
             )
-            pair_masks = []
+            selected_values = []
 
-            # 各(q, k)ペアに対応するHOPのscoreだけを採用する。
-            # 巨大な[B,L,L,11,D]テンソルを作らないためHOPごとに処理。
-            for hop_index in range(11):
-                if hop_index < 10:
-                    pair_mask = distance.eq(hop_index + 1)
-                else:
-                    pair_mask = distance.ge(11)
-                pair_masks.append(pair_mask)
+            if self.samidare_hop:
+                # distance 1..10 -> HOP1..10, distance 11+ -> HOP10
+                # Each selected HOP reaches at most the current query token,
+                # never the next-token prediction target.
+                for bucket_index in range(11):
+                    if bucket_index < 10:
+                        pair_mask = distance.eq(bucket_index + 1)
+                    else:
+                        pair_mask = distance.ge(11)
 
+                    hop_scores = torch.matmul(
+                        qv,
+                        kv[:, bucket_index].transpose(-2, -1),
+                    ) / math.sqrt(self.head_dim)
+                    allowed = (
+                        pair_mask[None, None, :, :]
+                        & vqw_valid[:, bucket_index, None, None, :]
+                    )
+                    vqw_scores = torch.where(
+                        allowed,
+                        hop_scores,
+                        vqw_scores,
+                    )
+                    selected_values.append(
+                        (pair_mask, vv[:, bucket_index])
+                    )
+            else:
+                # Fixed-HOP mode. For HOP h, keys with attention distance
+                # smaller than h are masked because their bilateral context
+                # could include the next-token prediction target. With HOP10,
+                # distance>=10 corresponds to the target's 11th previous
+                # token or earlier.
+                bucket_index = self.distant_hop - 1
+                pair_mask = distance.ge(self.distant_hop)
                 hop_scores = torch.matmul(
                     qv,
-                    kv[:, hop_index].transpose(-2, -1),
+                    kv[:, bucket_index].transpose(-2, -1),
                 ) / math.sqrt(self.head_dim)
                 allowed = (
                     pair_mask[None, None, :, :]
-                    & vqw_valid[:, hop_index, None, None, :]
+                    & vqw_valid[:, bucket_index, None, None, :]
                 )
                 vqw_scores = torch.where(
                     allowed,
                     hop_scores,
                     vqw_scores,
+                )
+                selected_values.append(
+                    (pair_mask, vv[:, bucket_index])
                 )
 
             if key_padding_mask is not None:
@@ -446,11 +482,11 @@ class HeadSplitDistanceAwareAttention(nn.Module):
             )
 
             vqw_out = torch.zeros_like(qv)
-            for hop_index, pair_mask in enumerate(pair_masks):
+            for pair_mask, selected_v in selected_values:
                 hop_attn = vqw_attn * pair_mask[None, None, :, :]
                 vqw_out = vqw_out + torch.matmul(
                     hop_attn,
-                    vv[:, hop_index],
+                    selected_v,
                 )
 
             vqw_out = (
@@ -492,7 +528,9 @@ class SingleHopTransformerBlock(nn.Module):
             dropout=0.1,
             vqw_init_scale=0.1,
             n_vqw_heads=None,
-            disable_second_branch=False,  # 追加
+            disable_second_branch=False,
+            samidare_hop=True,
+            distant_hop=10,
     ):
         super().__init__()
 
@@ -504,7 +542,9 @@ class SingleHopTransformerBlock(nn.Module):
             dropout=dropout,
             n_vqw_heads=n_vqw_heads,
             vqw_init_scale=vqw_init_scale,
-            disable_second_branch=disable_second_branch,  # 追加
+            disable_second_branch=disable_second_branch,
+            samidare_hop=samidare_hop,
+            distant_hop=distant_hop,
         )
 
         self.dropout1 = nn.Dropout(dropout)
@@ -568,12 +608,18 @@ class BPEVQWDistancePairAddLM(nn.Module):
             use_vqw=False,
             pure_bpe_mode=False,
             samidare_hop=True,
+            distant_hop=10,
             vqw_init_scale=0.1,
     ):
         super().__init__()
         self.use_vqw = bool(use_vqw)
         self.pure_bpe_mode = bool(pure_bpe_mode)
         self.samidare_hop = bool(samidare_hop)
+        self.distant_hop = int(distant_hop)
+        if not 1 <= self.distant_hop <= 10:
+            raise ValueError(
+                f"distant_hop must be in 1..10: {self.distant_hop}"
+            )
         if self.pure_bpe_mode and self.use_vqw:
             raise ValueError("pure_bpe_mode=1 requires use_vqw=0")
 
@@ -640,7 +686,9 @@ class BPEVQWDistancePairAddLM(nn.Module):
                 dropout=dropout,
                 vqw_init_scale=vqw_init_scale,
                 n_vqw_heads=attention_vqw_heads,
-                disable_second_branch=self.pure_bpe_mode,  # 追加
+                disable_second_branch=self.pure_bpe_mode,
+                samidare_hop=self.samidare_hop,
+                distant_hop=self.distant_hop,
             )
             for _ in range(n_layers)
         ])
@@ -860,7 +908,17 @@ def main():
         help=(
             "Use distance-dependent Samidare HOP assignment. "
             "1: distance 1..10 -> HOP1..10 and 11+ -> HOP10; "
-            "0: HOP assignment is undefined/unused."
+            "0: use --distant_hop only at distances >= that HOP."
+        ),
+    )
+    ap.add_argument(
+        "--distant_hop",
+        type=int,
+        default=10,
+        choices=range(1, 11),
+        help=(
+            "Fixed HOP used when --samidare_hop=0. Keys with attention "
+            "distance smaller than this value are masked."
         ),
     )
     ap.add_argument(
@@ -894,9 +952,8 @@ def main():
         default=0,
         choices=[0, 1],
         help=(
-            "Use a standard all-head causal BPE Transformer (1=yes). "
-            "Requires --use_vqw 0. With 0, --use_vqw 0 remains the "
-            "distance-limited BPE control."
+            "Use four causal BPE heads and leave the four second-branch "
+            "head slots unused (1=yes). Requires --use_vqw 0."
         ),
     )
     ap.add_argument("--batch_size", type=int, default=32)
@@ -911,9 +968,6 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tie_weights", action="store_true")
     args = ap.parse_args()
-
-    if args.pure_bpe_mode and args.use_vqw:
-        ap.error("--pure_bpe_mode 1 requires --use_vqw 0")
 
     if args.pure_bpe_mode and args.use_vqw:
         ap.error("--pure_bpe_mode 1 requires --use_vqw 0")
@@ -1008,21 +1062,39 @@ def main():
     )
 
     if args.pure_bpe_mode:
-        architecture_name = "pure_bpe_causal_transformer"
+        architecture_name = "pure_bpe_4heads_plus_4unused"
         architecture_description = (
-            "pure BPE: all attention heads use ordinary causal BPE K/V"
+            "pure BPE: 4 causal BPE heads + 4 zero/unused head slots"
         )
     elif args.use_vqw:
-        architecture_name = "bpe_projection_raw_vqw_distance_attention_causal"
-        architecture_description = (
-            "split heads: ordinary BPE + distance-mapped VQW HOP1..10"
-        )
+        if args.samidare_hop:
+            architecture_name = "bpe_vqw_samidare_distance_attention"
+            architecture_description = (
+                "4 causal BPE heads + 4 Samidare VQW heads"
+            )
+        else:
+            architecture_name = "bpe_vqw_fixed_distant_hop_attention"
+            architecture_description = (
+                f"4 causal BPE heads + 4 fixed-HOP{args.distant_hop} "
+                f"VQW heads at distance>={args.distant_hop}"
+            )
     else:
-        architecture_name = "bpe_projection_distant_bpe_attention_causal"
-        architecture_description = (
-            "split heads: ordinary BPE + distance-limited BPE control"
-        )
-    print(f"[architecture] {architecture_description}")
+        if args.samidare_hop:
+            architecture_name = "bpe_samidare_distance_control_attention"
+            architecture_description = (
+                "4 causal BPE heads + 4 Samidare-distance BPE control heads"
+            )
+        else:
+            architecture_name = "bpe_fixed_distant_control_attention"
+            architecture_description = (
+                f"4 causal BPE heads + 4 BPE control heads at "
+                f"distance>={args.distant_hop}"
+            )
+    print(
+        f"[architecture] {architecture_description}; "
+        f"samidare_hop={args.samidare_hop}; "
+        f"distant_hop={args.distant_hop}"
+    )
     random.shuffle(samples)
     n = len(samples)
     n_train = int(0.8 * n)
@@ -1089,6 +1161,7 @@ def main():
         use_vqw=bool(args.use_vqw),
         pure_bpe_mode=bool(args.pure_bpe_mode),
         samidare_hop=bool(args.samidare_hop),
+        distant_hop=args.distant_hop,
         vqw_init_scale=args.vqw_init_scale,
     ).to(device)
 
@@ -1200,21 +1273,19 @@ def main():
             "tok_pad_id": tok_pad_id,
             "vq_pad_id": vq_pad_id,
             "hop_distance_mapping": (
-            {
-                "distance_1": "HOP1",
-                "distance_2": "HOP2",
-                "distance_3": "HOP3",
-                "distance_4": "HOP4",
-                "distance_5": "HOP5",
-                "distance_6": "HOP6",
-                "distance_7": "HOP7",
-                "distance_8": "HOP8",
-                "distance_9": "HOP9",
-                "distance_10": "HOP10",
-                "distance_11_plus": "HOP10",
-            }
-            if args.samidare_hop
-            else None
+                {
+                    "mode": "samidare",
+                    "distance_1_to_10": "HOP1_to_HOP10",
+                    "distance_11_plus": "HOP10",
+                }
+                if args.samidare_hop
+                else {
+                    "mode": "fixed_distant_hop",
+                    "fixed_hop": args.distant_hop,
+                    "minimum_attention_distance": args.distant_hop,
+                    "prediction_relative_first_key": args.distant_hop + 1,
+                    "closer_distances": "masked",
+                }
             ),
             "hop_data_sources": hop_data_paths,
             "hop_codebook_sources": hop_codebook_paths,
@@ -1223,6 +1294,7 @@ def main():
             "last_valid": valid_metrics,
             "last_test": test_metrics,
             "samidare_hop": bool(args.samidare_hop),
+            "distant_hop": args.distant_hop,
             "pure_bpe_mode": bool(args.pure_bpe_mode),
             "use_vqw": bool(args.use_vqw),
         }
