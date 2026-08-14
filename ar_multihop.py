@@ -41,9 +41,9 @@ class SequenceARDataset(Dataset):
     tok_in[:, q] から tok_y[:, q] を予測する。
     tok_y[:, q] = tok_inの次トークン。
 
-    各入力位置には、その位置自身についてHOP 0..10で得た
-    11種類のVQ IDを保持する。実際に使うHOPはattention内で
-    query-key距離から選択する。
+    各入力位置には11個の距離bucketを保持する。
+    bucket 0..9はHOP 1..10、bucket 10は距離11以上で
+    HOP10を再利用する。
     """
 
     def __init__(
@@ -61,7 +61,7 @@ class SequenceARDataset(Dataset):
 
         token_ids_flat = token_ids_flat.long().reshape(-1)
         if len(vq_ids_flat_by_hop) != 11:
-            raise ValueError("Expected VQ ID tensors for HOP 0..10")
+            raise ValueError("Expected 11 VQ distance buckets")
         vq_ids_flat_by_hop = [
             ids.long().reshape(-1) for ids in vq_ids_flat_by_hop
         ]
@@ -170,7 +170,7 @@ class HeadSplitDistanceAwareAttention(nn.Module):
 
     Remaining heads:
         VQW K/V, with distance-dependent HOP:
-        distance 1..10 -> HOP 0..9, distance >=11 -> HOP10
+        distance 1..10 -> HOP 1..10, distance >=11 -> HOP10
 
     Queryは全headともBPE/shared hiddenから作る。
     これによりquery位置自身のVQWからのリークを防ぐ。
@@ -535,7 +535,7 @@ class BPEVQWDistancePairAddLM(nn.Module):
     """
     BPE causal Transformer with a distance-dependent VQW K/V branch.
 
-    For query q and key k, distance 1..10 selects HOP 0..9;
+    For query q and key k, distance 1..10 selects HOP 1..10;
     distance 11 or larger selects HOP10. Distance 0 is never allowed,
     so the VQW branch cannot leak the current position.
     """
@@ -590,10 +590,11 @@ class BPEVQWDistancePairAddLM(nn.Module):
                 d_model,
                 bias=False,
             )
+        # 11 distance buckets: HOP1..10 plus HOP10 reuse for 11+.
         # VQW codebook center自体は固定。
         # L2正規化したcenterだけ、学習可能なLinearへ通す。
         if len(centers_by_hop) != 11:
-            raise ValueError("Expected codebook centers for HOP 0..10")
+            raise ValueError("Expected 11 codebook distance buckets")
         center_dim = int(centers_by_hop[0].size(1))
         if any(int(c.size(1)) != center_dim for c in centers_by_hop):
             raise ValueError("All HOP codebooks must have the same center dimension")
@@ -829,7 +830,7 @@ def main():
         "--hop_data_pattern",
         required=True,
         help=(
-            "VQ ID path pattern for HOP 0..10. "
+            "VQ ID path pattern for HOP 1..10. "
             "Use {hop:02d}, e.g. /data/...bilateral{hop:02d}..._ids.pt"
         ),
     )
@@ -837,7 +838,7 @@ def main():
         "--hop_codebook_pattern",
         required=True,
         help=(
-            "Codebook path pattern for HOP 0..10. "
+            "Codebook path pattern for HOP 1..10. "
             "Use {hop:02d}, e.g. /data/...bilateral{hop:02d}....pt"
         ),
     )
@@ -894,11 +895,14 @@ def main():
     )
     print(f"[device] {device}")
 
+    # Available files are HOP1..HOP10. Attention needs 11 distance
+    # buckets, so the last bucket (distance >= 11) reuses HOP10.
+    source_hops = list(range(1, 11)) + [10]
     hop_data_paths = [
-        args.hop_data_pattern.format(hop=hop) for hop in range(11)
+        args.hop_data_pattern.format(hop=hop) for hop in source_hops
     ]
     hop_codebook_paths = [
-        args.hop_codebook_pattern.format(hop=hop) for hop in range(11)
+        args.hop_codebook_pattern.format(hop=hop) for hop in source_hops
     ]
 
     references = [
@@ -915,31 +919,39 @@ def main():
     reference_sample_bounds = [
         (int(s["start"]), int(s["end"])) for s in samples
     ]
-    for hop, (hop_reference, codebook_path) in enumerate(
-        zip(references, hop_codebook_paths)
+    for bucket_index, (source_hop, hop_reference, codebook_path) in enumerate(
+        zip(source_hops, references, hop_codebook_paths)
     ):
         recorded_hop = int(hop_reference.get("hop", -1))
-        if recorded_hop != hop:
+        if recorded_hop != source_hop:
             raise ValueError(
-                f"Expected HOP{hop} data, metadata says HOP{recorded_hop}"
+                f"Bucket {bucket_index}: expected HOP{source_hop} data, "
+                f"metadata says HOP{recorded_hop}"
             )
         hop_tokens = hop_reference["token_ids_flat"].long().reshape(-1)
         if not torch.equal(hop_tokens, token_ids_flat):
-            raise ValueError(f"HOP{hop}: token_ids_flat differs from HOP10")
+            raise ValueError(
+                f"Bucket {bucket_index}/HOP{source_hop}: "
+                "token_ids_flat differs from HOP10"
+            )
         hop_bounds = [
             (int(s["start"]), int(s["end"]))
             for s in hop_reference["samples"]
         ]
         if hop_bounds != reference_sample_bounds:
-            raise ValueError(f"HOP{hop}: sample boundaries differ from HOP10")
+            raise ValueError(
+                f"Bucket {bucket_index}/HOP{source_hop}: "
+                "sample boundaries differ from HOP10"
+            )
 
         raw = torch.load(
             codebook_path, map_location="cpu", weights_only=False
         )
         codebook_hop = int(raw.get("args", {}).get("hop", -1))
-        if codebook_hop != hop:
+        if codebook_hop != source_hop:
             raise ValueError(
-                f"Expected HOP{hop} codebook, metadata says HOP{codebook_hop}"
+                f"Bucket {bucket_index}: expected HOP{source_hop} "
+                f"codebook, metadata says HOP{codebook_hop}"
             )
         centers = raw["global_centers"].float()
         ids = hop_reference["vq_ids_flat"].long().reshape(-1)
@@ -948,7 +960,7 @@ def main():
         vq_max = int(ids.max().item())
         if vq_min < 0 or vq_max >= vocab_size:
             raise ValueError(
-                f"HOP{hop}: VQ IDs out of range: "
+                f"Bucket {bucket_index}/HOP{source_hop}: VQ IDs out of range: "
                 f"{vq_min}..{vq_max}, vocab={vocab_size}"
             )
         vq_ids_flat_by_hop.append(ids)
@@ -971,7 +983,7 @@ def main():
     elif args.use_vqw:
         architecture_name = "bpe_projection_raw_vqw_distance_attention_causal"
         architecture_description = (
-            "split heads: ordinary BPE + distance-mapped VQW HOP0..10"
+            "split heads: ordinary BPE + distance-mapped VQW HOP1..10"
         )
     else:
         architecture_name = "bpe_projection_distant_bpe_attention_causal"
@@ -1158,7 +1170,7 @@ def main():
             "tok_pad_id": tok_pad_id,
             "vq_pad_id": vq_pad_id,
             "hop_distance_mapping": {
-                "distance_1_to_10": "HOP0_to_HOP9",
+                "distance_1_to_10": "HOP1_to_HOP10",
                 "distance_11_plus": "HOP10",
             },
             "hop_data_sources": hop_data_paths,
