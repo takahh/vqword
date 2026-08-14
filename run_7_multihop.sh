@@ -35,11 +35,11 @@ fi
 VQ_CODEBOOK_LABEL="$1"
 CENTER_SCALE="$2"
 DISTANT_HOP="$3"
-USE_GLOBAL_VQW_ID="${USE_GLOBAL_VQW_ID:-0}"
-case "${USE_GLOBAL_VQW_ID}" in
+USE_HOP_EMBEDDING="${USE_HOP_EMBEDDING:-0}"
+case "${USE_HOP_EMBEDDING}" in
   0|1) ;;
   *)
-    echo "[error] USE_GLOBAL_VQW_ID must be 0 or 1"
+    echo "[error] USE_HOP_EMBEDDING must be 0 or 1"
     exit 1
     ;;
 esac
@@ -369,7 +369,7 @@ PY
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-RUN="ar_inputcat_bpeonly_multihop01to10_usevqw${USE_VQW}_purebpe${PURE_BPE_MODE}_samidare${SAMIDARE_HOP}_globalid${USE_GLOBAL_VQW_ID}_distanthop${DISTANT_HOP}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
+RUN="ar_inputcat_bpeonly_multihop01to10_usevqw${USE_VQW}_purebpe${PURE_BPE_MODE}_samidare${SAMIDARE_HOP}_hopemb${USE_HOP_EMBEDDING}}_distanthop${DISTANT_HOP}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
@@ -399,7 +399,7 @@ echo "VQW initial scale     = ${VQW_INIT_SCALE}"
 echo "center scale          = ${CENTER_SCALE}"
 echo "codebook size         = ${VQ_CODEBOOK_SIZE}"
 echo "AR seed               = ${AR_SEED}"
-echo "global VQW ID         = ${USE_GLOBAL_VQW_ID}"
+echo "HOP embedding         = ${USE_HOP_EMBEDDING}"
 echo "run                   = ${RUN}"
 echo "============================================================"
 
@@ -427,7 +427,7 @@ python "${AR_SCRIPT}" \
   --samidare_hop "${SAMIDARE_HOP}" \
   --distant_hop "${DISTANT_HOP}" \
   --vqw_init_scale "${VQW_INIT_SCALE}" \
-  --use_global_vqw_id "${USE_GLOBAL_VQW_ID}" \
+  --use_hop_embedding "${USE_HOP_EMBEDDING}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 
