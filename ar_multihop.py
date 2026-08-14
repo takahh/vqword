@@ -615,29 +615,67 @@ class BPEVQWDistancePairAddLM(nn.Module):
             vqw_init_scale=0.1,
     ):
         super().__init__()
+
+        # ==============================================
+        # 1. 先にすべての設定をselfへ保存
+        # ==============================================
+
+        self.use_vqw = bool(
+            use_vqw
+        )
+
+        self.pure_bpe_mode = bool(
+            pure_bpe_mode
+        )
+
+        self.samidare_hop = bool(
+            samidare_hop
+        )
+
+        self.distant_hop = int(
+            distant_hop
+        )
+
         self.use_hop_embedding = bool(
             use_hop_embedding
         )
+
         self.use_hop_projection = bool(
             use_hop_projection
         )
+
+        # ==============================================
+        # 2. selfへの保存後に引数を検査
+        # ==============================================
+
+        if not 1 <= self.distant_hop <= 10:
+            raise ValueError(
+                f"distant_hop must be in 1..10: "
+                f"{self.distant_hop}"
+            )
+
+        if self.pure_bpe_mode and self.use_vqw:
+            raise ValueError(
+                "pure_bpe_mode=1 requires use_vqw=0"
+            )
+
+        if self.use_hop_embedding and not self.use_vqw:
+            raise ValueError(
+                "use_hop_embedding=1 requires use_vqw=1"
+            )
+
         if self.use_hop_projection and not self.use_vqw:
             raise ValueError(
                 "use_hop_projection=1 requires use_vqw=1"
             )
-        self.use_vqw = bool(use_vqw)
-        self.pure_bpe_mode = bool(pure_bpe_mode)
-        self.samidare_hop = bool(samidare_hop)
-        self.distant_hop = int(distant_hop)
-        if not 1 <= self.distant_hop <= 10:
+
+        if (
+                self.use_hop_embedding
+                and self.use_hop_projection
+        ):
             raise ValueError(
-                f"distant_hop must be in 1..10: {self.distant_hop}"
-            )
-        if self.pure_bpe_mode and self.use_vqw:
-            raise ValueError("pure_bpe_mode=1 requires use_vqw=0")
-        if self.use_hop_embedding and not self.use_vqw:
-            raise ValueError(
-                "use_hop_embedding=1 requires use_vqw=1"
+                "use_hop_embedding and use_hop_projection "
+                "cannot both be enabled"
             )
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(target_vq_vocab_size)
