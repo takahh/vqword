@@ -103,7 +103,6 @@ if [ "${PURE_BPE_MODE}" = "1" ] && [ "${USE_VQW}" != "0" ]; then
   exit 1
 fi
 
-# SAMIDARE_HOP=0では代替HOP割り当てを定義せず、HOPは不使用。
 if [ "${USE_VQW}" = "1" ] && [ "${SAMIDARE_HOP}" != "1" ]; then
   echo "[error] USE_VQW=1 requires SAMIDARE_HOP=1"
   exit 1
