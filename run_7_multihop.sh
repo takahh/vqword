@@ -427,6 +427,7 @@ python "${AR_SCRIPT}" \
   --samidare_hop "${SAMIDARE_HOP}" \
   --distant_hop "${DISTANT_HOP}" \
   --vqw_init_scale "${VQW_INIT_SCALE}" \
+  --use_global_vqw_id "${USE_GLOBAL_VQW_ID}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 
