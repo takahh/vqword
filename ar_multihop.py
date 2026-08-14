@@ -177,12 +177,13 @@ class HeadSplitDistanceAwareAttention(nn.Module):
     """
 
     def __init__(
-        self,
-        d_model,
-        n_heads,
-        dropout=0.1,
-        n_vqw_heads=None,
-        vqw_init_scale=0.1,
+            self,
+            d_model,
+            n_heads,
+            dropout=0.1,
+            n_vqw_heads=None,
+            vqw_init_scale=0.1,
+            disable_second_branch=False,  # 追加
     ):
         super().__init__()
 
@@ -190,7 +191,7 @@ class HeadSplitDistanceAwareAttention(nn.Module):
             raise ValueError(
                 f"d_model={d_model} must be divisible by n_heads={n_heads}"
             )
-
+        self.disable_second_branch = bool(disable_second_branch)
         self.d_model = int(d_model)
         self.n_heads = int(n_heads)
         self.head_dim = d_model // n_heads
@@ -371,7 +372,7 @@ class HeadSplitDistanceAwareAttention(nn.Module):
         # VQW HEADS / HEAD CAT
         # =====================================================
 
-        if self.n_vqw_heads > 0:
+        if self.n_vqw_heads > 0 and not self.disable_second_branch:
             # VQW headでもQueryはBPE/shared hiddenから作る
             qv = self._split_heads(
                 self.q_vqw_proj(x),
@@ -461,9 +462,20 @@ class HeadSplitDistanceAwareAttention(nn.Module):
                 [bpe_out, vqw_out],
                 dim=1,
             )
-
+        elif self.n_vqw_heads > 0:
+            # Pure BPE:
+            # 4 BPE headsは使用し、残り4 headsはゼロ固定
+            unused_out = bpe_out.new_zeros(
+                B,
+                self.n_vqw_heads,
+                L,
+                self.head_dim,
+            )
+            all_heads = torch.cat(
+                [bpe_out, unused_out],
+                dim=1,
+            )
         else:
-            # 8 BPE heads + 0 VQW heads
             all_heads = bpe_out
 
         merged = self._merge_heads(
@@ -480,6 +492,7 @@ class SingleHopTransformerBlock(nn.Module):
             dropout=0.1,
             vqw_init_scale=0.1,
             n_vqw_heads=None,
+            disable_second_branch=False,  # 追加
     ):
         super().__init__()
 
@@ -491,6 +504,7 @@ class SingleHopTransformerBlock(nn.Module):
             dropout=dropout,
             n_vqw_heads=n_vqw_heads,
             vqw_init_scale=vqw_init_scale,
+            disable_second_branch=disable_second_branch,  # 追加
         )
 
         self.dropout1 = nn.Dropout(dropout)
@@ -615,7 +629,8 @@ class BPEVQWDistancePairAddLM(nn.Module):
         self.pos_emb = nn.Embedding(max_len, d_model)
         # Pure BPE: all heads use ordinary causal BPE K/V.
         # Other modes retain the split-head comparison design.
-        attention_vqw_heads = 0 if self.pure_bpe_mode else n_heads // 2
+        # 常に4 BPE heads + 4 second-branch headsの構成を保つ
+        attention_vqw_heads = n_heads // 2
         self.shared_blocks = nn.ModuleList([
             SingleHopTransformerBlock(
                 d_model=d_model,
@@ -623,6 +638,7 @@ class BPEVQWDistancePairAddLM(nn.Module):
                 dropout=dropout,
                 vqw_init_scale=vqw_init_scale,
                 n_vqw_heads=attention_vqw_heads,
+                disable_second_branch=self.pure_bpe_mode,  # 追加
             )
             for _ in range(n_layers)
         ])
