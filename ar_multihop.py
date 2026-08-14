@@ -609,9 +609,13 @@ class BPEVQWDistancePairAddLM(nn.Module):
             pure_bpe_mode=False,
             samidare_hop=True,
             distant_hop=10,
+            use_global_vqw_id=False,
             vqw_init_scale=0.1,
     ):
         super().__init__()
+        self.use_global_vqw_id = bool(
+            use_global_vqw_id
+        )
         self.use_vqw = bool(use_vqw)
         self.pure_bpe_mode = bool(pure_bpe_mode)
         self.samidare_hop = bool(samidare_hop)
@@ -663,16 +667,49 @@ class BPEVQWDistancePairAddLM(nn.Module):
 
         if not self.pure_bpe_mode:
             self.center_embeddings = nn.ModuleList([
-                FrozenCenterEmbedding(centers) for centers in centers_by_hop
+                FrozenCenterEmbedding(centers)
+                for centers in centers_by_hop
             ])
+
             self.vqw_projection = nn.Linear(
                 center_dim,
                 d_model,
                 bias=False,
             )
+
+            # 実際のHOPはHOP1〜HOP10の10種類。
+            # 11番目のbucketはHOP10の再利用なので、新しいHOPではない。
+            self.n_physical_hops = 10
+
+            self.global_vqw_vocab_size = (
+                    self.n_physical_hops
+                    * self.vq_vocab_size
+            )
+
+            if self.use_global_vqw_id:
+                self.global_vqw_id_embedding = nn.Embedding(
+                    self.global_vqw_vocab_size,
+                    d_model,
+                )
+
+                # global IDを追加していない従来モデルと
+                # 同じ初期状態から学習を始めるためゼロ初期化。
+                nn.init.zeros_(
+                    self.global_vqw_id_embedding.weight
+                )
+            else:
+                self.global_vqw_id_embedding = None
+
         else:
             self.center_embeddings = nn.ModuleList()
             self.vqw_projection = None
+
+            self.n_physical_hops = 10
+            self.global_vqw_vocab_size = (
+                    self.n_physical_hops
+                    * self.vq_vocab_size
+            )
+            self.global_vqw_id_embedding = None
 
         self.pos_emb = nn.Embedding(max_len, d_model)
         # Pure BPE: all heads use ordinary causal BPE K/V.
@@ -735,22 +772,103 @@ class BPEVQWDistancePairAddLM(nn.Module):
             second_x = None
             second_valid = None
         elif self.use_vqw:
-            # VQW条件：
-            # frozen VQW center -> dedicated Linear
+            # vq_in shape:
+            # [batch, 11 buckets, sequence_length]
+            #
+            # bucket 0  = HOP1
+            # bucket 1  = HOP2
+            # ...
+            # bucket 9  = HOP10
+            # bucket 10 = 距離11以上用に再利用するHOP10
+
             second_valid = vq_in.ne(self.vq_pad_id)
 
+            # ==============================================
+            # 1. frozen centerを取得する
+            # ==============================================
+
             vqw_center = torch.stack([
-                self.center_embeddings[hop_index](vq_in[:, hop_index])
-                for hop_index in range(11)
+                self.center_embeddings[bucket_index](
+                    vq_in[:, bucket_index]
+                )
+                for bucket_index in range(11)
             ], dim=1)
 
-            second_x = self.vqw_projection(
+            # shape:
+            # [B, 11, L, center_dim]
+
+            # ==============================================
+            # 2. frozen centerを共通d_model空間へ射影
+            # ==============================================
+
+            center_feature = self.vqw_projection(
                 vqw_center
             )
 
+            # shape:
+            # [B, 11, L, d_model]
+
+            # ==============================================
+            # 3. 必要ならglobal ID embeddingを追加
+            # ==============================================
+            if self.use_global_vqw_id:
+                global_id_features = []
+                for bucket_index in range(11):
+                    # bucket 0〜9はHOP1〜HOP10。
+                    # bucket 10も物理的にはHOP10なのでindex 9を使う。
+                    physical_hop_index = min(
+                        bucket_index,
+                        9,)
+                    local_ids = vq_in[:, bucket_index]
+                    # padding位置を判定
+                    valid = local_ids.ne(
+                        self.vq_pad_id)
+                    # padding IDはvq_vocab_sizeなので、そのままoffsetを
+                    # 足すとEmbeddingの範囲外になる可能性がある。
+                    # lookup時だけ安全な範囲へclampする。
+                    safe_local_ids = local_ids.clamp(
+                        min=0,
+                        max=self.vq_vocab_size - 1,)
+                    # HOPごとにID領域を分ける
+                    global_ids = (
+                            physical_hop_index
+                            * self.vq_vocab_size
+                            + safe_local_ids)
+                    id_feature = (
+                        self.global_vqw_id_embedding(
+                            global_ids
+                        )
+                    )
+                    # padding位置からgradientや情報が入らないようゼロ化
+                    id_feature = (
+                            id_feature
+                            * valid.unsqueeze(-1).to(
+                        id_feature.dtype
+                    )
+                    )
+                    global_id_features.append(
+                        id_feature
+                    )
+                global_id_feature = torch.stack(
+                    global_id_features,
+                    dim=1,
+                )
+                # frozen center由来の特徴と、
+                # HOP-offset global ID由来の特徴を加算
+                second_x = (
+                        center_feature
+                        + global_id_feature
+                )
+            else:
+                second_x = center_feature
+            # ==============================================
+            # 4. padding位置を最終的にゼロ化
+            # ==============================================
             second_x = (
                     second_x
-                    * second_valid.unsqueeze(-1).to(second_x.dtype)
+                    * second_valid.unsqueeze(-1).to(
+                second_x.dtype
+            )
             )
 
         else:
@@ -954,6 +1072,16 @@ def main():
         help=(
             "Use four causal BPE heads and leave the four second-branch "
             "head slots unused (1=yes). Requires --use_vqw 0."
+        ),
+    )
+    ap.add_argument(
+        "--use_global_vqw_id",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            "Add a trainable HOP-offset global VQW ID embedding "
+            "to the projected frozen center."
         ),
     )
     ap.add_argument("--batch_size", type=int, default=32)
@@ -1162,9 +1290,21 @@ def main():
         pure_bpe_mode=bool(args.pure_bpe_mode),
         samidare_hop=bool(args.samidare_hop),
         distant_hop=args.distant_hop,
+
+        # 追加
+        use_global_vqw_id=bool(
+            args.use_global_vqw_id
+        ),
+
         vqw_init_scale=args.vqw_init_scale,
     ).to(device)
-
+    print(
+        "[global VQW ID] "
+        f"enabled={args.use_global_vqw_id} "
+        f"physical_hops=10 "
+        f"vocab={10 * vq_vocab_size} "
+        f"dim={args.d_model}"
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -1263,6 +1403,19 @@ def main():
             "test": test_metrics,
         }
         history.append(record)
+        if args.use_vqw and args.samidare_hop:
+            if args.use_global_vqw_id:
+                architecture_name = (
+                    "bpe_vqw_samidare_global_id_embedding"
+                )
+                architecture_description = (
+                    "4 causal BPE heads + 4 Samidare VQW heads "
+                    "+ HOP-offset global ID embedding"
+                )
+            else:
+                architecture_name = (
+                    "bpe_vqw_samidare_distance_attention"
+                )
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
@@ -1297,6 +1450,24 @@ def main():
             "distant_hop": args.distant_hop,
             "pure_bpe_mode": bool(args.pure_bpe_mode),
             "use_vqw": bool(args.use_vqw),
+            "use_global_vqw_id": bool(
+                args.use_global_vqw_id
+            ),
+            "global_vqw_vocab_size": (
+                10 * vq_vocab_size
+                if args.use_global_vqw_id
+                else 0
+            ),
+            "global_vqw_id_dim": (
+                args.d_model
+                if args.use_global_vqw_id
+                else 0
+            ),
+            "global_vqw_id_init": (
+                "zeros"
+                if args.use_global_vqw_id
+                else None
+            ),
         }
 
         torch.save(checkpoint, args.out)
