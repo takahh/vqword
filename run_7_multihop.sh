@@ -132,7 +132,7 @@ AR_SCRIPT="/vqword/ar_multihop.py"
 
 COMMON_SUFFIX="center${CENTER_LABEL}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
 
-DATA_PATTERN="/vqword/wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral{hop:02d}_${COMMON_SUFFIX}_ids.pt"
+DATA_PATTERN="/vqword/tinystories_vqword_bpe${BPE_VOCAB_LABEL}_bilateral{hop:02d}_${COMMON_SUFFIX}_ids.pt"
 
 CODEBOOK_PATTERN="/vqword/wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral{hop:02d}_${COMMON_SUFFIX}.pt"
 
@@ -167,50 +167,30 @@ LFTP
 }
 
 # ============================================================
-# HOP1..10をダウンロード・結合
+# HOP1..10をダウンロード
+#
+# codebook：WikiText-103で学習したトークナイザー
+# data：そのトークナイザーをTinyStoriesへ適用したAR用ID
 # ============================================================
 
 for HOP_INDEX in $(seq 1 10); do
   HOP2=$(printf "%02d" "${HOP_INDEX}")
 
-  PREFIX="wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_${COMMON_SUFFIX}"
+  CODEBOOK_PREFIX="wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_${COMMON_SUFFIX}"
 
-  DATA_FILE="${PREFIX}_ids.pt"
-  CODEBOOK_FILE="${PREFIX}.pt"
+  DATA_PREFIX="tinystories_vqword_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_${COMMON_SUFFIX}"
+
+  CODEBOOK_FILE="${CODEBOOK_PREFIX}.pt"
+  DATA_FILE="${DATA_PREFIX}_ids.pt"
 
   download_file \
     "${CODEBOOK_FILE}" \
     "/vqword/${CODEBOOK_FILE}"
 
-  if [ ! -s "/vqword/${DATA_FILE}" ]; then
-    download_file \
-      "${DATA_FILE}.part000" \
-      "/vqword/${DATA_FILE}.part000"
-
-    download_file \
-      "${DATA_FILE}.part001" \
-      "/vqword/${DATA_FILE}.part001"
-
-    echo "[combine] ${DATA_FILE}"
-
-    cat \
-      "/vqword/${DATA_FILE}.part000" \
-      "/vqword/${DATA_FILE}.part001" \
-      > "/vqword/${DATA_FILE}.tmp"
-
-    mv \
-      "/vqword/${DATA_FILE}.tmp" \
-      "/vqword/${DATA_FILE}"
-  else
-    echo "[reuse] /vqword/${DATA_FILE}"
-  fi
+  download_file \
+    "${DATA_FILE}" \
+    "/vqword/${DATA_FILE}"
 done
-
-if [ ! -s "${AR_SCRIPT}" ]; then
-  echo "[error] missing AR script: ${AR_SCRIPT}"
-  exit 1
-fi
-
 # ============================================================
 # HOP1..10の事前検証
 # ============================================================
