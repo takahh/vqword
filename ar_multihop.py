@@ -1221,41 +1221,64 @@ def main():
     token_vocab_size = int(
         reference.get("token_vocab_size", 50257)
     )
-
-    if args.pure_bpe_mode:
-        architecture_name = "pure_bpe_4heads_plus_4unused"
-        architecture_description = (
-            "pure BPE: 4 causal BPE heads + 4 zero/unused head slots"
-        )
     elif args.use_vqw:
-        if args.samidare_hop:
-            architecture_name = "bpe_vqw_samidare_distance_attention"
+    if args.samidare_hop:
+        if args.use_hop_projection:
+            architecture_name = (
+                "bpe_vqw_samidare_hop_specific_projection"
+            )
+            architecture_description = (
+                "4 causal BPE heads + 4 Samidare VQW heads "
+                "+ HOP-specific center projections"
+            )
+
+        elif args.use_hop_embedding:
+            architecture_name = (
+                "bpe_vqw_samidare_hop_embedding"
+            )
+            architecture_description = (
+                "4 causal BPE heads + 4 Samidare VQW heads "
+                "+ lightweight HOP embedding"
+            )
+
+        else:
+            architecture_name = (
+                "bpe_vqw_samidare_distance_attention"
+            )
             architecture_description = (
                 "4 causal BPE heads + 4 Samidare VQW heads"
             )
-        else:
-            architecture_name = "bpe_vqw_fixed_distant_hop_attention"
-            architecture_description = (
-                f"4 causal BPE heads + 4 fixed-HOP{args.distant_hop} "
-                f"VQW heads at distance>={args.distant_hop}"
-            )
+
     else:
-        if args.samidare_hop:
-            architecture_name = "bpe_samidare_distance_control_attention"
-            architecture_description = (
-                "4 causal BPE heads + 4 Samidare-distance BPE control heads"
+        if args.use_hop_projection:
+            architecture_name = (
+                "bpe_vqw_fixed_hop_specific_projection"
             )
+            architecture_description = (
+                f"4 causal BPE heads + 4 fixed-HOP"
+                f"{args.distant_hop} VQW heads "
+                "+ HOP-specific center projection"
+            )
+
+        elif args.use_hop_embedding:
+            architecture_name = (
+                "bpe_vqw_fixed_hop_embedding"
+            )
+            architecture_description = (
+                f"4 causal BPE heads + 4 fixed-HOP"
+                f"{args.distant_hop} VQW heads "
+                "+ lightweight HOP embedding"
+            )
+
         else:
-            architecture_name = "bpe_fixed_distant_control_attention"
-            architecture_description = (
-                f"4 causal BPE heads + 4 BPE control heads at "
-                f"distance>={args.distant_hop}"
+            architecture_name = (
+                "bpe_vqw_fixed_distant_hop_attention"
             )
-    print(
-        f"[architecture] {architecture_description}; "
-        f"samidare_hop={args.samidare_hop}; "
-        f"distant_hop={args.distant_hop}"
-    )
+            architecture_description = (
+                f"4 causal BPE heads + 4 fixed-HOP"
+                f"{args.distant_hop} VQW heads "
+                f"at distance>={args.distant_hop}"
+            )
     random.shuffle(samples)
     n = len(samples)
     n_train = int(0.8 * n)
@@ -1451,33 +1474,6 @@ def main():
             "test": test_metrics,
         }
         history.append(record)
-        elif args.use_vqw:
-        if args.samidare_hop:
-            if args.use_hop_projection:
-                architecture_name = (
-                    "bpe_vqw_samidare_hop_specific_projection"
-                )
-                architecture_description = (
-                    "4 causal BPE heads + 4 Samidare VQW heads "
-                    "+ HOP-specific center projections"
-                )
-
-            elif args.use_hop_embedding:
-                architecture_name = (
-                    "bpe_vqw_samidare_hop_embedding"
-                )
-                architecture_description = (
-                    "4 causal BPE heads + 4 Samidare VQW heads "
-                    "+ lightweight HOP embedding"
-                )
-
-            else:
-                architecture_name = (
-                    "bpe_vqw_samidare_distance_attention"
-                )
-                architecture_description = (
-                    "4 causal BPE heads + 4 Samidare VQW heads"
-                )
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
