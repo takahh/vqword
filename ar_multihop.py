@@ -27,6 +27,7 @@ import argparse
 import math
 import random
 from pathlib import Path
+import copy
 
 import torch
 import torch.nn as nn
@@ -610,12 +611,20 @@ class BPEVQWDistancePairAddLM(nn.Module):
             samidare_hop=True,
             distant_hop=10,
             use_hop_embedding=False,
+            use_hop_projection=False,
             vqw_init_scale=0.1,
     ):
         super().__init__()
         self.use_hop_embedding = bool(
             use_hop_embedding
         )
+        self.use_hop_projection = bool(
+            use_hop_projection
+        )
+        if self.use_hop_projection and not self.use_vqw:
+            raise ValueError(
+                "use_hop_projection=1 requires use_vqw=1"
+            )
         self.use_vqw = bool(use_vqw)
         self.pure_bpe_mode = bool(pure_bpe_mode)
         self.samidare_hop = bool(samidare_hop)
@@ -674,11 +683,30 @@ class BPEVQWDistancePairAddLM(nn.Module):
                 for centers in centers_by_hop
             ])
 
-            self.vqw_projection = nn.Linear(
+            # 従来の共通projectionと同じ初期値を1つ作る。
+            base_vqw_projection = nn.Linear(
                 center_dim,
                 d_model,
                 bias=False,
             )
+
+            if self.use_hop_projection:
+                # HOP1〜HOP10専用の10 projection。
+                #
+                # 全projectionを同一初期値から始めることで、
+                # 初期状態では従来の共通projectionと等価にする。
+                # 学習開始後はHOPごとに別々に更新される。
+                self.vqw_projections = nn.ModuleList([
+                    copy.deepcopy(base_vqw_projection)
+                    for _ in range(10)
+                ])
+
+                self.vqw_projection = None
+
+            else:
+                # 従来どおり全HOPで1つのprojectionを共有
+                self.vqw_projection = base_vqw_projection
+                self.vqw_projections = nn.ModuleList()
             # 実際のHOPはHOP1〜HOP10の10種類。
             # 11番目のbucketはHOP10の再利用なので、
             # HOP embeddingはHOP10と共有する。
@@ -701,7 +729,7 @@ class BPEVQWDistancePairAddLM(nn.Module):
         else:
             self.center_embeddings = nn.ModuleList()
             self.vqw_projection = None
-
+            self.vqw_projections = nn.ModuleList()
             self.n_physical_hops = 10
             self.hop_embedding = None
 
@@ -780,28 +808,43 @@ class BPEVQWDistancePairAddLM(nn.Module):
             # ==============================================
             # 1. frozen centerを取得する
             # ==============================================
-
-            vqw_center = torch.stack([
-                self.center_embeddings[bucket_index](
-                    vq_in[:, bucket_index]
+            if self.use_hop_projection:
+                projected_centers = []
+                for bucket_index in range(11):
+                    # このbucketに対応するfrozen centerを取得
+                    center = self.center_embeddings[
+                        bucket_index
+                    ](
+                        vq_in[:, bucket_index]
+                    )
+                    # bucket 0〜9はHOP1〜HOP10。
+                    # bucket 10もHOP10の再利用なので、
+                    # projection index 9を共有する。
+                    projection_index = min(
+                        bucket_index,
+                        9,
+                    )
+                    projected = self.vqw_projections[
+                        projection_index
+                    ](center)
+                    projected_centers.append(
+                        projected
+                    )
+                center_feature = torch.stack(
+                    projected_centers,
+                    dim=1,
                 )
-                for bucket_index in range(11)
-            ], dim=1)
-
-            # shape:
-            # [B, 11, L, center_dim]
-
-            # ==============================================
-            # 2. frozen centerを共通d_model空間へ射影
-            # ==============================================
-
-            center_feature = self.vqw_projection(
-                vqw_center
-            )
-
-            # shape:
-            # [B, 11, L, d_model]
-
+            else:
+                # 従来の共通projection
+                vqw_center = torch.stack([
+                    self.center_embeddings[bucket_index](
+                        vq_in[:, bucket_index]
+                    )
+                    for bucket_index in range(11)
+                ], dim=1)
+                center_feature = self.vqw_projection(
+                    vqw_center
+                )
             # ==============================================
             # 3. 必要ならglobal ID embeddingを追加
             # ==============================================
@@ -992,6 +1035,16 @@ def main():
         ),
     )
     ap.add_argument(
+        "--use_hop_projection",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            "Use separate trainable projections for "
+            "HOP1 through HOP10 VQW center spaces."
+        ),
+    )
+    ap.add_argument(
         "--samidare_hop",
         type=int,
         default=1,
@@ -1069,7 +1122,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tie_weights", action="store_true")
     args = ap.parse_args()
-
+    if args.use_hop_projection and not args.use_vqw:
+        ap.error(
+            "--use_hop_projection 1 requires --use_vqw 1"
+        )
     if args.pure_bpe_mode and args.use_vqw:
         ap.error("--pure_bpe_mode 1 requires --use_vqw 0")
     if args.use_hop_embedding and not args.use_vqw:
@@ -1270,6 +1326,9 @@ def main():
         use_hop_embedding=bool(
             args.use_hop_embedding
         ),
+        use_hop_projection=bool(
+            args.use_hop_projection
+        ),
         vqw_init_scale=args.vqw_init_scale,
     ).to(device)
 
@@ -1368,7 +1427,21 @@ def main():
             f"test_bpe_top1={test_metrics['bpe_top1']:.4f} "
             f"test_bpe_top5={test_metrics['bpe_top5']:.4f}"
         )
+        projection_parameters = sum(
+            parameter.numel()
+            for name, parameter in model.named_parameters()
+            if (
+                    "vqw_projection" in name
+                    or "vqw_projections" in name
+            )
+        )
 
+        print(
+            "[VQW projection] "
+            f"hop_specific={args.use_hop_projection} "
+            f"count={10 if args.use_hop_projection else 1} "
+            f"parameters={projection_parameters}"
+        )
         record = {
             "epoch": epoch,
             "train_bpe_loss": (
@@ -1378,8 +1451,18 @@ def main():
             "test": test_metrics,
         }
         history.append(record)
-        if args.use_vqw and args.samidare_hop:
-            if args.use_hop_embedding:
+        elif args.use_vqw:
+        if args.samidare_hop:
+            if args.use_hop_projection:
+                architecture_name = (
+                    "bpe_vqw_samidare_hop_specific_projection"
+                )
+                architecture_description = (
+                    "4 causal BPE heads + 4 Samidare VQW heads "
+                    "+ HOP-specific center projections"
+                )
+
+            elif args.use_hop_embedding:
                 architecture_name = (
                     "bpe_vqw_samidare_hop_embedding"
                 )
@@ -1387,9 +1470,13 @@ def main():
                     "4 causal BPE heads + 4 Samidare VQW heads "
                     "+ lightweight HOP embedding"
                 )
+
             else:
                 architecture_name = (
                     "bpe_vqw_samidare_distance_attention"
+                )
+                architecture_description = (
+                    "4 causal BPE heads + 4 Samidare VQW heads"
                 )
         checkpoint = {
             "model": model.state_dict(),
@@ -1447,6 +1534,27 @@ def main():
                 "zeros"
                 if args.use_hop_embedding
                 else None
+            ),
+            "use_hop_projection": bool(
+                args.use_hop_projection
+            ),
+            "hop_projection_count": (
+                10
+                if args.use_hop_projection
+                else 1
+            ),
+            "hop_projection_shared_initialization": bool(
+                args.use_hop_projection
+            ),
+            "hop_projection_parameters": (
+                sum(
+                    parameter.numel()
+                    for name, parameter in model.named_parameters()
+                    if (
+                            "vqw_projection" in name
+                            or "vqw_projections" in name
+                    )
+                )
             ),
         }
 

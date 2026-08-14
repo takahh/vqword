@@ -43,7 +43,14 @@ case "${USE_HOP_EMBEDDING}" in
     exit 1
     ;;
 esac
-
+USE_HOP_PROJECTION="${USE_HOP_PROJECTION:-0}"
+case "${USE_HOP_PROJECTION}" in
+  0|1) ;;
+  *)
+    echo "[error] USE_HOP_PROJECTION must be 0 or 1"
+    exit 1
+    ;;
+esac
 AR_SEED="${AR_SEED:-0}"
 USE_VQW="${USE_VQW:-1}"
 PURE_BPE_MODE="${PURE_BPE_MODE:-0}"
@@ -369,7 +376,7 @@ PY
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-RUN="ar_inputcat_bpeonly_multihop01to10_usevqw${USE_VQW}_purebpe${PURE_BPE_MODE}_samidare${SAMIDARE_HOP}_hopemb${USE_HOP_EMBEDDING}}_distanthop${DISTANT_HOP}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
+RUN="ar_inputcat_bpeonly_multihop01to10_usevqw${USE_VQW}_purebpe${PURE_BPE_MODE}_samidare${SAMIDARE_HOP}_hopemb${USE_HOP_EMBEDDING}_hopproj${USE_HOP_PROJECTION}_distanthop${DISTANT_HOP}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
@@ -400,6 +407,8 @@ echo "center scale          = ${CENTER_SCALE}"
 echo "codebook size         = ${VQ_CODEBOOK_SIZE}"
 echo "AR seed               = ${AR_SEED}"
 echo "HOP embedding         = ${USE_HOP_EMBEDDING}"
+echo "HOP embedding         = ${USE_HOP_EMBEDDING}"
+echo "HOP projection        = ${USE_HOP_PROJECTION}"
 echo "run                   = ${RUN}"
 echo "============================================================"
 
@@ -429,6 +438,7 @@ python "${AR_SCRIPT}" \
   --vqw_init_scale "${VQW_INIT_SCALE}" \
   --use_hop_embedding "${USE_HOP_EMBEDDING}" \
   --out "${FINAL_PATH}" \
+  --use_hop_projection "${USE_HOP_PROJECTION}" \
   2>&1 | tee "${LOG_PATH}"
 
 # ============================================================
