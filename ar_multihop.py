@@ -552,11 +552,15 @@ class BPEVQWDistancePairAddLM(nn.Module):
         max_len=255,
         tie_weights=False,
         use_vqw=False,
+        pure_bpe_mode=False,
         vqw_init_scale=0.1,
     ):
         super().__init__()
 
         self.use_vqw = bool(use_vqw)
+        self.pure_bpe_mode = bool(pure_bpe_mode)
+        if self.pure_bpe_mode and self.use_vqw:
+            raise ValueError("pure_bpe_mode=1 requires use_vqw=0")
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(target_vq_vocab_size)
         self.tok_pad_id = self.token_vocab_size
@@ -579,11 +583,13 @@ class BPEVQWDistancePairAddLM(nn.Module):
         )
 
         # HOP制限付きBPE control枝用
-        self.distant_bpe_projection = nn.Linear(
-            d_model,
-            d_model,
-            bias=False,
-        )
+        self.distant_bpe_projection = None
+        if not self.pure_bpe_mode:
+            self.distant_bpe_projection = nn.Linear(
+                d_model,
+                d_model,
+                bias=False,
+            )
         # VQW codebook center自体は固定。
         # L2正規化したcenterだけ、学習可能なLinearへ通す。
         if len(centers_by_hop) != 11:
@@ -592,18 +598,23 @@ class BPEVQWDistancePairAddLM(nn.Module):
         if any(int(c.size(1)) != center_dim for c in centers_by_hop):
             raise ValueError("All HOP codebooks must have the same center dimension")
 
-        self.center_embeddings = nn.ModuleList([
-            FrozenCenterEmbedding(centers) for centers in centers_by_hop
-        ])
-
-        self.vqw_projection = nn.Linear(
-            center_dim,
-            d_model,
-            bias=False,
-        )
+        if not self.pure_bpe_mode:
+            self.center_embeddings = nn.ModuleList([
+                FrozenCenterEmbedding(centers) for centers in centers_by_hop
+            ])
+            self.vqw_projection = nn.Linear(
+                center_dim,
+                d_model,
+                bias=False,
+            )
+        else:
+            self.center_embeddings = nn.ModuleList()
+            self.vqw_projection = None
 
         self.pos_emb = nn.Embedding(max_len, d_model)
-        attention_vqw_heads = n_heads // 2
+        # Pure BPE: all heads use ordinary causal BPE K/V.
+        # Other modes retain the split-head comparison design.
+        attention_vqw_heads = 0 if self.pure_bpe_mode else n_heads // 2
         self.shared_blocks = nn.ModuleList([
             SingleHopTransformerBlock(
                 d_model=d_model,
@@ -651,7 +662,12 @@ class BPEVQWDistancePairAddLM(nn.Module):
         # 2. HOP制限付き第2枝
         # ==========================================
 
-        if self.use_vqw:
+        if self.pure_bpe_mode:
+            # The attention blocks have zero second-branch heads, so no
+            # distance-limited BPE or VQW features enter the model.
+            second_x = None
+            second_valid = None
+        elif self.use_vqw:
             # VQW条件：
             # frozen VQW center -> dedicated Linear
             second_valid = vq_in.ne(self.vq_pad_id)
@@ -842,6 +858,17 @@ def main():
         choices=[0, 1],
         help="Use VQ context as input (1=yes, 0=no).",
     )
+    ap.add_argument(
+        "--pure_bpe_mode",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            "Use a standard all-head causal BPE Transformer (1=yes). "
+            "Requires --use_vqw 0. With 0, --use_vqw 0 remains the "
+            "distance-limited BPE control."
+        ),
+    )
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -855,6 +882,8 @@ def main():
     ap.add_argument("--tie_weights", action="store_true")
 
     args = ap.parse_args()
+    if args.pure_bpe_mode and args.use_vqw:
+        ap.error("--pure_bpe_mode 1 requires --use_vqw 0")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -934,12 +963,22 @@ def main():
         reference.get("token_vocab_size", 50257)
     )
 
-    print(
-        "[architecture] "
-        "BPE->learned embedding only, "
-        "VQW HOP0..10->frozen center->shared Linear, "
-        "distance-mapped causal Transformer, BPE head"
-    )
+    if args.pure_bpe_mode:
+        architecture_name = "pure_bpe_causal_transformer"
+        architecture_description = (
+            "pure BPE: all attention heads use ordinary causal BPE K/V"
+        )
+    elif args.use_vqw:
+        architecture_name = "bpe_projection_raw_vqw_distance_attention_causal"
+        architecture_description = (
+            "split heads: ordinary BPE + distance-mapped VQW HOP0..10"
+        )
+    else:
+        architecture_name = "bpe_projection_distant_bpe_attention_causal"
+        architecture_description = (
+            "split heads: ordinary BPE + distance-limited BPE control"
+        )
+    print(f"[architecture] {architecture_description}")
     random.shuffle(samples)
     n = len(samples)
     n_train = int(0.8 * n)
@@ -1007,6 +1046,7 @@ def main():
 
         tie_weights=args.tie_weights,
         use_vqw=bool(args.use_vqw),
+        pure_bpe_mode=bool(args.pure_bpe_mode),
         vqw_init_scale=args.vqw_init_scale,
     ).to(device)
 
@@ -1111,7 +1151,7 @@ def main():
         checkpoint = {
             "model": model.state_dict(),
             "args": vars(args),
-            "architecture": "bpe_projection_raw_vqw_distance_attention_causal",
+            "architecture": architecture_name,
             "history": history,
             "token_vocab_size": token_vocab_size,
             "vq_vocab_size": vq_vocab_size,
