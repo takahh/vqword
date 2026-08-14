@@ -577,11 +577,6 @@ class BPEVQWDistancePairAddLM(nn.Module):
         if self.pure_bpe_mode and self.use_vqw:
             raise ValueError("pure_bpe_mode=1 requires use_vqw=0")
 
-        if self.use_vqw and not self.samidare_hop:
-            raise ValueError("use_vqw=1 requires samidare_hop=1")
-
-        if not self.use_vqw and self.samidare_hop:
-            raise ValueError("use_vqw=0 requires samidare_hop=0")
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(target_vq_vocab_size)
         self.tok_pad_id = self.token_vocab_size
@@ -919,12 +914,6 @@ def main():
 
     if args.pure_bpe_mode and args.use_vqw:
         ap.error("--pure_bpe_mode 1 requires --use_vqw 0")
-
-    if args.use_vqw and not args.samidare_hop:
-        ap.error("--use_vqw 1 requires --samidare_hop 1")
-
-    if not args.use_vqw and args.samidare_hop:
-        ap.error("--use_vqw 0 requires --samidare_hop 0")
 
     if args.pure_bpe_mode and args.use_vqw:
         ap.error("--pure_bpe_mode 1 requires --use_vqw 0")
