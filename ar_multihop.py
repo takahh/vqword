@@ -1221,7 +1221,7 @@ def main():
     token_vocab_size = int(
         reference.get("token_vocab_size", 50257)
     )
-    elif args.use_vqw:
+
     if args.samidare_hop:
         if args.use_hop_projection:
             architecture_name = (
