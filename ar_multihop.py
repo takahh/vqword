@@ -183,7 +183,7 @@ class HeadSplitDistanceAwareAttention(nn.Module):
             dropout=0.1,
             n_vqw_heads=None,
             vqw_init_scale=0.1,
-            disable_second_branch=False,  # 追加
+            disable_second_branch=False,
     ):
         super().__init__()
 
@@ -555,26 +555,33 @@ class BPEVQWDistancePairAddLM(nn.Module):
     """
 
     def __init__(
-        self,
-        centers_by_hop,
-        token_vocab_size,
-        target_vq_vocab_size,
-        d_model=256,
-        n_layers=6,
-        n_heads=8,
-        dropout=0.1,
-        max_len=255,
-        tie_weights=False,
-        use_vqw=False,
-        pure_bpe_mode=False,
-        vqw_init_scale=0.1,
+            self,
+            centers_by_hop,
+            token_vocab_size,
+            target_vq_vocab_size,
+            d_model=256,
+            n_layers=6,
+            n_heads=8,
+            dropout=0.1,
+            max_len=255,
+            tie_weights=False,
+            use_vqw=False,
+            pure_bpe_mode=False,
+            samidare_hop=True,
+            vqw_init_scale=0.1,
     ):
         super().__init__()
-
         self.use_vqw = bool(use_vqw)
         self.pure_bpe_mode = bool(pure_bpe_mode)
+        self.samidare_hop = bool(samidare_hop)
         if self.pure_bpe_mode and self.use_vqw:
             raise ValueError("pure_bpe_mode=1 requires use_vqw=0")
+
+        if self.use_vqw and not self.samidare_hop:
+            raise ValueError("use_vqw=1 requires samidare_hop=1")
+
+        if not self.use_vqw and self.samidare_hop:
+            raise ValueError("use_vqw=0 requires samidare_hop=0")
         self.token_vocab_size = int(token_vocab_size)
         self.vq_vocab_size = int(target_vq_vocab_size)
         self.tok_pad_id = self.token_vocab_size
@@ -851,6 +858,17 @@ def main():
         ),
     )
     ap.add_argument(
+        "--samidare_hop",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help=(
+            "Use distance-dependent Samidare HOP assignment. "
+            "1: distance 1..10 -> HOP1..10 and 11+ -> HOP10; "
+            "0: HOP assignment is undefined/unused."
+        ),
+    )
+    ap.add_argument(
         "--hop_codebook_pattern",
         required=True,
         help=(
@@ -897,8 +915,17 @@ def main():
     ap.add_argument("--max_len", type=int, default=255)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tie_weights", action="store_true")
-
     args = ap.parse_args()
+
+    if args.pure_bpe_mode and args.use_vqw:
+        ap.error("--pure_bpe_mode 1 requires --use_vqw 0")
+
+    if args.use_vqw and not args.samidare_hop:
+        ap.error("--use_vqw 1 requires --samidare_hop 1")
+
+    if not args.use_vqw and args.samidare_hop:
+        ap.error("--use_vqw 0 requires --samidare_hop 0")
+
     if args.pure_bpe_mode and args.use_vqw:
         ap.error("--pure_bpe_mode 1 requires --use_vqw 0")
     random.seed(args.seed)
@@ -1068,13 +1095,11 @@ def main():
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         dropout=args.dropout,
-
-        # 系列長
         max_len=args.max_len,
-
         tie_weights=args.tie_weights,
         use_vqw=bool(args.use_vqw),
         pure_bpe_mode=bool(args.pure_bpe_mode),
+        samidare_hop=bool(args.samidare_hop),
         vqw_init_scale=args.vqw_init_scale,
     ).to(device)
 
@@ -1185,16 +1210,32 @@ def main():
             "vq_vocab_size": vq_vocab_size,
             "tok_pad_id": tok_pad_id,
             "vq_pad_id": vq_pad_id,
-            "hop_distance_mapping": {
-                "distance_1_to_10": "HOP1_to_HOP10",
+            "hop_distance_mapping": (
+            {
+                "distance_1": "HOP1",
+                "distance_2": "HOP2",
+                "distance_3": "HOP3",
+                "distance_4": "HOP4",
+                "distance_5": "HOP5",
+                "distance_6": "HOP6",
+                "distance_7": "HOP7",
+                "distance_8": "HOP8",
+                "distance_9": "HOP9",
+                "distance_10": "HOP10",
                 "distance_11_plus": "HOP10",
-            },
+            }
+            if args.samidare_hop
+            else None
+            ),
             "hop_data_sources": hop_data_paths,
             "hop_codebook_sources": hop_codebook_paths,
             "vq_centers_frozen": True,
             "vq_used_as_input_only": True,
             "last_valid": valid_metrics,
             "last_test": test_metrics,
+            "samidare_hop": bool(args.samidare_hop),
+            "pure_bpe_mode": bool(args.pure_bpe_mode),
+            "use_vqw": bool(args.use_vqw),
         }
 
         torch.save(checkpoint, args.out)
