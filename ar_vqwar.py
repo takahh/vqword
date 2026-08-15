@@ -1248,7 +1248,8 @@ def main():
 
     # Available files are HOP1..HOP10. Attention needs 11 distance
     # buckets, so the last bucket (distance >= 11) reuses HOP10.
-    source_hops = list(range(1, 11)) + [10]
+    # Fixed-HOP10専用。既存の11-bucket形状は維持する。
+    source_hops = [10] * 11
     hop_data_paths = [
         args.hop_data_pattern.format(hop=hop) for hop in source_hops
     ]
