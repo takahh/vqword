@@ -57,6 +57,7 @@ PURE_BPE_MODE="${PURE_BPE_MODE:-0}"
 SAMIDARE_HOP="${SAMIDARE_HOP:-${USE_VQW}}"
 VQW_INIT_SCALE="${VQW_INIT_SCALE:-0.1}"
 LOCAL_BPE_TOKENS="${LOCAL_BPE_TOKENS:-10}"
+MIXTURE_TOPK="${MIXTURE_TOPK:-32}"
 
 # SAMIDARE_HOP=0では、第3引数のHOP未満の距離をマスクし、
 # 指定HOP距離以上だけで固定HOPを使う。
@@ -372,7 +373,7 @@ PY
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-RUN="pure_vqwar_hop10_gap${VQ_GAP}_frozen_bpedec_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
+RUN="vqwar_hop10_gap${VQ_GAP}_localbpe${LOCAL_BPE_TOKENS}_cat_topk${MIXTURE_TOPK}_frozen_bpedec_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
@@ -383,10 +384,13 @@ LOG_PATH="/vqword/${RUN}.log"
 # ============================================================
 
 echo "============================================================"
-echo "[start pure HOP10 VQW-AR + frozen BPE decoder]"
+echo "[start HOP10 VQW-AR + local BPE CAT + frozen BPE decoder]"
 echo "data                  = /vqword/${DATA_FILE}"
 echo "codebook/decoder      = /vqword/${CODEBOOK_FILE}"
 echo "VQ target gap         = ${VQ_GAP}"
+echo "local BPE tokens      = ${LOCAL_BPE_TOKENS}"
+echo "fusion                = VQW hidden CAT local-BPE projection"
+echo "mixture top-k         = ${MIXTURE_TOPK}"
 echo "training objective    = VQW cross entropy only"
 echo "BPE evaluation        = argmax VQW -> frozen pretrained decoder"
 echo "center scale          = ${CENTER_SCALE}"
@@ -408,6 +412,8 @@ python "${AR_SCRIPT}" \
   --data "/vqword/${DATA_FILE}" \
   --codebook "/vqword/${CODEBOOK_FILE}" \
   --gap "${VQ_GAP}" \
+  --local_bpe_tokens "${LOCAL_BPE_TOKENS}" \
+  --mixture_topk "${MIXTURE_TOPK}" \
   --batch_size "${BATCH_SIZE}" \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
