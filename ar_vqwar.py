@@ -1,33 +1,17 @@
 #!/usr/bin/env python3
-"""
-NN-only-to-BPE autoregressive language model.
+"""Pure fixed-HOP VQW autoregression followed by a frozen BPE decoder.
 
-Inputs:
-    learned projection of BPE[t] embedding
-    normalized frozen Single-HOP VQ center (no learned input projection)
-
-Fusion:
-    BPE branch and raw VQW-center branch
-    -> distance-aware attention
-    -> shared causal Transformer
-    -> BPE[t+1] head only
-
-Frozen:
-    - selected HOP codebook centers
-
-Trainable:
-    - BPE embedding
-    - BPE input projection
-    - VQW attention scale
-    - shared causal Transformer
-    - BPE output head
+For target position t, the AR input ends at t-gap.  With bilateral HOP10,
+gap=11 is the first leak-free alignment: the newest input VQW is centered at
+t-11 and its right context ends at t-1.  The model is trained only with VQW
+cross entropy.  BPE metrics are computed by decoding the predicted VQW with
+the pretrained linear center-to-BPE decoder stored in the codebook checkpoint.
 """
 
 import argparse
 import math
 import random
 from pathlib import Path
-import copy
 
 import torch
 import torch.nn as nn
@@ -35,1184 +19,180 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-class SequenceARDataset(Dataset):
-    """
-    1サンプル = 最大max_len位置のAR系列。
 
-    tok_in[:, q] から tok_y[:, q] を予測する。
-    tok_y[:, q] = tok_inの次トークン。
-
-    各入力位置には11個の距離bucketを保持する。
-    bucket 0..9はHOP 1..10、bucket 10は距離11以上で
-    HOP10を再利用する。
-    """
-
-    def __init__(
-        self,
-        samples,
-        token_ids_flat,
-        vq_ids_flat_by_hop,
-        tok_pad_id,
-        vq_pad_id,
-        max_len=255,
-    ):
-        self.max_len = int(max_len)
-        self.tok_pad_id = int(tok_pad_id)
+class GapVQARDataset(Dataset):
+    def __init__(self, samples, token_ids, vq_ids, vq_pad_id, gap=11, max_len=255):
+        self.token_ids = token_ids.long().reshape(-1)
+        self.vq_ids = vq_ids.long().reshape(-1)
         self.vq_pad_id = int(vq_pad_id)
-
-        token_ids_flat = token_ids_flat.long().reshape(-1)
-        if len(vq_ids_flat_by_hop) != 11:
-            raise ValueError("Expected 11 VQ distance buckets")
-        vq_ids_flat_by_hop = [
-            ids.long().reshape(-1) for ids in vq_ids_flat_by_hop
-        ]
-        if any(ids.numel() != token_ids_flat.numel()
-               for ids in vq_ids_flat_by_hop):
-            raise ValueError("Token/VQ flattened lengths do not match")
-
-        self.token_ids_flat = token_ids_flat
-        self.vq_ids_flat_by_hop = vq_ids_flat_by_hop
+        self.gap = int(gap)
+        self.max_len = int(max_len)
+        if self.token_ids.numel() != self.vq_ids.numel():
+            raise ValueError("token_ids and vq_ids have different lengths")
+        if self.gap < 1:
+            raise ValueError("gap must be positive")
 
         self.examples = []
-
         for sample in samples:
-            start = int(sample["start"])
-            end = int(sample["end"])
-
-            # input+targetに最低2 token必要
-            if end - start < 2:
+            start, end = int(sample["start"]), int(sample["end"])
+            aligned = end - start - self.gap
+            if aligned < 1:
                 continue
-
-            # 1チャンクにはinput max_len + 最後のtarget 1個が必要
-            chunk_token_count = self.max_len + 1
-
-            for chunk_start in range(
-                start,
-                end - 1,
-                self.max_len,
-            ):
-                chunk_end = min(
-                    chunk_start + chunk_token_count,
-                    end,
-                )
-
-                length = chunk_end - chunk_start - 1
-                if length < 1:
-                    continue
-                self.examples.append((chunk_start, length))
+            for offset in range(0, aligned, self.max_len):
+                length = min(self.max_len, aligned - offset)
+                self.examples.append((start + offset, length))
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, index):
-        chunk_start, length = self.examples[index]
-        input_end = chunk_start + length
+        source_start, length = self.examples[index]
+        target_start = source_start + self.gap
 
-        padded_tok_in = torch.full(
-            (self.max_len,), self.tok_pad_id, dtype=torch.long
-        )
-        padded_vq_in = torch.full(
-            (11, self.max_len), self.vq_pad_id, dtype=torch.long
-        )
-        padded_tok_y = torch.full(
-            (self.max_len,), -100, dtype=torch.long
-        )
-        attention_mask = torch.zeros(self.max_len, dtype=torch.bool)
+        vq_in = torch.full((self.max_len,), self.vq_pad_id, dtype=torch.long)
+        vq_y = torch.full((self.max_len,), -100, dtype=torch.long)
+        bpe_y = torch.full((self.max_len,), -100, dtype=torch.long)
+        valid = torch.zeros(self.max_len, dtype=torch.bool)
 
-        padded_tok_in[:length] = self.token_ids_flat[
-            chunk_start:input_end
-        ]
-        padded_tok_y[:length] = self.token_ids_flat[
-            chunk_start + 1:input_end + 1
-        ]
-        for hop_index, ids in enumerate(self.vq_ids_flat_by_hop):
-            padded_vq_in[hop_index, :length] = ids[
-                chunk_start:input_end
-            ]
-        attention_mask[:length] = True
+        vq_in[:length] = self.vq_ids[source_start:source_start + length]
+        vq_y[:length] = self.vq_ids[target_start:target_start + length]
+        bpe_y[:length] = self.token_ids[target_start:target_start + length]
+        valid[:length] = True
+        return vq_in, vq_y, bpe_y, valid
 
-        return (
-            padded_tok_in,
-            padded_vq_in,
-            padded_tok_y,
-            attention_mask,
-        )
 
-class FrozenCenterEmbedding(nn.Module):
-    def __init__(self, centers):
+class PureVQWAR(nn.Module):
+    def __init__(self, centers, d_model=256, n_layers=6, n_heads=8,
+                 dropout=0.1, max_len=255):
         super().__init__()
-
         centers = centers.float()
-
-        self.padding_idx = int(centers.size(0))
-        zero = torch.zeros(
-            1,
-            centers.size(1),
-            dtype=centers.dtype,
-        )
-
-        self.register_buffer(
-            "weight",
-            torch.cat([centers, zero], dim=0),
-            persistent=False,
-        )
-
-    def forward(self, ids):
-        return F.embedding(
-            ids,
-            self.weight,
-            padding_idx=self.padding_idx,
-        )
-
-class HeadSplitDistanceAwareAttention(nn.Module):
-    """
-    Head 0 .. n_bpe_heads-1:
-        BPE K/V, normal causal attention
-
-    Remaining heads:
-        VQW K/V, with distance-dependent HOP:
-        distance 1..10 -> HOP 1..10, distance >=11 -> HOP10
-
-    Queryは全headともBPE/shared hiddenから作る。
-    これによりquery位置自身のVQWからのリークを防ぐ。
-    """
-
-    def __init__(
-            self,
-            d_model,
-            n_heads,
-            dropout=0.1,
-            n_vqw_heads=None,
-            vqw_init_scale=0.1,
-            disable_second_branch=False,
-            samidare_hop=True,
-            distant_hop=10,
-            local_bpe_tokens=0,
-    ):
-        super().__init__()
-
-        if d_model % n_heads != 0:
-            raise ValueError(
-                f"d_model={d_model} must be divisible by n_heads={n_heads}"
-            )
-        self.disable_second_branch = bool(disable_second_branch)
-        self.samidare_hop = bool(samidare_hop)
-        self.distant_hop = int(distant_hop)
-        self.local_bpe_tokens = int(local_bpe_tokens)
-        if self.local_bpe_tokens < 0:
-            raise ValueError(
-                "local_bpe_tokens must be >= 0"
-            )
-        if not 1 <= self.distant_hop <= 10:
-            raise ValueError(
-                f"distant_hop must be in 1..10: {self.distant_hop}"
-            )
-        self.d_model = int(d_model)
-        self.n_heads = int(n_heads)
-        self.head_dim = d_model // n_heads
-
-        # 8 headsならデフォルト4 BPE + 4 VQW
-        if n_vqw_heads is None:
-            n_vqw_heads = n_heads // 2
-
-        self.n_vqw_heads = int(n_vqw_heads)
-        self.n_bpe_heads = n_heads - self.n_vqw_heads
-
-        if self.n_bpe_heads <= 0:
-            raise ValueError("Need at least one BPE head")
-
-        if self.n_vqw_heads < 0:
-            raise ValueError("n_vqw_heads must be non-negative")
-        bpe_dim = self.n_bpe_heads * self.head_dim
-        vqw_dim = self.n_vqw_heads * self.head_dim
-
-        # 8 head, d_model=256
-        #
-        # head_dim = 32
-        # BPE 4 heads = 128
-        # VQW 4 heads = 128
-
-        self.q_bpe_proj = nn.Linear(
-            d_model,
-            bpe_dim,
-            bias=False,
-        )
-        self.k_bpe_proj = nn.Linear(
-            d_model,
-            bpe_dim,
-            bias=False,
-        )
-        self.v_bpe_proj = nn.Linear(
-            d_model,
-            bpe_dim,
-            bias=False,
-        )
-
-        # VQW headsはuse_vqw=1の場合のみ作成
-        if self.n_vqw_heads > 0:
-            self.q_vqw_proj = nn.Linear(
-                d_model,
-                vqw_dim,
-                bias=False,
-            )
-            self.k_vqw_proj = nn.Linear(
-                d_model,
-                vqw_dim,
-                bias=False,
-            )
-            self.v_vqw_proj = nn.Linear(
-                d_model,
-                vqw_dim,
-                bias=False,
-            )
-
-            self.vqw_scale = nn.Parameter(
-                torch.tensor(float(vqw_init_scale))
-            )
-        else:
-            self.q_vqw_proj = None
-            self.k_vqw_proj = None
-            self.v_vqw_proj = None
-            self.register_parameter("vqw_scale", None)
-
-        # 全headsをCATした後256次元へ
-        self.out_proj = nn.Linear(
-            d_model,
-            d_model,
-            bias=True,
-        )
-
-        self.attn_dropout = nn.Dropout(dropout)
-
-    def _split_heads(self, x, n_heads):
-        B, L, _ = x.shape
-
-        return (
-            x.view(B, L, n_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-
-    def _merge_heads(self, x):
-        B, H, L, HD = x.shape
-
-        return (
-            x.transpose(1, 2)
-            .contiguous()
-            .view(B, L, H * HD)
-        )
-
-    def forward(
-            self,
-            x,
-            bpe_source,
-            vqw_features,
-            vqw_valid,
-            key_padding_mask=None,
-    ):
-        B, L, _ = x.shape
-        device = x.device
-
-        # ==========================================
-        # CATされた512次元を二つに分ける
-        # ==========================================
-
-        pos = torch.arange(
-            L,
-            device=device,
-        )
-
-        qpos = pos[:, None]
-        kpos = pos[None, :]
-        distance = qpos - kpos
-
-        # =====================================================
-        # BPE HEADS
-        # =====================================================
-
-        qb = self._split_heads(
-            self.q_bpe_proj(x),
-            self.n_bpe_heads,
-        )
-
-        # local BPE modeではK/Vを各layerのhidden stateではなく、
-        # 固定された入力BPE特徴から作る。そうしないとlayerを重ねるたびに
-        # q-9のhidden経由でさらに古いBPEが伝播し、「直前N個だけ」という
-        # 制約が崩れる。
-        bpe_kv_source = (
-            bpe_source
-            if self.local_bpe_tokens > 0
-            else x
-        )
-
-        kb = self._split_heads(
-            self.k_bpe_proj(bpe_kv_source),
-            self.n_bpe_heads,
-        )
-
-        vb = self._split_heads(
-            self.v_bpe_proj(bpe_kv_source),
-            self.n_bpe_heads,
-        )
-
-        bpe_scores = torch.matmul(
-            qb,
-            kb.transpose(-2, -1),
-        ) / math.sqrt(self.head_dim)
-
-        # 普通のcausal。local_bpe_tokens > 0 のときは、予測対象から
-        # 見て直前N個のBPEだけに制限する。
-        # query q は BPE[q+1] を予測するため、N=10なら
-        # key q-9..q（distance 0..9）が直前10 BPEに対応する。
-        bpe_allowed = (
-                kpos <= qpos
-        )
-        if self.local_bpe_tokens > 0:
-            bpe_allowed = (
-                bpe_allowed
-                & distance.lt(self.local_bpe_tokens)
-            )
-
-        bpe_scores = bpe_scores.masked_fill(
-            ~bpe_allowed[None, None, :, :],
-            float("-inf"),
-        )
-
-        if key_padding_mask is not None:
-            bpe_scores = bpe_scores.masked_fill(
-                key_padding_mask[:, None, None, :],
-                float("-inf"),
-            )
-
-        bpe_attn = torch.softmax(
-            bpe_scores,
-            dim=-1,
-        )
-
-        bpe_attn = torch.nan_to_num(
-            bpe_attn,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-        bpe_attn = self.attn_dropout(
-            bpe_attn
-        )
-
-        bpe_out = torch.matmul(
-            bpe_attn,
-            vb,
-        )
-        # =====================================================
-        # VQW HEADS / HEAD CAT
-        # =====================================================
-
-        if self.n_vqw_heads > 0 and not self.disable_second_branch:
-            # VQW headでもQueryはBPE/shared hiddenから作る
-            qv = self._split_heads(
-                self.q_vqw_proj(x),
-                self.n_vqw_heads,
-            )
-
-            # vqw_features: [B, 11, L, D]
-            # K/V候補をHOPごとに作り、query-key距離で一つを選ぶ。
-            kv = self._split_heads(
-                self.k_vqw_proj(vqw_features).reshape(B * 11, L, -1),
-                self.n_vqw_heads,
-            ).reshape(B, 11, self.n_vqw_heads, L, self.head_dim)
-
-            vv = self._split_heads(
-                self.v_vqw_proj(vqw_features).reshape(B * 11, L, -1),
-                self.n_vqw_heads,
-            ).reshape(B, 11, self.n_vqw_heads, L, self.head_dim)
-
-            vqw_scores = torch.full(
-                (B, self.n_vqw_heads, L, L),
-                float("-inf"),
-                device=device,
-                dtype=qv.dtype,
-            )
-            selected_values = []
-
-            if self.samidare_hop:
-                # distance 1..10 -> HOP1..10, distance 11+ -> HOP10
-                # Each selected HOP reaches at most the current query token,
-                # never the next-token prediction target.
-                for bucket_index in range(11):
-                    if bucket_index < 10:
-                        pair_mask = distance.eq(bucket_index + 1)
-                    else:
-                        pair_mask = distance.ge(11)
-
-                    hop_scores = torch.matmul(
-                        qv,
-                        kv[:, bucket_index].transpose(-2, -1),
-                    ) / math.sqrt(self.head_dim)
-                    allowed = (
-                        pair_mask[None, None, :, :]
-                        & vqw_valid[:, bucket_index, None, None, :]
-                    )
-                    vqw_scores = torch.where(
-                        allowed,
-                        hop_scores,
-                        vqw_scores,
-                    )
-                    selected_values.append(
-                        (pair_mask, vv[:, bucket_index])
-                    )
-            else:
-                # Fixed-HOP mode. For HOP h, keys with attention distance
-                # smaller than h are masked because their bilateral context
-                # could include the next-token prediction target. With HOP10,
-                # distance>=10 corresponds to the target's 11th previous
-                # token or earlier.
-                bucket_index = self.distant_hop - 1
-                pair_mask = distance.ge(self.distant_hop)
-                hop_scores = torch.matmul(
-                    qv,
-                    kv[:, bucket_index].transpose(-2, -1),
-                ) / math.sqrt(self.head_dim)
-                allowed = (
-                    pair_mask[None, None, :, :]
-                    & vqw_valid[:, bucket_index, None, None, :]
-                )
-                vqw_scores = torch.where(
-                    allowed,
-                    hop_scores,
-                    vqw_scores,
-                )
-                selected_values.append(
-                    (pair_mask, vv[:, bucket_index])
-                )
-
-            if key_padding_mask is not None:
-                vqw_scores = vqw_scores.masked_fill(
-                    key_padding_mask[:, None, None, :],
-                    float("-inf"),
-                )
-
-            vqw_attn = torch.softmax(
-                vqw_scores,
-                dim=-1,
-            )
-
-            vqw_attn = torch.nan_to_num(
-                vqw_attn,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-
-            vqw_attn = self.attn_dropout(
-                vqw_attn
-            )
-
-            vqw_out = torch.zeros_like(qv)
-            for pair_mask, selected_v in selected_values:
-                hop_attn = vqw_attn * pair_mask[None, None, :, :]
-                vqw_out = vqw_out + torch.matmul(
-                    hop_attn,
-                    selected_v,
-                )
-
-            vqw_out = (
-                    self.vqw_scale * vqw_out
-            )
-
-            # 4 BPE heads + 4 VQW heads
-            all_heads = torch.cat(
-                [bpe_out, vqw_out],
-                dim=1,
-            )
-        elif self.n_vqw_heads > 0:
-            # Pure BPE:
-            # 4 BPE headsは使用し、残り4 headsはゼロ固定
-            unused_out = bpe_out.new_zeros(
-                B,
-                self.n_vqw_heads,
-                L,
-                self.head_dim,
-            )
-            all_heads = torch.cat(
-                [bpe_out, unused_out],
-                dim=1,
-            )
-        else:
-            all_heads = bpe_out
-
-        merged = self._merge_heads(
-            all_heads
-        )
-
-        return self.out_proj(merged)
-
-class SingleHopTransformerBlock(nn.Module):
-    def __init__(
-            self,
-            d_model,
-            n_heads,
-            dropout=0.1,
-            vqw_init_scale=0.1,
-            n_vqw_heads=None,
-            disable_second_branch=False,
-            samidare_hop=True,
-            distant_hop=10,
-            local_bpe_tokens=0,
-    ):
-        super().__init__()
-
-        self.norm1 = nn.LayerNorm(d_model)
-
-        self.attention = HeadSplitDistanceAwareAttention(
-            d_model=d_model,
-            n_heads=n_heads,
-            dropout=dropout,
-            n_vqw_heads=n_vqw_heads,
-            vqw_init_scale=vqw_init_scale,
-            disable_second_branch=disable_second_branch,
-            samidare_hop=samidare_hop,
-            distant_hop=distant_hop,
-            local_bpe_tokens=local_bpe_tokens,
-        )
-
-        self.dropout1 = nn.Dropout(dropout)
-
-        self.norm2 = nn.LayerNorm(d_model)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * d_model, d_model),
-        )
-
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(
-            self,
-            x,
-            bpe_source,
-            vqw_features,
-            vqw_valid,
-            key_padding_mask=None,
-    ):
-        h = self.norm1(x)
-
-        attn_out = self.attention(
-            x=h,
-            bpe_source=bpe_source,
-            vqw_features=vqw_features,
-            vqw_valid=vqw_valid,
-            key_padding_mask=key_padding_mask,
-        )
-
-        x = x + self.dropout1(attn_out)
-
-        x = x + self.dropout2(
-            self.ffn(self.norm2(x))
-        )
-
-        return x
-
-
-class BPEVQWDistancePairAddLM(nn.Module):
-    """
-    BPE causal Transformer with a distance-dependent VQW K/V branch.
-
-    For query q and key k, distance 1..10 selects HOP 1..10;
-    distance 11 or larger selects HOP10. Distance 0 is never allowed,
-    so the VQW branch cannot leak the current position.
-    """
-
-    def __init__(
-            self,
-            centers_by_hop,
-            token_vocab_size,
-            target_vq_vocab_size,
-            d_model=256,
-            n_layers=6,
-            n_heads=8,
-            dropout=0.1,
-            max_len=255,
-            tie_weights=False,
-            use_vqw=False,
-            pure_bpe_mode=False,
-            samidare_hop=True,
-            distant_hop=10,
-            use_hop_embedding=False,
-            use_hop_projection=False,
-            vqw_init_scale=0.1,
-            local_bpe_tokens=0,
-    ):
-        super().__init__()
-
-        # ==============================================
-        # 1. 先にすべての設定をselfへ保存
-        # ==============================================
-
-        self.use_vqw = bool(
-            use_vqw
-        )
-
-        self.pure_bpe_mode = bool(
-            pure_bpe_mode
-        )
-
-        self.samidare_hop = bool(
-            samidare_hop
-        )
-
-        self.distant_hop = int(
-            distant_hop
-        )
-
-        self.use_hop_embedding = bool(
-            use_hop_embedding
-        )
-
-        self.use_hop_projection = bool(
-            use_hop_projection
-        )
-
-        self.local_bpe_tokens = int(
-            local_bpe_tokens
-        )
-
-        # ==============================================
-        # 2. selfへの保存後に引数を検査
-        # ==============================================
-
-        if not 1 <= self.distant_hop <= 10:
-            raise ValueError(
-                f"distant_hop must be in 1..10: "
-                f"{self.distant_hop}"
-            )
-
-        if self.local_bpe_tokens < 0:
-            raise ValueError(
-                "local_bpe_tokens must be >= 0"
-            )
-
-        if self.pure_bpe_mode and self.use_vqw:
-            raise ValueError(
-                "pure_bpe_mode=1 requires use_vqw=0"
-            )
-
-        if self.use_hop_embedding and not self.use_vqw:
-            raise ValueError(
-                "use_hop_embedding=1 requires use_vqw=1"
-            )
-
-        if self.use_hop_projection and not self.use_vqw:
-            raise ValueError(
-                "use_hop_projection=1 requires use_vqw=1"
-            )
-
-        if (
-                self.use_hop_embedding
-                and self.use_hop_projection
-        ):
-            raise ValueError(
-                "use_hop_embedding and use_hop_projection "
-                "cannot both be enabled"
-            )
-        self.token_vocab_size = int(token_vocab_size)
-        self.vq_vocab_size = int(target_vq_vocab_size)
-        self.tok_pad_id = self.token_vocab_size
+        self.vq_vocab_size = int(centers.size(0))
         self.vq_pad_id = self.vq_vocab_size
-        self.d_model = int(d_model)
-        self.tie_weights = bool(tie_weights)
+        zero = torch.zeros(1, centers.size(1), dtype=centers.dtype)
+        self.register_buffer("center_table", torch.cat([centers, zero], 0))
 
-        self.tok_emb = nn.Embedding(
-            self.token_vocab_size + 1,
-            d_model,
-            padding_idx=self.tok_pad_id,
-        )
-
-        # BPE側の学習可能なNN
-        # 通常BPE attention用
-        self.bpe_projection = nn.Linear(
-            d_model,
-            d_model,
-            bias=False,
-        )
-
-        # HOP制限付きBPE control枝用
-        self.distant_bpe_projection = None
-        if not self.pure_bpe_mode:
-            self.distant_bpe_projection = nn.Linear(
-                d_model,
-                d_model,
-                bias=False,
-            )
-        # 11 distance buckets: HOP1..10 plus HOP10 reuse for 11+.
-        # VQW codebook center自体は固定。
-        # L2正規化したcenterだけ、学習可能なLinearへ通す。
-        if len(centers_by_hop) != 11:
-            raise ValueError("Expected 11 codebook distance buckets")
-        center_dim = int(centers_by_hop[0].size(1))
-        if any(int(c.size(1)) != center_dim for c in centers_by_hop):
-            raise ValueError("All HOP codebooks must have the same center dimension")
-
-        if not self.pure_bpe_mode:
-            self.center_embeddings = nn.ModuleList([
-                FrozenCenterEmbedding(centers)
-                for centers in centers_by_hop
-            ])
-
-            # 従来の共通projectionと同じ初期値を1つ作る。
-            base_vqw_projection = nn.Linear(
-                center_dim,
-                d_model,
-                bias=False,
-            )
-
-            if self.use_hop_projection:
-                # HOP1〜HOP10専用の10 projection。
-                #
-                # 全projectionを同一初期値から始めることで、
-                # 初期状態では従来の共通projectionと等価にする。
-                # 学習開始後はHOPごとに別々に更新される。
-                self.vqw_projections = nn.ModuleList([
-                    copy.deepcopy(base_vqw_projection)
-                    for _ in range(10)
-                ])
-
-                self.vqw_projection = None
-
-            else:
-                # 従来どおり全HOPで1つのprojectionを共有
-                self.vqw_projection = base_vqw_projection
-                self.vqw_projections = nn.ModuleList()
-            # 実際のHOPはHOP1〜HOP10の10種類。
-            # 11番目のbucketはHOP10の再利用なので、
-            # HOP embeddingはHOP10と共有する。
-            self.n_physical_hops = 10
-
-            if self.use_hop_embedding:
-                self.hop_embedding = nn.Embedding(
-                    self.n_physical_hops,
-                    d_model,
-                )
-
-                # 従来モデルと同じ初期状態から開始するためゼロ初期化。
-                # 学習後はHOPごとに別々のベクトルへ更新される。
-                nn.init.zeros_(
-                    self.hop_embedding.weight
-                )
-            else:
-                self.hop_embedding = None
-
-        else:
-            self.center_embeddings = nn.ModuleList()
-            self.vqw_projection = None
-            self.vqw_projections = nn.ModuleList()
-            self.n_physical_hops = 10
-            self.hop_embedding = None
-
+        self.input_projection = nn.Linear(centers.size(1), d_model, bias=False)
         self.pos_emb = nn.Embedding(max_len, d_model)
-        # Pure BPE baselineは全headsを通常のBPE causal attentionに使う。
-        # その他の条件は4 BPE heads + 4 second-branch headsを保つ。
-        attention_vqw_heads = (
-            0 if self.pure_bpe_mode else n_heads // 2
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
-        self.shared_blocks = nn.ModuleList([
-            SingleHopTransformerBlock(
-                d_model=d_model,
-                n_heads=n_heads,
-                dropout=dropout,
-                vqw_init_scale=vqw_init_scale,
-                n_vqw_heads=attention_vqw_heads,
-                disable_second_branch=self.pure_bpe_mode,
-                samidare_hop=self.samidare_hop,
-                distant_hop=self.distant_hop,
-                local_bpe_tokens=self.local_bpe_tokens,
-            )
-            for _ in range(n_layers)
-        ])
-        self.shared_norm = nn.LayerNorm(d_model)
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.vq_head = nn.Linear(d_model, self.vq_vocab_size)
 
-        if not self.tie_weights:
-            self.bpe_head = nn.Linear(
-                d_model, self.token_vocab_size, bias=False
-            )
-        else:
-            self.bpe_head = None
-        self.bpe_bias = nn.Parameter(
-            torch.zeros(self.token_vocab_size)
+    def forward(self, vq_in, key_padding_mask=None):
+        _, length = vq_in.shape
+        pos = torch.arange(length, device=vq_in.device)[None, :]
+        centers = F.embedding(vq_in, self.center_table, padding_idx=self.vq_pad_id)
+        h = self.input_projection(centers) + self.pos_emb(pos)
+        causal = torch.triu(
+            torch.ones(length, length, dtype=torch.bool, device=vq_in.device),
+            diagonal=1,
         )
+        h = self.transformer(h, mask=causal, src_key_padding_mask=key_padding_mask)
+        h = self.norm(h)
+        return self.vq_head(h)
 
-    def forward(
-            self,
-            tok_in,
-            vq_in,
-            key_padding_mask=None,
-    ):
-        _, seq_len = tok_in.shape
 
-        pos = torch.arange(
-            seq_len,
-            device=tok_in.device,
-        )[None, :]
-
-        # ==========================================
-        # 1. BPE -> embeddingのみ（追加NNなし）
-        # ==========================================
-        # BPE embedding -> learned NN
-        # 元のBPE embedding
-        tok_e = self.tok_emb(tok_in)
-
-        # 通常BPE headへ渡す特徴
-        bpe_x = self.bpe_projection(tok_e)
-
-        # ==========================================
-        # 2. HOP制限付き第2枝
-        # ==========================================
-
-        if self.pure_bpe_mode:
-            # The attention blocks have zero second-branch heads, so no
-            # distance-limited BPE or VQW features enter the model.
-            second_x = None
-            second_valid = None
-        elif self.use_vqw:
-            # vq_in shape:
-            # [batch, 11 buckets, sequence_length]
-            #
-            # bucket 0  = HOP1
-            # bucket 1  = HOP2
-            # ...
-            # bucket 9  = HOP10
-            # bucket 10 = 距離11以上用に再利用するHOP10
-
-            second_valid = vq_in.ne(self.vq_pad_id)
-
-            # ==============================================
-            # 1. frozen centerを取得する
-            # ==============================================
-            if self.use_hop_projection:
-                projected_centers = []
-                for bucket_index in range(11):
-                    # このbucketに対応するfrozen centerを取得
-                    center = self.center_embeddings[
-                        bucket_index
-                    ](
-                        vq_in[:, bucket_index]
-                    )
-                    # bucket 0〜9はHOP1〜HOP10。
-                    # bucket 10もHOP10の再利用なので、
-                    # projection index 9を共有する。
-                    projection_index = min(
-                        bucket_index,
-                        9,
-                    )
-                    projected = self.vqw_projections[
-                        projection_index
-                    ](center)
-                    projected_centers.append(
-                        projected
-                    )
-                center_feature = torch.stack(
-                    projected_centers,
-                    dim=1,
-                )
-            else:
-                # 従来の共通projection
-                vqw_center = torch.stack([
-                    self.center_embeddings[bucket_index](
-                        vq_in[:, bucket_index]
-                    )
-                    for bucket_index in range(11)
-                ], dim=1)
-                center_feature = self.vqw_projection(
-                    vqw_center
-                )
-            # ==============================================
-            # 3. 必要ならglobal ID embeddingを追加
-            # ==============================================
-            if self.use_hop_embedding:
-                # bucketと物理HOPの対応：
-                #
-                # bucket 0  → HOP1  → embedding index 0
-                # bucket 1  → HOP2  → embedding index 1
-                # ...
-                # bucket 9  → HOP10 → embedding index 9
-                # bucket 10 → HOP10 → embedding index 9
-                hop_indices = torch.tensor(
-                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9],
-                    dtype=torch.long,
-                    device=vq_in.device,
-                )
-
-                hop_feature = self.hop_embedding(
-                    hop_indices
-                )
-
-                # hop_feature:
-                # [11, d_model]
-                #
-                # [1, 11, 1, d_model]へ変形し、
-                # batch方向と系列長方向へbroadcastする。
-                second_x = (
-                        center_feature
-                        + hop_feature[None, :, None, :]
-                )
-            else:
-                second_x = center_feature
-            # ==============================================
-            # 4. padding位置を最終的にゼロ化
-            # ==============================================
-            second_x = (
-                    second_x
-                    * second_valid.unsqueeze(-1).to(
-                second_x.dtype
+class FrozenCenterToBPE(nn.Module):
+    def __init__(self, centers, weight, bias):
+        super().__init__()
+        if weight.ndim != 2 or weight.size(1) != centers.size(1):
+            raise ValueError(
+                f"decoder/center dimension mismatch: weight={tuple(weight.shape)}, "
+                f"centers={tuple(centers.shape)}"
             )
-            )
+        self.register_buffer("centers", centers.float())
+        self.register_buffer("weight", weight.float())
+        self.register_buffer("bias", bias.float())
 
-        else:
-            # BPE control条件：
-            # BPE embedding -> dedicated Linear
-            second_valid = tok_in.ne(self.tok_pad_id)
+    def forward(self, vq_ids):
+        q = F.embedding(vq_ids, self.centers)
+        return F.linear(q, self.weight, self.bias)
 
-            second_x = self.distant_bpe_projection(
-                tok_e
-            )
 
-            second_x = (
-                    second_x
-                    * second_valid.unsqueeze(-1).to(second_x.dtype)
-            )
-
-            # attention側の共通インターフェース [B, 11, L, D]
-            second_x = second_x[:, None, :, :].expand(-1, 11, -1, -1)
-            second_valid = second_valid[:, None, :].expand(-1, 11, -1)
-
-        # Transformer本体への入力はBPE + positional embedding。
-        # VQWは別枝として各attention blockへ渡す。
-        shared_h = (
-                bpe_x
-                + self.pos_emb(pos)
+def load_decoder(codebook):
+    state = codebook.get("decoder_state_dict")
+    if state is None:
+        model_state = codebook.get("model", {})
+        if "decoder.weight" in model_state and "decoder.bias" in model_state:
+            state = {
+                "weight": model_state["decoder.weight"],
+                "bias": model_state["decoder.bias"],
+            }
+    if state is None or "weight" not in state or "bias" not in state:
+        raise KeyError(
+            "No pretrained linear decoder found. Expected decoder_state_dict "
+            "or model['decoder.weight'/'decoder.bias'] in the codebook."
         )
-        # local BPE attention用の固定K/V source。
-        # layer間で古いBPE情報がリレーされるのを防ぐ。
-        bpe_source = shared_h
+    return state["weight"], state["bias"]
 
-        for block in self.shared_blocks:
-            shared_h = block(
-                x=shared_h,
-                bpe_source=bpe_source,
-                vqw_features=second_x,
-                vqw_valid=second_valid,
-                key_padding_mask=key_padding_mask,
-            )
 
-        shared_h = self.shared_norm(shared_h)
-
-        if self.tie_weights:
-            bpe_logits = F.linear(
-                shared_h,
-                self.tok_emb.weight[:self.token_vocab_size],
-                self.bpe_bias,
-            )
-        else:
-            bpe_logits = (
-                    self.bpe_head(shared_h)
-                    + self.bpe_bias
-            )
-
-        return {
-            "bpe_logits": bpe_logits,
-            "hidden": shared_h,
-            "bpe_input": bpe_x,
-            "second_input": second_x,
-
-            # 古い解析コードとの互換性用
-            "vqw_input": second_x,
-        }
+def accumulate_topk(logits, targets, k=5):
+    top = logits.topk(min(k, logits.size(-1)), dim=-1).indices
+    return (
+        int(top[:, 0].eq(targets).sum().item()),
+        int(top.eq(targets[:, None]).any(dim=1).sum().item()),
+    )
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, decoder, loader, device):
     model.eval()
+    totals = dict(count=0, vq_loss=0.0, vq_top1=0, vq_top5=0,
+                  bpe_loss=0.0, bpe_top1=0, bpe_top5=0,
+                  oracle_bpe_loss=0.0, oracle_bpe_top1=0, oracle_bpe_top5=0)
 
-    total_bpe_loss = 0.0
-    total_count = 0
-    total_bpe_top1 = 0
-    total_bpe_top5 = 0
+    for vq_in, vq_y, bpe_y, valid in tqdm(loader, desc="[eval]", leave=False):
+        vq_in, vq_y = vq_in.to(device), vq_y.to(device)
+        bpe_y, valid = bpe_y.to(device), valid.to(device)
+        logits = model(vq_in, key_padding_mask=~valid)
+        mask = vq_y.ne(-100)
+        vl, vt = logits[mask], vq_y[mask]
+        bt = bpe_y[mask]
+        n = int(vt.numel())
 
-    for (
-            tok_in,
-            vq_in,
-            tok_y,
-            attention_mask,
-    ) in tqdm(loader, desc="[eval]", leave=False):
-        tok_in = tok_in.to(device)
-        vq_in = vq_in.to(device)
-        tok_y = tok_y.to(device)
-        attention_mask = attention_mask.to(device)
+        totals["count"] += n
+        totals["vq_loss"] += float(F.cross_entropy(vl, vt, reduction="sum").item())
+        a, b = accumulate_topk(vl, vt)
+        totals["vq_top1"] += a; totals["vq_top5"] += b
 
-        output = model(
-            tok_in=tok_in,
-            vq_in=vq_in,
-            key_padding_mask=~attention_mask,
+        pred_bpe = decoder(vl.argmax(dim=-1))
+        totals["bpe_loss"] += float(F.cross_entropy(pred_bpe, bt, reduction="sum").item())
+        a, b = accumulate_topk(pred_bpe, bt)
+        totals["bpe_top1"] += a; totals["bpe_top5"] += b
+
+        oracle_bpe = decoder(vt)
+        totals["oracle_bpe_loss"] += float(
+            F.cross_entropy(oracle_bpe, bt, reduction="sum").item()
         )
+        a, b = accumulate_topk(oracle_bpe, bt)
+        totals["oracle_bpe_top1"] += a; totals["oracle_bpe_top5"] += b
 
-        bpe_logits = output["bpe_logits"]
+    n = max(totals["count"], 1)
+    result = {"count": totals["count"]}
+    for prefix in ("vq", "bpe", "oracle_bpe"):
+        ce = totals[f"{prefix}_loss"] / n
+        result[f"{prefix}_loss"] = ce
+        result[f"{prefix}_ppl"] = math.exp(min(ce, 20.0))
+        result[f"{prefix}_top1"] = totals[f"{prefix}_top1"] / n
+        result[f"{prefix}_top5"] = totals[f"{prefix}_top5"] / n
+    return result
 
-        flat_logits = bpe_logits.reshape(
-            -1,
-            bpe_logits.size(-1),
-        )
-
-        flat_targets = tok_y.reshape(-1)
-
-        valid_target = flat_targets.ne(-100)
-
-        valid_logits = flat_logits[valid_target]
-        valid_targets = flat_targets[valid_target]
-
-        bpe_loss = F.cross_entropy(
-            valid_logits,
-            valid_targets,
-            reduction="sum",
-        )
-
-        bpe_topk = valid_logits.topk(
-            min(5, valid_logits.size(-1)),
-            dim=-1,
-        ).indices
-
-        batch_count = valid_targets.numel()
-
-        total_bpe_loss += float(bpe_loss.item())
-        total_count += batch_count
-
-        total_bpe_top1 += int(
-            bpe_topk[:, 0]
-            .eq(valid_targets)
-            .sum()
-            .item()
-        )
-
-        total_bpe_top5 += int(
-            bpe_topk
-            .eq(valid_targets[:, None])
-            .any(dim=1)
-            .sum()
-            .item()
-        )
-
-    bpe_ce = total_bpe_loss / max(total_count, 1)
-
-    return {
-        "bpe_loss": bpe_ce,
-        "bpe_ppl": math.exp(min(bpe_ce, 20.0)),
-        "bpe_top1": (
-            total_bpe_top1 / max(total_count, 1)
-        ),
-        "bpe_top5": (
-            total_bpe_top5 / max(total_count, 1)
-        ),
-        "count": total_count,
-    }
 
 def main():
     ap = argparse.ArgumentParser()
-
-    ap.add_argument(
-        "--hop_data_pattern",
-        required=True,
-        help=(
-            "VQ ID path pattern for HOP 1..10. "
-            "Use {hop:02d}, e.g. /data/...bilateral{hop:02d}..._ids.pt"
-        ),
-    )
-    ap.add_argument(
-        "--use_hop_projection",
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help=(
-            "Use separate trainable projections for "
-            "HOP1 through HOP10 VQW center spaces."
-        ),
-    )
-    ap.add_argument(
-        "--samidare_hop",
-        type=int,
-        default=1,
-        choices=[0, 1],
-        help=(
-            "Use distance-dependent Samidare HOP assignment. "
-            "1: distance 1..10 -> HOP1..10 and 11+ -> HOP10; "
-            "0: use --distant_hop only at distances >= that HOP."
-        ),
-    )
-    ap.add_argument(
-        "--distant_hop",
-        type=int,
-        default=10,
-        choices=range(1, 11),
-        help=(
-            "Fixed HOP used when --samidare_hop=0. Keys with attention "
-            "distance smaller than this value are masked."
-        ),
-    )
-    ap.add_argument(
-        "--local_bpe_tokens",
-        type=int,
-        default=0,
-        help=(
-            "Number of immediately preceding BPE tokens visible to the "
-            "BPE attention heads. 0 keeps the ordinary full causal BPE "
-            "context; 10 uses exactly the previous 10 BPE tokens."
-        ),
-    )
-    ap.add_argument(
-        "--hop_codebook_pattern",
-        required=True,
-        help=(
-            "Codebook path pattern for HOP 1..10. "
-            "Use {hop:02d}, e.g. /data/...bilateral{hop:02d}....pt"
-        ),
-    )
-    ap.add_argument(
-        "--vqw_init_scale",
-        type=float,
-        default=0.1,
-        help="Initial learnable scale for the VQW attention contribution.",
-    )
-    ap.add_argument(
-        "--out",
-        default="ar_bpe_singlehop_input_cat_bpe_only.pt",
-    )
-    ap.add_argument(
-        "--use_vqw",
-        type=int,
-        default=1,
-        choices=[0, 1],
-        help="Use VQ context as input (1=yes, 0=no).",
-    )
-    ap.add_argument(
-        "--pure_bpe_mode",
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help=(
-            "Use four causal BPE heads and leave the four second-branch "
-            "head slots unused (1=yes). Requires --use_vqw 0."
-        ),
-    )
-    ap.add_argument(
-        "--use_hop_embedding",
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help=(
-            "Add a trainable HOP1..HOP10 embedding "
-            "to the projected frozen VQW center."
-        ),
-    )
-    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--codebook", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--gap", type=int, default=11)
+    ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
@@ -1222,462 +202,92 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--max_len", type=int, default=255)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--tie_weights", action="store_true")
     args = ap.parse_args()
-    if args.use_hop_projection and not args.use_vqw:
-        ap.error(
-            "--use_hop_projection 1 requires --use_vqw 1"
-        )
-    if args.pure_bpe_mode and args.use_vqw:
-        ap.error("--pure_bpe_mode 1 requires --use_vqw 0")
-    if args.use_hop_embedding and not args.use_vqw:
-        ap.error(
-            "--use_hop_embedding 1 requires --use_vqw 1"
-        )
-    if args.local_bpe_tokens < 0:
-        ap.error("--local_bpe_tokens must be >= 0")
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+
+    random.seed(args.seed); torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {device}")
 
-    # Available files are HOP1..HOP10. Attention needs 11 distance
-    # buckets, so the last bucket (distance >= 11) reuses HOP10.
-    # Fixed-HOP10専用。既存の11-bucket形状は維持する。
-    source_hops = [10] * 11
-    hop_data_paths = [
-        args.hop_data_pattern.format(hop=hop) for hop in source_hops
-    ]
-    hop_codebook_paths = [
-        args.hop_codebook_pattern.format(hop=hop) for hop in source_hops
-    ]
-
-    references = [
-        torch.load(path, map_location="cpu", weights_only=False)
-        for path in hop_data_paths
-    ]
-    reference = references[10]
-    samples = list(reference["samples"])
-    token_ids_flat = reference["token_ids_flat"].long().reshape(-1)
-    vq_ids_flat_by_hop = []
-    centers_by_hop = []
-    vq_vocab_sizes = []
-
-    reference_sample_bounds = [
-        (int(s["start"]), int(s["end"])) for s in samples
-    ]
-    for bucket_index, (source_hop, hop_reference, codebook_path) in enumerate(
-        zip(source_hops, references, hop_codebook_paths)
-    ):
-        recorded_hop = int(hop_reference.get("hop", -1))
-        if recorded_hop != source_hop:
-            raise ValueError(
-                f"Bucket {bucket_index}: expected HOP{source_hop} data, "
-                f"metadata says HOP{recorded_hop}"
-            )
-        hop_tokens = hop_reference["token_ids_flat"].long().reshape(-1)
-        if not torch.equal(hop_tokens, token_ids_flat):
-            raise ValueError(
-                f"Bucket {bucket_index}/HOP{source_hop}: "
-                "token_ids_flat differs from HOP10"
-            )
-        hop_bounds = [
-            (int(s["start"]), int(s["end"]))
-            for s in hop_reference["samples"]
-        ]
-        if hop_bounds != reference_sample_bounds:
-            raise ValueError(
-                f"Bucket {bucket_index}/HOP{source_hop}: "
-                "sample boundaries differ from HOP10"
-            )
-
-        raw = torch.load(
-            codebook_path, map_location="cpu", weights_only=False
+    data = torch.load(args.data, map_location="cpu", weights_only=False)
+    codebook = torch.load(args.codebook, map_location="cpu", weights_only=False)
+    if int(data.get("hop", -1)) != 10 or int(codebook.get("hop", -1)) != 10:
+        raise ValueError(
+            f"HOP10 required: data={data.get('hop')}, codebook={codebook.get('hop')}"
         )
-        codebook_hop = int(raw.get("args", {}).get("hop", -1))
-        if codebook_hop != source_hop:
-            raise ValueError(
-                f"Bucket {bucket_index}: expected HOP{source_hop} "
-                f"codebook, metadata says HOP{codebook_hop}"
-            )
-        centers = raw["global_centers"].float()
-        ids = hop_reference["vq_ids_flat"].long().reshape(-1)
-        vocab_size = int(centers.size(0))
-        vq_min = int(ids.min().item())
-        vq_max = int(ids.max().item())
-        if vq_min < 0 or vq_max >= vocab_size:
-            raise ValueError(
-                f"Bucket {bucket_index}/HOP{source_hop}: VQ IDs out of range: "
-                f"{vq_min}..{vq_max}, vocab={vocab_size}"
-            )
-        vq_ids_flat_by_hop.append(ids)
-        centers_by_hop.append(centers)
-        vq_vocab_sizes.append(vocab_size)
+    centers = codebook["global_centers"].float()
+    vq_ids = data["vq_ids_flat"].long().reshape(-1)
+    token_ids = data["token_ids_flat"].long().reshape(-1)
+    if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= centers.size(0):
+        raise ValueError("VQ IDs are outside the HOP10 codebook")
+    dec_weight, dec_bias = load_decoder(codebook)
+    decoder = FrozenCenterToBPE(centers, dec_weight, dec_bias).to(device).eval()
 
-    if len(set(vq_vocab_sizes)) != 1:
-        raise ValueError(f"HOP codebook sizes differ: {vq_vocab_sizes}")
-    vq_vocab_size = vq_vocab_sizes[0]
-
-    token_vocab_size = int(
-        reference.get("token_vocab_size", 50257)
-    )
-
-    if args.samidare_hop:
-        if args.use_hop_projection:
-            architecture_name = (
-                "bpe_vqw_samidare_hop_specific_projection"
-            )
-            architecture_description = (
-                "4 causal BPE heads + 4 Samidare VQW heads "
-                "+ HOP-specific center projections"
-            )
-
-        elif args.use_hop_embedding:
-            architecture_name = (
-                "bpe_vqw_samidare_hop_embedding"
-            )
-            architecture_description = (
-                "4 causal BPE heads + 4 Samidare VQW heads "
-                "+ lightweight HOP embedding"
-            )
-
-        else:
-            architecture_name = (
-                "bpe_vqw_samidare_distance_attention"
-            )
-            architecture_description = (
-                "4 causal BPE heads + 4 Samidare VQW heads"
-            )
-
-    else:
-        if args.use_hop_projection:
-            architecture_name = (
-                "bpe_vqw_fixed_hop_specific_projection"
-            )
-            architecture_description = (
-                f"4 causal BPE heads + 4 fixed-HOP"
-                f"{args.distant_hop} VQW heads "
-                "+ HOP-specific center projection"
-            )
-
-        elif args.use_hop_embedding:
-            architecture_name = (
-                "bpe_vqw_fixed_hop_embedding"
-            )
-            architecture_description = (
-                f"4 causal BPE heads + 4 fixed-HOP"
-                f"{args.distant_hop} VQW heads "
-                "+ lightweight HOP embedding"
-            )
-
-        else:
-            architecture_name = (
-                "bpe_vqw_fixed_distant_hop_attention"
-            )
-            architecture_description = (
-                f"4 causal BPE heads + 4 fixed-HOP"
-                f"{args.distant_hop} VQW heads "
-                f"at distance>={args.distant_hop}"
-            )
+    samples = list(data["samples"])
     random.shuffle(samples)
-    n = len(samples)
-    n_train = int(0.8 * n)
-    n_valid = int(0.1 * n)
+    n = len(samples); n_train = int(0.8 * n); n_valid = int(0.1 * n)
+    splits = (samples[:n_train], samples[n_train:n_train+n_valid], samples[n_train+n_valid:])
+    datasets = [GapVQARDataset(s, token_ids, vq_ids, centers.size(0), args.gap, args.max_len)
+                for s in splits]
+    loaders = [DataLoader(ds, batch_size=args.batch_size, shuffle=(i == 0),
+                          num_workers=4, pin_memory=True, persistent_workers=True)
+               for i, ds in enumerate(datasets)]
 
-    train_samples = samples[:n_train]
-    valid_samples = samples[n_train:n_train + n_valid]
-    test_samples = samples[n_train + n_valid:]
-
-    tok_pad_id = token_vocab_size
-    vq_pad_id = vq_vocab_size
-
-    train_ds = SequenceARDataset(
-        samples=train_samples,
-        token_ids_flat=token_ids_flat,
-        vq_ids_flat_by_hop=vq_ids_flat_by_hop,
-        tok_pad_id=tok_pad_id,
-        vq_pad_id=vq_pad_id,
-        max_len=args.max_len,
-    )
-
-    valid_ds = SequenceARDataset(
-        samples=valid_samples,
-        token_ids_flat=token_ids_flat,
-        vq_ids_flat_by_hop=vq_ids_flat_by_hop,
-        tok_pad_id=tok_pad_id,
-        vq_pad_id=vq_pad_id,
-        max_len=args.max_len,
-    )
-
-    test_ds = SequenceARDataset(
-        samples=test_samples,
-        token_ids_flat=token_ids_flat,
-        vq_ids_flat_by_hop=vq_ids_flat_by_hop,
-        tok_pad_id=tok_pad_id,
-        vq_pad_id=vq_pad_id,
-        max_len=args.max_len,
-    )
-
-    def make_loader(dataset, shuffle):
-        return DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=shuffle,
-            num_workers=4,
-            pin_memory=True,
-            persistent_workers=True,
-        )
-
-    train_loader = make_loader(train_ds, True)
-    valid_loader = make_loader(valid_ds, False)
-    test_loader = make_loader(test_ds, False)
-
-    model = BPEVQWDistancePairAddLM(
-        centers_by_hop=centers_by_hop,
-        token_vocab_size=token_vocab_size,
-        target_vq_vocab_size=vq_vocab_size,
-        d_model=args.d_model,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
-        dropout=args.dropout,
-        max_len=args.max_len,
-        tie_weights=args.tie_weights,
-        use_vqw=bool(args.use_vqw),
-        pure_bpe_mode=bool(args.pure_bpe_mode),
-        samidare_hop=bool(args.samidare_hop),
-        distant_hop=args.distant_hop,
-        use_hop_embedding=bool(
-            args.use_hop_embedding
-        ),
-        use_hop_projection=bool(
-            args.use_hop_projection
-        ),
-        vqw_init_scale=args.vqw_init_scale,
-        local_bpe_tokens=args.local_bpe_tokens,
-    ).to(device)
-
-    print(
-        "[context split] "
-        f"local_bpe_tokens={args.local_bpe_tokens or 'full'} "
-        f"vqw_mode={'samidare' if args.samidare_hop else 'fixed'} "
-        f"distant_hop={args.distant_hop}"
-    )
-
-    print(
-        "[HOP embedding] "
-        f"enabled={args.use_hop_embedding} "
-        f"physical_hops=10 "
-        f"dim={args.d_model} "
-        f"parameters={10 * args.d_model}"
-    )
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    history = []
-    best_valid = float("inf")
-    best_path = str(
-        Path(args.out).with_name(
-            Path(args.out).stem + "_best.pt"
-        )
-    )
+    model = PureVQWAR(centers, args.d_model, args.n_layers, args.n_heads,
+                      args.dropout, args.max_len).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay)
+    history, best_valid = [], float("inf")
+    best_path = str(Path(args.out).with_name(Path(args.out).stem + "_best.pt"))
+    print(f"[architecture] pure HOP10 VQW-AR gap={args.gap} -> frozen decoder -> BPE")
+    print(f"[decoder] frozen linear {centers.size(1)} -> {dec_weight.size(0)}")
 
     for epoch in range(1, args.epochs + 1):
-        model.train()
-
-        running_bpe_loss = 0.0
-        running_count = 0
-
-        pbar = tqdm(
-            train_loader,
-            desc=f"[train] epoch {epoch}/{args.epochs}",
-        )
-
-        for (
-                tok_in,
-                vq_in,
-                tok_y,
-                attention_mask,
-        ) in pbar:
-            tok_in = tok_in.to(device)
-            vq_in = vq_in.to(device)
-            tok_y = tok_y.to(device)
-            attention_mask = attention_mask.to(device)
+        model.train(); total_loss = 0.0; total_count = 0
+        pbar = tqdm(loaders[0], desc=f"[train] epoch {epoch}/{args.epochs}")
+        for vq_in, vq_y, _bpe_y, valid in pbar:
+            vq_in, vq_y, valid = vq_in.to(device), vq_y.to(device), valid.to(device)
             optimizer.zero_grad(set_to_none=True)
-
-            output = model(
-                tok_in=tok_in,
-                vq_in=vq_in,
-                key_padding_mask=~attention_mask,
-            )
-
-            bpe_logits = output["bpe_logits"]
-
-            bpe_loss = F.cross_entropy(
-                bpe_logits.reshape(-1, bpe_logits.size(-1)),
-                tok_y.reshape(-1),
-                ignore_index=-100,
-            )
-
-            bpe_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                1.0,
-            )
+            logits = model(vq_in, key_padding_mask=~valid)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)),
+                                   vq_y.reshape(-1), ignore_index=-100)
+            loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            count = int(vq_y.ne(-100).sum().item())
+            total_loss += float(loss.item()) * count; total_count += count
+            pbar.set_postfix(vq=f"{total_loss / max(total_count, 1):.4f}")
 
-            n_valid_tokens = int(tok_y.ne(-100).sum().item())
-            running_bpe_loss += (
-                float(bpe_loss.item()) * n_valid_tokens
-            )
-            running_count += n_valid_tokens
-
-            pbar.set_postfix(
-                bpe=f"{running_bpe_loss / max(running_count, 1):.4f}",
-            )
-
-        valid_metrics = evaluate(
-            model,
-            valid_loader,
-            device,
-        )
-        test_metrics = evaluate(
-            model,
-            test_loader,
-            device,
-        )
-
+        valid_metrics = evaluate(model, decoder, loaders[1], device)
+        test_metrics = evaluate(model, decoder, loaders[2], device)
         print(
-            f"[epoch {epoch}] "
+            f"[epoch {epoch}] valid_vq_ppl={valid_metrics['vq_ppl']:.4f} "
+            f"valid_vq_top1={valid_metrics['vq_top1']:.4f} "
             f"valid_bpe_ppl={valid_metrics['bpe_ppl']:.4f} "
             f"valid_bpe_top1={valid_metrics['bpe_top1']:.4f} "
-            f"valid_bpe_top5={valid_metrics['bpe_top5']:.4f} "
+            f"test_vq_ppl={test_metrics['vq_ppl']:.4f} "
+            f"test_vq_top1={test_metrics['vq_top1']:.4f} "
             f"test_bpe_ppl={test_metrics['bpe_ppl']:.4f} "
             f"test_bpe_top1={test_metrics['bpe_top1']:.4f} "
-            f"test_bpe_top5={test_metrics['bpe_top5']:.4f}"
+            f"oracle_bpe_ppl={test_metrics['oracle_bpe_ppl']:.4f}"
         )
-        projection_parameters = sum(
-            parameter.numel()
-            for name, parameter in model.named_parameters()
-            if (
-                    "vqw_projection" in name
-                    or "vqw_projections" in name
-            )
-        )
-
-        print(
-            "[VQW projection] "
-            f"hop_specific={args.use_hop_projection} "
-            f"count={10 if args.use_hop_projection else 1} "
-            f"parameters={projection_parameters}"
-        )
-        record = {
-            "epoch": epoch,
-            "train_bpe_loss": (
-                running_bpe_loss / max(running_count, 1)
-            ),
-            "valid": valid_metrics,
-            "test": test_metrics,
-        }
-        history.append(record)
+        history.append({"epoch": epoch, "train_vq_loss": total_loss/max(total_count, 1),
+                        "valid": valid_metrics, "test": test_metrics})
         checkpoint = {
-            "model": model.state_dict(),
-            "args": vars(args),
-            "architecture": architecture_name,
-            "history": history,
-            "token_vocab_size": token_vocab_size,
-            "vq_vocab_size": vq_vocab_size,
-            "tok_pad_id": tok_pad_id,
-            "vq_pad_id": vq_pad_id,
-            "hop_distance_mapping": (
-                {
-                    "mode": "samidare",
-                    "distance_1_to_10": "HOP1_to_HOP10",
-                    "distance_11_plus": "HOP10",
-                }
-                if args.samidare_hop
-                else {
-                    "mode": "fixed_distant_hop",
-                    "fixed_hop": args.distant_hop,
-                    "minimum_attention_distance": args.distant_hop,
-                    "prediction_relative_first_key": args.distant_hop + 1,
-                    "closer_distances": "masked",
-                }
-            ),
-            "hop_data_sources": hop_data_paths,
-            "hop_codebook_sources": hop_codebook_paths,
-            "vq_centers_frozen": True,
-            "vq_used_as_input_only": True,
-            "last_valid": valid_metrics,
-            "last_test": test_metrics,
-            "samidare_hop": bool(args.samidare_hop),
-            "distant_hop": args.distant_hop,
-            "local_bpe_tokens": args.local_bpe_tokens,
-            "pure_bpe_mode": bool(args.pure_bpe_mode),
-            "use_vqw": bool(args.use_vqw),
-            "use_hop_embedding": bool(
-                args.use_hop_embedding
-            ),
-            "hop_embedding_count": (
-                10
-                if args.use_hop_embedding
-                else 0
-            ),
-            "hop_embedding_dim": (
-                args.d_model
-                if args.use_hop_embedding
-                else 0
-            ),
-            "hop_embedding_parameters": (
-                10 * args.d_model
-                if args.use_hop_embedding
-                else 0
-            ),
-            "hop_embedding_init": (
-                "zeros"
-                if args.use_hop_embedding
-                else None
-            ),
-            "use_hop_projection": bool(
-                args.use_hop_projection
-            ),
-            "hop_projection_count": (
-                10
-                if args.use_hop_projection
-                else 1
-            ),
-            "hop_projection_shared_initialization": bool(
-                args.use_hop_projection
-            ),
-            "hop_projection_parameters": (
-                sum(
-                    parameter.numel()
-                    for name, parameter in model.named_parameters()
-                    if (
-                            "vqw_projection" in name
-                            or "vqw_projections" in name
-                    )
-                )
-            ),
+            "model": model.state_dict(), "args": vars(args), "history": history,
+            "architecture": "pure_hop10_vqwar_gap11_frozen_bpe_decoder",
+            "vq_vocab_size": int(centers.size(0)),
+            "token_vocab_size": int(dec_weight.size(0)),
+            "decoder_frozen": True, "decoder_source": args.codebook,
+            "last_valid": valid_metrics, "last_test": test_metrics,
         }
-
         torch.save(checkpoint, args.out)
-
-        if valid_metrics["bpe_ppl"] < best_valid:
-            best_valid = valid_metrics["bpe_ppl"]
+        if valid_metrics["vq_ppl"] < best_valid:
+            best_valid = valid_metrics["vq_ppl"]
             torch.save(checkpoint, best_path)
             print(f"[save best] {best_path}")
-
     print(f"[save final] {args.out}")
 
 
 if __name__ == "__main__":
     main()
-

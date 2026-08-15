@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -149,7 +150,8 @@ LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
 
-AR_SCRIPT="/vqword/ar_vqwar.py"
+AR_SCRIPT="/vqword/pure_vqwar_decode.py"
+VQ_GAP="${VQ_GAP:-11}"
 
 # ============================================================
 # ファイル名
@@ -371,7 +373,7 @@ PY
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-RUN="ar_inputcat_bpeonly_multihop01to10_usevqw${USE_VQW}_purebpe${PURE_BPE_MODE}_samidare${SAMIDARE_HOP}_hopemb${USE_HOP_EMBEDDING}_hopproj${USE_HOP_PROJECTION}_distanthop${DISTANT_HOP}_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
+RUN="pure_vqwar_hop10_gap${VQ_GAP}_frozen_bpedec_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
 
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
@@ -382,22 +384,12 @@ LOG_PATH="/vqword/${RUN}.log"
 # ============================================================
 
 echo "============================================================"
-echo "[start multi-HOP BPE-only AR training]"
-if [ "${SAMIDARE_HOP}" = "1" ]; then
-  echo "VQW distance mapping  = 1:HOP1 ... 10:HOP10, 11+:HOP10"
-else
-  echo "VQW distance mapping  = distance ${DISTANT_HOP}+: fixed HOP${DISTANT_HOP}"
-fi
-echo "data HOP range        = HOP1..HOP10"
-echo "data pattern          = ${DATA_PATTERN}"
-echo "codebook pattern      = ${CODEBOOK_PATTERN}"
-echo "use VQW               = ${USE_VQW}"
-echo "pure BPE mode         = ${PURE_BPE_MODE}"
-echo "samidare HOP          = ${SAMIDARE_HOP}"
-echo "fixed distant HOP     = ${DISTANT_HOP}"
-echo "minimum key distance  = ${DISTANT_HOP} (when samidare=0)"
-echo "prediction-relative   = $((DISTANT_HOP + 1)) tokens back or earlier"
-echo "VQW initial scale     = ${VQW_INIT_SCALE}"
+echo "[start pure HOP10 VQW-AR + frozen BPE decoder]"
+echo "data                  = /vqword/${DATA_FILE}"
+echo "codebook/decoder      = /vqword/${CODEBOOK_FILE}"
+echo "VQ target gap         = ${VQ_GAP}"
+echo "training objective    = VQW cross entropy only"
+echo "BPE evaluation        = argmax VQW -> frozen pretrained decoder"
 echo "center scale          = ${CENTER_SCALE}"
 echo "codebook size         = ${VQ_CODEBOOK_SIZE}"
 echo "AR seed               = ${AR_SEED}"
@@ -414,8 +406,9 @@ echo "============================================================"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python "${AR_SCRIPT}" \
-  --hop_data_pattern "${DATA_PATTERN}" \
-  --hop_codebook_pattern "${CODEBOOK_PATTERN}" \
+  --data "/vqword/${DATA_FILE}" \
+  --codebook "/vqword/${CODEBOOK_FILE}" \
+  --gap "${VQ_GAP}" \
   --batch_size "${BATCH_SIZE}" \
   --epochs "${EPOCHS}" \
   --lr "${LR}" \
@@ -426,15 +419,7 @@ python "${AR_SCRIPT}" \
   --dropout "${DROPOUT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
-  --use_vqw "${USE_VQW}" \
-  --pure_bpe_mode "${PURE_BPE_MODE}" \
-  --samidare_hop "${SAMIDARE_HOP}" \
-  --distant_hop "${DISTANT_HOP}" \
-  --vqw_init_scale "${VQW_INIT_SCALE}" \
-  --use_hop_embedding "${USE_HOP_EMBEDDING}" \
   --out "${FINAL_PATH}" \
-  --use_hop_projection "${USE_HOP_PROJECTION}" \
-  --local_bpe_tokens "${LOCAL_BPE_TOKENS}" \
   2>&1 | tee "${LOG_PATH}"
 
 # ============================================================
@@ -479,3 +464,5 @@ echo "best  = ${BEST_PATH}"
 echo "final = ${FINAL_PATH}"
 echo "log   = ${LOG_PATH}"
 echo "============================================================"
+
+
