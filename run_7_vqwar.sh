@@ -150,7 +150,7 @@ LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
 
-AR_SCRIPT="/vqword/pure_vqwar.py"
+AR_SCRIPT="/vqword/ar_vqwar.py"
 VQ_GAP="${VQ_GAP:-11}"
 
 # ============================================================
