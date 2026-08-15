@@ -197,16 +197,19 @@ LFTP
 # codebook：WikiText-103で学習したトークナイザー
 # data：そのトークナイザーをTinyStoriesへ適用したAR用ID
 # ============================================================
-
-HOP=10
 HOP_PADDED="10"
 
-download_file \
-  "wikitext103_vqword_bpe50257_bilateral${HOP_PADDED}_center${CENTER_LABEL}_deconly_dec3_global_ivf256_vqcb${VQ_CODEBOOK_LABEL}_seed0.pt"
+CODEBOOK_FILE="wikitext103_vqword_bpe50257_bilateral${HOP_PADDED}_center${CENTER_LABEL}_deconly_dec3_global_ivf256_vqcb${VQ_CODEBOOK_LABEL}_seed0.pt"
+
+DATA_FILE="tinystories_vqword_bpe50257_bilateral${HOP_PADDED}_center${CENTER_LABEL}_deconly_dec3_global_ivf256_vqcb${VQ_CODEBOOK_LABEL}_seed0_ids.pt"
 
 download_file \
-  "tinystories_vqword_bpe50257_bilateral${HOP_PADDED}_center${CENTER_LABEL}_deconly_dec3_global_ivf256_vqcb${VQ_CODEBOOK_LABEL}_seed0_ids.pt"
+  "${CODEBOOK_FILE}" \
+  "/vqword/${CODEBOOK_FILE}"
 
+download_file \
+  "${DATA_FILE}" \
+  "/vqword/${DATA_FILE}"
 # ============================================================
 # HOP1..10の事前検証
 # ============================================================
