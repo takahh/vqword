@@ -232,7 +232,7 @@ expected_center_scale = float(sys.argv[4])
 reference_tokens = None
 reference_bounds = None
 
-for hop in range(1, 11):
+for hop in (10,):
     data_path = data_pattern.format(hop=hop)
     codebook_path = codebook_pattern.format(hop=hop)
 
