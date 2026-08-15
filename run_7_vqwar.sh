@@ -198,24 +198,15 @@ LFTP
 # data：そのトークナイザーをTinyStoriesへ適用したAR用ID
 # ============================================================
 
-for HOP_INDEX in $(seq 1 10); do
-  HOP2=$(printf "%02d" "${HOP_INDEX}")
+HOP=10
+HOP_PADDED="10"
 
-  CODEBOOK_PREFIX="wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_${COMMON_SUFFIX}"
+download_file \
+  "wikitext103_vqword_bpe50257_bilateral${HOP_PADDED}_center${CENTER_LABEL}_deconly_dec3_global_ivf256_vqcb${VQ_CODEBOOK_LABEL}_seed0.pt"
 
-  DATA_PREFIX="tinystories_vqword_bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_${COMMON_SUFFIX}"
+download_file \
+  "tinystories_vqword_bpe50257_bilateral${HOP_PADDED}_center${CENTER_LABEL}_deconly_dec3_global_ivf256_vqcb${VQ_CODEBOOK_LABEL}_seed0_ids.pt"
 
-  CODEBOOK_FILE="${CODEBOOK_PREFIX}.pt"
-  DATA_FILE="${DATA_PREFIX}_ids.pt"
-
-  download_file \
-    "${CODEBOOK_FILE}" \
-    "/vqword/${CODEBOOK_FILE}"
-
-  download_file \
-    "${DATA_FILE}" \
-    "/vqword/${DATA_FILE}"
-done
 # ============================================================
 # HOP1..10の事前検証
 # ============================================================
