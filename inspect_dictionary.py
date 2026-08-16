@@ -1,7 +1,7 @@
 import torch
 from collections import defaultdict, Counter
 
-raw = torch.load("/Users/taka/tinystories_from_wikitext103_bpe_vqword_bpe_self03_pertok_f03_dictionary.pt", map_location="cpu")
+raw = torch.load("wikitext103_vqword_bpe50257_bilateral10_center1_deconly_dec3_global_ivf256_vqcb25k_seed0_dictionary.pt", map_location="cpu")
 
 dict_entries = {
     int(k): v
