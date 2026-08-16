@@ -1325,6 +1325,10 @@ def main():
             "global_id_max": global_vq_vocab_size - 1,
             "decoder_type": "linear_center_to_bpe",
             "decoder_metrics": final_decoder_metrics,
+            "bpe_id_to_token": [
+                tok.convert_ids_to_tokens(i)
+                for i in range(vocab_size)
+            ],
         },
         ids_out,
     )
