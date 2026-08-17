@@ -108,6 +108,127 @@ class VQWordGNN(nn.Module):
         loss = F.cross_entropy(logits, target_ids)
         return loss, logits, z
 
+@torch.no_grad()
+def fit_bpe_local_kmeans(
+    model,
+    ctx,
+    tgt,
+    batch_size,
+    device,
+    max_clusters=5,
+    seed=0,
+    vocab_size=None,
+):
+    """
+    Cluster latent vectors independently inside each BPE token.
+
+    Returns
+    -------
+    local_vq_ids:
+        [N] tensor. Local cluster ID within each BPE, 0..K_b-1.
+
+    centers_by_bpe:
+        dict[bpe_id] -> [K_b, d_model] tensor
+
+    k_by_bpe:
+        [vocab_size] tensor containing number of local clusters.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Encode all positions
+    # ---------------------------------------------------------
+    all_z = []
+
+    for start in tqdm(
+        range(0, len(ctx), batch_size),
+        desc="[encode for BPE-local clustering]",
+    ):
+        z, _ = encode_batch(
+            model,
+            ctx,
+            start,
+            batch_size,
+            device,
+        )
+        all_z.append(z.cpu())
+
+    z_all = torch.cat(all_z, dim=0)
+    z_all = F.normalize(z_all.float(), dim=-1)
+
+    local_vq_ids = torch.zeros(
+        len(tgt),
+        dtype=torch.long,
+    )
+
+    centers_by_bpe = {}
+    if vocab_size is None:
+        vocab_size = int(tgt.max().item()) + 1
+    k_by_bpe = torch.zeros(int(vocab_size), dtype=torch.long)
+
+    # ---------------------------------------------------------
+    # 2. Partition by BPE ID
+    # ---------------------------------------------------------
+    unique_bpes = torch.unique(tgt)
+
+    for bpe_id_tensor in tqdm(
+        unique_bpes,
+        desc="[BPE-local KMeans]",
+    ):
+        bpe_id = int(bpe_id_tensor.item())
+
+        indices = torch.where(tgt == bpe_id)[0]
+        x = z_all[indices]
+
+        n = x.size(0)
+        k = min(int(max_clusters), n)
+
+        k_by_bpe[bpe_id] = k
+
+        # singleton BPE
+        if k == 1:
+            center = F.normalize(
+                x.mean(dim=0, keepdim=True),
+                dim=-1,
+            )
+
+            centers_by_bpe[bpe_id] = center
+            local_vq_ids[indices] = 0
+            continue
+
+        km = MiniBatchKMeans(
+            n_clusters=k,
+            init="k-means++",
+            n_init=3,
+            batch_size=min(4096, max(k, n)),
+            random_state=seed,
+            reassignment_ratio=0.01,
+        )
+
+        labels = km.fit_predict(
+            x.numpy().astype(np.float32, copy=False)
+        )
+
+        centers = torch.from_numpy(
+            km.cluster_centers_
+        ).float()
+
+        centers = F.normalize(
+            centers,
+            dim=-1,
+        )
+
+        centers_by_bpe[bpe_id] = centers
+
+        local_vq_ids[indices] = torch.from_numpy(
+            labels
+        ).long()
+
+    return (
+        local_vq_ids,
+        centers_by_bpe,
+        k_by_bpe,
+    )
+
 
 def iter_index_batches(n, batch_size, shuffle, device=None):
     if shuffle:
@@ -903,7 +1024,12 @@ def fit_global_ivf_then_kmeans_streaming(model, ctx, batch_size, device, args):
 
 def main():
     ap = argparse.ArgumentParser()
-
+    ap.add_argument(
+        "--local_clusters",
+        type=int,
+        default=5,
+        help="maximum number of latent clusters within each BPE token",
+    )
     # Data
     ap.add_argument("--dataset", default="roneneldan/TinyStories")
     ap.add_argument("--dataset_config", default=None)
@@ -1092,239 +1218,104 @@ def main():
     # With center_scale > 0, the current BPE embedding is already included
     # in the representation before clustering.
     model.eval()
-    (
-        global_centers,
-        vq_ids,
-        ivf_centers,
-        ivf_ids,
-        k_per_ivf_list,
-        global_offsets,
-        ivf_counts,
-    ) = fit_global_ivf_then_kmeans_streaming(
+
+    local_vq_ids, centers_by_bpe, k_by_bpe = fit_bpe_local_kmeans(
         model=model,
         ctx=ctx,
-        batch_size=args.batch_size,
-        device=device,
-        args=args,
-    )
-
-    global_vq_vocab_size = int(global_centers.size(0))
-    print(f"[global] vq_vocab_size={global_vq_vocab_size:,}")
-
-
-    discrete_decoder_history = train_discrete_decoder(
-        decoder=model.decoder,
-        centers=global_centers,
-        vq_ids=vq_ids,
-        tgt=tgt,
-        epochs=args.decoder_epochs,
-        batch_size=args.batch_size,
-        lr=args.decoder_lr,
-        weight_decay=args.decoder_weight_decay,
-        device=device,
-        eval_size=args.decoder_eval_size,
-    )
-
-    final_decoder_metrics = evaluate_discrete_decoder(
-        decoder=model.decoder,
-        centers=global_centers,
-        vq_ids=vq_ids,
         tgt=tgt,
         batch_size=args.batch_size,
         device=device,
-        max_items=args.decoder_eval_size,
+        max_clusters=args.local_clusters,
+        seed=args.seed,
+        vocab_size=vocab_size,
     )
 
+    # The pair itself is the token: no lossy VQW -> BPE decoder is needed.
+    # local_vq_id only has meaning inside its accompanying BPE partition.
+    pair_counts = torch.zeros(
+        (vocab_size, args.local_clusters), dtype=torch.int64
+    )
+    pair_counts.index_put_(
+        (tgt.long(), local_vq_ids.long()),
+        torch.ones_like(tgt, dtype=torch.int64),
+        accumulate=True,
+    )
+    observed_bpes = k_by_bpe > 0
+    used_pairs = int((pair_counts > 0).sum().item())
     print(
-        f"[final discrete reconstruction] "
-        f"loss={final_decoder_metrics['loss']:.6f} "
-        f"ppl={final_decoder_metrics['ppl']:.4f} "
-        f"top1={final_decoder_metrics['top1']:.4f} "
-        f"top5={final_decoder_metrics['top5']:.4f}"
-    )
-
-    # ---------------------------------------------------------
-    # Dictionary: VQW ID -> associated BPE ID candidates
-    # ---------------------------------------------------------
-    top_k = 32
-
-    cluster_counter = defaultdict(Counter)
-
-    for bpe_id, vqw_id in zip(tgt.tolist(), vq_ids.tolist()):
-        cluster_counter[int(vqw_id)][int(bpe_id)] += 1
-
-    # 固定長tensor。
-    # AR側で候補集合を高速に引くために使う。
-    candidate_token_ids = torch.full(
-        (global_vq_vocab_size, top_k),
-        -1,
-        dtype=torch.int32,
-    )
-    candidate_token_counts = torch.zeros(
-        (global_vq_vocab_size, top_k),
-        dtype=torch.int64,
-    )
-
-    # 各VQW IDの全出現数
-    vq_total_counts = torch.zeros(
-        global_vq_vocab_size,
-        dtype=torch.int64,
-    )
-
-    # 各VQW IDに対応するBPE ID数
-    vq_candidate_sizes = torch.zeros(
-        global_vq_vocab_size,
-        dtype=torch.int32,
-    )
-
-    # 可変長の完全版。
-    # VQW ID -> [(bpe_id, count), ...]
-    vq_to_bpe_ids = {}
-
-    for vqw_id in range(global_vq_vocab_size):
-        counter = cluster_counter.get(vqw_id)
-
-        if counter is None:
-            vq_to_bpe_ids[vqw_id] = []
-            continue
-
-        ranked = counter.most_common()
-        total_count = sum(count for _, count in ranked)
-
-        vq_total_counts[vqw_id] = total_count
-        vq_candidate_sizes[vqw_id] = len(ranked)
-
-        # 完全な対応一覧
-        vq_to_bpe_ids[vqw_id] = [
-            (int(bpe_id), int(count))
-            for bpe_id, count in ranked
-        ]
-
-        # 上位top_k候補をtensorにも保存
-        for rank, (bpe_id, count) in enumerate(ranked[:top_k]):
-            candidate_token_ids[vqw_id, rank] = int(bpe_id)
-            candidate_token_counts[vqw_id, rank] = int(count)
-
-    used_vq = vq_total_counts > 0
-
-    print(
-        f"[dictionary] covered="
-        f"{int(used_vq.sum())}/{global_vq_vocab_size} "
-        f"mean_bpe_candidates="
-        f"{vq_candidate_sizes[used_vq].float().mean().item():.2f} "
-        f"max_bpe_candidates="
-        f"{int(vq_candidate_sizes.max())}"
+        f"[BPE-local clustering] observed_bpes={int(observed_bpes.sum())}/"
+        f"{vocab_size} used_pairs={used_pairs} "
+        f"max_local_clusters={args.local_clusters}"
     )
 
     dictionary = {
-        # 完全版
-        "vq_to_bpe_ids": vq_to_bpe_ids,
-
-        # 高速アクセス用上位候補
-        "candidate_token_ids": candidate_token_ids,
-        "candidate_token_counts": candidate_token_counts,
-
-        # 統計
-        "vq_total_counts": vq_total_counts,
-        "vq_candidate_sizes": vq_candidate_sizes,
-
-        # metadata
-        "top_k": top_k,
-        "vq_vocab_size": global_vq_vocab_size,
-        "vq_pad_id": global_vq_vocab_size,
+        "centers_by_bpe": centers_by_bpe,
+        "k_by_bpe": k_by_bpe,
+        "pair_counts": pair_counts,
+        "bpe_id_to_token": [
+            tok.convert_ids_to_tokens(i) for i in range(vocab_size)
+        ],
         "token_vocab_size": vocab_size,
         "tokenizer_name": args.tokenizer,
         "pad_token_id": pad_id,
         "unk_token_id": tok.unk_token_id,
-        "vocab_type": "byte_bpe",
-        "partitioned": False,
-        "partition_type": "global_ivf_then_kmeans",
+        "partitioned": True,
+        "partition_type": "bpe_local_kmeans",
+        "max_local_clusters": int(args.local_clusters),
+        "id_scheme": "(bpe_id, local_vq_id)",
+        "reconstruction": "exact_from_bpe_id",
         "context_type": "bilateral",
         "hop": int(args.hop),
         "context_width": int(2 * args.hop + 1),
-        "id_scheme": "global_ivf_then_local_kmeans",
-        "global_id_min": 0,
-        "global_id_max": global_vq_vocab_size - 1,
-
-        # learned VQ center -> BPE decoder
-        "decoder_state_dict": {
-            key: value.detach().cpu()
-            for key, value in model.decoder.state_dict().items()
-        },
-        "decoder_type": "linear_center_to_bpe",
-        "decoder_metrics": final_decoder_metrics,
-        "discrete_decoder_history": discrete_decoder_history,
-        "encoder_reconstruction_pretraining": False,
     }
 
     dictionary_out = args.out.replace(".pt", "_dictionary.pt")
     torch.save(dictionary, dictionary_out)
     print(f"[save dictionary] {dictionary_out}")
-
-    metrics = compute_cluster_metrics(vq_ids, k_req=global_vq_vocab_size)
-    print(
-        f"[FINAL CLST] N={metrics['N']} "
-        f"K_eff={metrics['K_eff']}/{metrics['K_req']} "
-        f"max_frac={metrics['max_frac']:.4f} "
-        f"top5_frac={metrics['top5_frac']:.4f} "
-        f"H={metrics['entropy']:.4f} "
-        f"ppl={metrics['perplexity']:.2f} "
-        f"singleton_ratio={metrics['singleton_ratio']:.4f}"
-    )
-
     torch.save(
         {
             "model": model.state_dict(),
-            "ivf_centers": ivf_centers,
-            "global_centers": global_centers,
-            "k_per_ivf_list": k_per_ivf_list,
-            "global_offsets": global_offsets,
-            "ivf_counts": ivf_counts,
+            "centers_by_bpe": centers_by_bpe,
+            "k_by_bpe": k_by_bpe,
+
             "args": vars(args),
             "tokenizer_name": args.tokenizer,
             "pad_token_id": pad_id,
-            "unk_token_id": None,
+
             "vocab_type": "byte_bpe",
-            "partitioned": False,
-            "partition_type": "global_ivf_then_kmeans",
+            "partitioned": True,
+            "partition_type": "bpe_local_kmeans",
+
+            "max_local_clusters": int(args.local_clusters),
+
             "context_type": "bilateral",
             "hop": int(args.hop),
             "context_width": int(2 * args.hop + 1),
-            "vq_vocab_size": global_vq_vocab_size,
-            "id_scheme": "global_ivf_then_local_kmeans",
-            "global_id_min": 0,
-            "global_id_max": global_vq_vocab_size - 1,
-            "decoder_type": "linear_center_to_bpe",
-            "decoder_metrics": final_decoder_metrics,
-                "discrete_decoder_history": discrete_decoder_history,
-        "encoder_reconstruction_pretraining": False,
+
+            "id_scheme": "(bpe_id, local_vq_id)",
         },
         args.out,
     )
-
     ids_out = args.out.replace(".pt", "_ids.pt")
     torch.save(
         {
-            "vq_ids": vq_ids.to(torch.int32),
-            "tgt": tgt.to(torch.int32),
-            "ivf_ids": ivf_ids.to(torch.int16),
-            "k_per_ivf_list": k_per_ivf_list,
-            "global_offsets": global_offsets,
+            "bpe_ids": tgt.to(torch.int32),
+            "local_vq_ids": local_vq_ids.to(
+                torch.uint8 if args.local_clusters <= 256 else torch.int16
+            ),
+            "k_by_bpe": k_by_bpe,
+
             "tokenizer_name": args.tokenizer,
             "pad_token_id": pad_id,
-            "unk_token_id": None,
-            "vocab_type": "byte_bpe",
-            "partitioned": False,
-            "partition_type": "global_ivf_then_kmeans",
-            "context_type": "bilateral",
+
+            "partitioned": True,
+            "partition_type": "bpe_local_kmeans",
+            "max_local_clusters": args.local_clusters,
+
+            "id_scheme": "(bpe_id, local_vq_id)",
             "hop": int(args.hop),
             "context_width": int(2 * args.hop + 1),
-            "vq_vocab_size": global_vq_vocab_size,
-            "id_scheme": "global_ivf_then_local_kmeans",
-            "global_id_min": 0,
-            "global_id_max": global_vq_vocab_size - 1,
-            "decoder_type": "linear_center_to_bpe",
-            "decoder_metrics": final_decoder_metrics,
+
             "bpe_id_to_token": [
                 tok.convert_ids_to_tokens(i)
                 for i in range(vocab_size)
