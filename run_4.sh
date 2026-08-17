@@ -21,64 +21,46 @@ fi
 cd /vqword
 git pull
 
+
 # ============================================================
-# 共通設定
+# arguments
 # ============================================================
+
 BPE_VOCAB_LABEL=50257
-if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 {10k|25k|50k} {center_scale} {hop}"
+
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 {local_clusters} {hop}"
   echo
-  echo "Examples:"
-  echo "  $0 10k 1 10"
-  echo "  $0 25k 0.3 25"
+  echo "Example:"
+  echo "  $0 5 10"
   exit 1
 fi
 
-VQ_CODEBOOK_LABEL="$1"
-CENTER_SCALE="$2"
-HOP="$3"
+LOCAL_CLUSTERS="$1"
+HOP="$2"
 
-case "${VQ_CODEBOOK_LABEL}" in
-  10k)
-    VQ_CODEBOOK_SIZE=10000
-    ;;
-  25k)
-    VQ_CODEBOOK_SIZE=25000
-    ;;
-  50k)
-    VQ_CODEBOOK_SIZE=50000
-    ;;
-  *)
-    echo "[error] codebook must be 10k, 25k or 50k: ${VQ_CODEBOOK_LABEL}"
-    exit 1
-    ;;
-esac
+if ! [[ "${LOCAL_CLUSTERS}" =~ ^[0-9]+$ ]]; then
+  echo "[error] local_clusters must be positive integer"
+  exit 1
+fi
 
-case "${CENTER_SCALE}" in
-  0.3|1|1.0)
-    ;;
-  *)
-    echo "[error] center_scale must be 0.3 or 1: ${CENTER_SCALE}"
-    exit 1
-    ;;
-esac
-
-if [ "${CENTER_SCALE}" = "1.0" ]; then
-  CENTER_LABEL=1
-else
-  CENTER_LABEL="${CENTER_SCALE}"
+if [ "${LOCAL_CLUSTERS}" -lt 1 ]; then
+  echo "[error] local_clusters must be >= 1"
+  exit 1
 fi
 
 if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
-  echo "[error] hop must be a non-negative integer: ${HOP}"
+  echo "[error] hop must be non-negative integer"
   exit 1
 fi
 
-DISCRETIZATION_SEED=0
 
-IVF_NLIST=256
-DECODER_EPOCHS=3
-MODEL_VARIANT="deconly"
+# ============================================================
+# fixed settings
+# ============================================================
+
+CENTER_SCALE=0
+DISCRETIZATION_SEED=0
 
 MAX_SAMPLES=20000
 SEQ_LEN=256
@@ -87,14 +69,16 @@ K_BLOCK=4096
 
 BPE_ARCHIVE="bpe_wikitext103_50257.tar.gz"
 TOKENIZER_DIR="/vqword/bpe_wikitext103_50257"
+
 ASSIGN_SCRIPT="/vqword/assign_vqword_ids.py"
 
 FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
 FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
+
 # ============================================================
-# BPE tokenizerを一度だけ取得・展開
+# BPE tokenizer
 # ============================================================
 
 rm -f "/vqword/${BPE_ARCHIVE}"
@@ -116,7 +100,9 @@ get "${BPE_ARCHIVE}" \
 bye
 EOF
 
-tar -xzf "/vqword/${BPE_ARCHIVE}" -C /vqword
+tar -xzf \
+  "/vqword/${BPE_ARCHIVE}" \
+  -C /vqword
 
 if [ ! -d "${TOKENIZER_DIR}" ]; then
   echo "[error] Tokenizer directory was not created:"
@@ -130,13 +116,14 @@ if [ ! -f "${ASSIGN_SCRIPT}" ]; then
   exit 1
 fi
 
+
 # ============================================================
-# HOP 0〜10
+# filenames
 # ============================================================
 
 HOP2=$(printf "%02d" "${HOP}")
 
-BASE_TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center${CENTER_LABEL}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
+BASE_TAG="bpe${BPE_VOCAB_LABEL}_bilateral${HOP2}_center0_localbpe${LOCAL_CLUSTERS}_seed${DISCRETIZATION_SEED}"
 
 VQ_CKPT="wikitext103_vqword_${BASE_TAG}.pt"
 VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
@@ -144,20 +131,24 @@ VQ_CKPT_PATH="/vqword/${VQ_CKPT}"
 OUT="tinystories_vqword_${BASE_TAG}_ids.pt"
 OUT_PATH="/vqword/${OUT}"
 
+
 echo
 echo "============================================================"
-echo "[HOP ${HOP}]"
-echo "checkpoint = ${VQ_CKPT}"
-echo "output     = ${OUT}"
+echo "[BPE-wise assignment]"
+echo "checkpoint     = ${VQ_CKPT}"
+echo "output         = ${OUT}"
+echo "hop            = ${HOP}"
+echo "local clusters = ${LOCAL_CLUSTERS}"
 echo "============================================================"
 
 rm -f "${VQ_CKPT_PATH}"
 rm -f "${OUT_PATH}"
 rm -f "${OUT_PATH}.part"*
 
-# ----------------------------------------------------------
-# checkpoint取得
-# ----------------------------------------------------------
+
+# ============================================================
+# checkpoint download
+# ============================================================
 
 lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
@@ -171,21 +162,24 @@ get "${VQ_CKPT}" \
 bye
 EOF
 
-  if [ ! -f "${VQ_CKPT_PATH}" ]; then
-    echo "[error] checkpoint not found: ${VQ_CKPT_PATH}"
-    exit 1
-  fi
+if [ ! -f "${VQ_CKPT_PATH}" ]; then
+  echo "[error] checkpoint not found:"
+  echo "        ${VQ_CKPT_PATH}"
+  exit 1
+fi
 
-  # ----------------------------------------------------------
-  # checkpoint確認
-  # ----------------------------------------------------------
 
-  python - <<PY
+# ============================================================
+# checkpoint check
+# ============================================================
+
+python - <<PY
 import torch
-expected_center_scale = float("${CENTER_SCALE}")
+
 path = "${VQ_CKPT_PATH}"
+
 expected_hop = int("${HOP}")
-expected_vq_vocab = int("${VQ_CODEBOOK_SIZE}")
+expected_local_clusters = int("${LOCAL_CLUSTERS}")
 expected_bpe_vocab = int("${BPE_VOCAB_LABEL}")
 
 ckpt = torch.load(
@@ -196,80 +190,138 @@ ckpt = torch.load(
 
 required = {
     "model",
-    "ivf_centers",
-    "global_centers",
-    "global_offsets",
-    "vq_vocab_size",
+    "centers_by_bpe",
+    "k_by_bpe",
     "args",
+    "partition_type",
+    "max_local_clusters",
+    "id_scheme",
 }
 
 missing = sorted(required - set(ckpt.keys()))
-if missing:
-    raise ValueError(f"Missing checkpoint keys: {missing}")
 
-args = ckpt["args"]
-actual_hop = int(args["hop"])
-actual_center_scale = float(
-    args.get("center_scale", args.get("center_weight", -1.0))
+if missing:
+    raise ValueError(
+        f"Missing checkpoint keys: {missing}"
+    )
+
+if ckpt["partition_type"] != "bpe_local_kmeans":
+    raise ValueError(
+        f"Unexpected partition_type: "
+        f"{ckpt['partition_type']}"
+    )
+
+if ckpt["id_scheme"] != "(bpe_id, local_vq_id)":
+    raise ValueError(
+        f"Unexpected id_scheme: "
+        f"{ckpt['id_scheme']}"
+    )
+
+actual_hop = int(
+    ckpt.get(
+        "hop",
+        ckpt["args"]["hop"],
+    )
 )
-actual_vq_vocab = int(ckpt["vq_vocab_size"])
+
+actual_center_scale = float(
+    ckpt["args"].get(
+        "center_scale",
+        -1.0,
+    )
+)
+
+actual_local_clusters = int(
+    ckpt["max_local_clusters"]
+)
+
 actual_bpe_vocab = int(
     ckpt["model"]["tok_emb.weight"].shape[0]
 )
-if abs(actual_center_scale - expected_center_scale) > 1e-8:
-    raise ValueError(
-        f"Center scale mismatch: expected={expected_center_scale}, "
-        f"actual={actual_center_scale}"
-    )
+
+k_by_bpe = ckpt["k_by_bpe"].long()
+
 if actual_hop != expected_hop:
     raise ValueError(
-        f"HOP mismatch: expected={expected_hop}, actual={actual_hop}"
+        f"HOP mismatch: "
+        f"expected={expected_hop}, "
+        f"actual={actual_hop}"
     )
 
-if actual_vq_vocab != expected_vq_vocab:
+if abs(actual_center_scale - 0.0) > 1e-8:
     raise ValueError(
-        f"VQ vocab mismatch: expected={expected_vq_vocab}, "
-        f"actual={actual_vq_vocab}"
+        f"center_scale mismatch: "
+        f"expected=0, "
+        f"actual={actual_center_scale}"
+    )
+
+if actual_local_clusters != expected_local_clusters:
+    raise ValueError(
+        f"local cluster mismatch: "
+        f"expected={expected_local_clusters}, "
+        f"actual={actual_local_clusters}"
     )
 
 if actual_bpe_vocab != expected_bpe_vocab:
     raise ValueError(
-        f"BPE vocab mismatch: expected={expected_bpe_vocab}, "
+        f"BPE vocab mismatch: "
+        f"expected={expected_bpe_vocab}, "
         f"actual={actual_bpe_vocab}"
+    )
+
+if k_by_bpe.numel() != expected_bpe_vocab:
+    raise ValueError(
+        f"k_by_bpe length mismatch: "
+        f"{k_by_bpe.numel()} != "
+        f"{expected_bpe_vocab}"
+    )
+
+if int(k_by_bpe.max()) > expected_local_clusters:
+    raise ValueError(
+        f"k_by_bpe max exceeds local cluster setting: "
+        f"{int(k_by_bpe.max())} > "
+        f"{expected_local_clusters}"
     )
 
 print("[checkpoint check] OK")
 print("hop:", actual_hop)
-print("vq_vocab_size:", actual_vq_vocab)
 print("center_scale:", actual_center_scale)
+print("max_local_clusters:", actual_local_clusters)
 print("bpe_vocab_size:", actual_bpe_vocab)
+print("BPEs with centers:", len(ckpt["centers_by_bpe"]))
+print("k_by_bpe min/max:", int(k_by_bpe.min()), int(k_by_bpe.max()))
 PY
 
-  # ----------------------------------------------------------
-  # TinyStories ID付与
-  # ----------------------------------------------------------
 
-  python "${ASSIGN_SCRIPT}" \
-    --ckpt "${VQ_CKPT_PATH}" \
-    --dataset roneneldan/TinyStories \
-    --split train \
-    --text_col text \
-    --max_samples "${MAX_SAMPLES}" \
-    --seq_len "${SEQ_LEN}" \
-    --batch_size "${BATCH_SIZE}" \
-    --k_block "${K_BLOCK}" \
-    --tokenizer "${TOKENIZER_DIR}" \
-    --out "${OUT_PATH}"
+# ============================================================
+# TinyStories ID assignment
+# ============================================================
 
-  # ----------------------------------------------------------
-  # 出力確認
-  # ----------------------------------------------------------
+python "${ASSIGN_SCRIPT}" \
+  --ckpt "${VQ_CKPT_PATH}" \
+  --dataset roneneldan/TinyStories \
+  --split train \
+  --text_col text \
+  --max_samples "${MAX_SAMPLES}" \
+  --seq_len "${SEQ_LEN}" \
+  --batch_size "${BATCH_SIZE}" \
+  --k_block "${K_BLOCK}" \
+  --tokenizer "${TOKENIZER_DIR}" \
+  --missing_bpe_policy zero \
+  --out "${OUT_PATH}"
 
-  python - <<PY
+
+# ============================================================
+# output check
+# ============================================================
+
+python - <<PY
 import torch
 
 path = "${OUT_PATH}"
+
 expected_hop = int("${HOP}")
+expected_local_clusters = int("${LOCAL_CLUSTERS}")
 
 data = torch.load(
     path,
@@ -280,52 +332,184 @@ data = torch.load(
 required = {
     "samples",
     "vq_ids_flat",
+    "local_vq_ids_flat",
     "token_ids_flat",
+    "k_by_bpe",
     "vq_vocab_size",
     "vq_pad_id",
     "hop",
+    "partition_type",
+    "id_scheme",
 }
 
-missing = sorted(required - set(data.keys()))
+missing = sorted(
+    required - set(data.keys())
+)
+
 if missing:
-    raise ValueError(f"Missing output keys: {missing}")
-
-token_ids = data["token_ids_flat"].long().reshape(-1)
-vq_ids = data["vq_ids_flat"].long().reshape(-1)
-
-if token_ids.numel() != vq_ids.numel():
     raise ValueError(
-        f"Length mismatch: token={token_ids.numel()}, "
-        f"vq={vq_ids.numel()}"
+        f"Missing output keys: {missing}"
+    )
+
+if data["partition_type"] != "bpe_local_kmeans":
+    raise ValueError(
+        f"Unexpected partition_type: "
+        f"{data['partition_type']}"
+    )
+
+if data["id_scheme"] != "(bpe_id, local_vq_id)":
+    raise ValueError(
+        f"Unexpected id_scheme: "
+        f"{data['id_scheme']}"
+    )
+
+token_ids = (
+    data["token_ids_flat"]
+    .long()
+    .reshape(-1)
+)
+
+local_ids = (
+    data["local_vq_ids_flat"]
+    .long()
+    .reshape(-1)
+)
+
+vq_ids = (
+    data["vq_ids_flat"]
+    .long()
+    .reshape(-1)
+)
+
+k_by_bpe = (
+    data["k_by_bpe"]
+    .long()
+)
+
+if token_ids.numel() != local_ids.numel():
+    raise ValueError(
+        f"Length mismatch: "
+        f"token={token_ids.numel()}, "
+        f"local_vq={local_ids.numel()}"
+    )
+
+if not torch.equal(
+    local_ids,
+    vq_ids,
+):
+    raise ValueError(
+        "vq_ids_flat and local_vq_ids_flat differ"
     )
 
 if int(data["hop"]) != expected_hop:
     raise ValueError(
-        f"Output HOP mismatch: expected={expected_hop}, "
+        f"Output HOP mismatch: "
+        f"expected={expected_hop}, "
         f"actual={data['hop']}"
     )
 
-if vq_ids.numel() and int(vq_ids.max()) >= int(data["vq_vocab_size"]):
+if int(data["vq_vocab_size"]) != expected_local_clusters:
     raise ValueError(
-        f"VQ ID out of range: max={int(vq_ids.max())}, "
-        f"vocab={int(data['vq_vocab_size'])}"
+        f"VQ vocab mismatch: "
+        f"expected={expected_local_clusters}, "
+        f"actual={data['vq_vocab_size']}"
     )
 
+if int(data["vq_pad_id"]) != expected_local_clusters:
+    raise ValueError(
+        f"VQ pad mismatch: "
+        f"expected={expected_local_clusters}, "
+        f"actual={data['vq_pad_id']}"
+    )
+
+
+# ------------------------------------------------------------
+# Strong per-BPE validation
+#
+# k=0 means the source WikiText checkpoint had no centers for
+# that BPE. Those are handled by missing_bpe_policy=zero.
+# ------------------------------------------------------------
+
+token_k = k_by_bpe[token_ids]
+
+has_centers = token_k > 0
+
+if has_centers.any():
+
+    invalid = (
+        local_ids[has_centers]
+        >= token_k[has_centers]
+    )
+
+    if invalid.any():
+        raise ValueError(
+            "Found local VQ ID outside "
+            "the BPE-specific cluster range"
+        )
+
+
+missing_mask = token_k == 0
+
+if missing_mask.any():
+
+    if not torch.all(
+        local_ids[missing_mask] == 0
+    ):
+        raise ValueError(
+            "Missing-center BPE must have "
+            "local_vq_id=0"
+        )
+
+
 print("[output check] OK")
-print("samples:", len(data["samples"]))
-print("tokens:", token_ids.numel())
-print("hop:", data["hop"])
-print("vq min/max:", int(vq_ids.min()), int(vq_ids.max()))
+
+print(
+    "samples:",
+    len(data["samples"]),
+)
+
+print(
+    "tokens:",
+    token_ids.numel(),
+)
+
+print(
+    "hop:",
+    data["hop"],
+)
+
+print(
+    "vq_vocab_size:",
+    data["vq_vocab_size"],
+)
+
+print(
+    "local VQ min/max:",
+    int(local_ids.min()),
+    int(local_ids.max()),
+)
+
+print(
+    "missing BPE types:",
+    len(data.get("missing_bpe_ids", [])),
+)
+
+print(
+    "missing BPE token count:",
+    int(missing_mask.sum()),
+)
 PY
 
-  # ----------------------------------------------------------
-  # FTPアップロード
-  # ----------------------------------------------------------
 
-  FILE_SIZE=$(stat -c%s "${OUT_PATH}")
+# ============================================================
+# FTP upload
+# ============================================================
 
-  if [ "${FILE_SIZE}" -lt 1800000000 ]; then
-    lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+FILE_SIZE=$(stat -c%s "${OUT_PATH}")
+
+if [ "${FILE_SIZE}" -lt 1800000000 ]; then
+
+  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
@@ -336,15 +520,17 @@ put "${OUT_PATH}" \
 
 bye
 EOF
-  else
-    split \
-      -b 450M \
-      -d \
-      -a 3 \
-      "${OUT_PATH}" \
-      "${OUT_PATH}.part"
 
-    lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+else
+
+  split \
+    -b 450M \
+    -d \
+    -a 3 \
+    "${OUT_PATH}" \
+    "${OUT_PATH}.part"
+
+  lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
 set ftp:ssl-allow no
 set net:max-retries 5
 set net:timeout 30
@@ -354,14 +540,16 @@ mput "${OUT_PATH}.part"*
 
 bye
 EOF
-  fi
 
-  echo "[completed HOP ${HOP}] ${OUT}"
+fi
 
-  # 次のHOP用に巨大checkpointだけ削除
-  rm -f "${VQ_CKPT_PATH}"
 
 echo
 echo "============================================================"
-echo "[completed] CB=${VQ_CODEBOOK_LABEL} center=${CENTER_SCALE} HOP=${HOP}"
+echo "[completed]"
+echo "local_clusters=${LOCAL_CLUSTERS}"
+echo "HOP=${HOP}"
+echo "${OUT}"
 echo "============================================================"
+
+rm -f "${VQ_CKPT_PATH}"
