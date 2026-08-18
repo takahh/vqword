@@ -2,7 +2,9 @@
 """Two leak-free HOP10 AR modes.
 
 local_bpe_direct:
-  (BPE[t-11], local-VQW[t-11]) + BPE[t-10:t-1] -> BPE[t]
+  BPE stream sees through BPE[t-1].
+  VQW stream sees through cat(BPE, local-VQW)[t-11].
+  cat(BPE hidden, VQW hidden) -> BPE[t]
 
 global_vqwar:
   pair-global-ID(BPE, local-VQW)[t-11] + BPE[t-10:t-1]
@@ -82,6 +84,66 @@ class GapPairDataset(Dataset):
         return distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid
 
 
+class TwoStreamLocalDataset(Dataset):
+    """Aligned BPE(t-1) and leak-free local-VQW(t-11) streams."""
+    def __init__(self, samples, token_ids, local_vq_ids, vq_pad_id,
+                 gap=11, max_len=255):
+        self.token_ids = token_ids.long().reshape(-1)
+        self.local_vq_ids = local_vq_ids.long().reshape(-1)
+        self.vq_pad_id = int(vq_pad_id)
+        self.gap = int(gap)
+        self.max_len = int(max_len)
+        self.bpe_input_len = self.max_len + self.gap - 1
+        self.examples = []
+        for sample in samples:
+            start, end = int(sample["start"]), int(sample["end"])
+            aligned = end - start - self.gap
+            if aligned < 1:
+                continue
+            for offset in range(0, aligned, self.max_len):
+                length = min(self.max_len, aligned - offset)
+                self.examples.append((start + offset, length))
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, index):
+        source_start, length = self.examples[index]
+        target_start = source_start + self.gap
+
+        # For target t, this stream ends at BPE[t-1].  The first gap-1
+        # positions warm up the causal BPE backbone for every chunk.
+        bpe_in = torch.zeros(self.bpe_input_len, dtype=torch.long)
+        bpe_valid = torch.zeros(self.bpe_input_len, dtype=torch.bool)
+        bpe_length = length + self.gap - 1
+        bpe_in[:bpe_length] = self.token_ids[
+            source_start:source_start + bpe_length
+        ]
+        bpe_valid[:bpe_length] = True
+
+        # At target t, source position is t-gap=t-11.  Each VQW input also
+        # carries its own BPE identity because local cluster labels are only
+        # meaningful within a BPE partition.
+        vqw_bpe = torch.zeros(self.max_len, dtype=torch.long)
+        local_vq = torch.full(
+            (self.max_len,), self.vq_pad_id, dtype=torch.long
+        )
+        vqw_bpe[:length] = self.token_ids[
+            source_start:source_start + length
+        ]
+        local_vq[:length] = self.local_vq_ids[
+            source_start:source_start + length
+        ]
+
+        bpe_y = torch.full((self.max_len,), -100, dtype=torch.long)
+        bpe_y[:length] = self.token_ids[
+            target_start:target_start + length
+        ]
+        valid = torch.zeros(self.max_len, dtype=torch.bool)
+        valid[:length] = True
+        return bpe_in, vqw_bpe, local_vq, bpe_y, bpe_valid, valid
+
+
 class RecentBPEWindow(nn.Module):
     """Process distant representation + ten recent BPEs as 11 tokens."""
     def __init__(self, token_vocab_size, local_bpe_tokens, d_model,
@@ -144,27 +206,44 @@ class LocalBPEDirectAR(nn.Module):
         super().__init__()
         self.local_vq_vocab_size = int(local_vq_vocab_size)
         self.vq_pad_id = self.local_vq_vocab_size
-        self.distant_bpe_embedding = nn.Embedding(token_vocab_size, d_model)
+        self.gap = int(local_bpe_tokens) + 1
+        self.bpe_embedding = nn.Embedding(token_vocab_size, d_model)
+        self.vqw_bpe_embedding = nn.Embedding(token_vocab_size, d_model)
         self.local_vq_embedding = nn.Embedding(
             self.local_vq_vocab_size + 1, d_model,
             padding_idx=self.vq_pad_id,
         )
-        self.backbone = ARBackbone(
+        self.vqw_input_fusion = nn.Linear(2 * d_model, d_model)
+        self.vqw_input_norm = nn.LayerNorm(d_model)
+        self.bpe_backbone = ARBackbone(
+            d_model, n_layers, n_heads, dropout, max_len + self.gap - 1
+        )
+        self.vqw_backbone = ARBackbone(
             d_model, n_layers, n_heads, dropout, max_len
         )
-        self.window = RecentBPEWindow(
-            token_vocab_size, local_bpe_tokens, d_model,
-            n_heads, dropout, window_layers
-        )
+        self.stream_fusion = nn.Linear(2 * d_model, d_model)
+        self.stream_norm = nn.LayerNorm(d_model)
         self.bpe_head = nn.Linear(d_model, token_vocab_size)
 
-    def forward(self, distant_bpe, local_vq, bpe_gap, key_padding_mask=None):
-        h = (
-            self.distant_bpe_embedding(distant_bpe)
-            + self.local_vq_embedding(local_vq)
+    def forward(self, bpe_in, vqw_bpe, local_vq,
+                bpe_key_padding_mask=None, vqw_key_padding_mask=None):
+        h_bpe_all = self.bpe_backbone(
+            self.bpe_embedding(bpe_in), bpe_key_padding_mask
         )
-        h = self.backbone(h, key_padding_mask)
-        h = self.window(h, bpe_gap)
+        # Output aligned to targets: position gap-1 ends at BPE[t-1].
+        h_bpe = h_bpe_all[:, self.gap - 1:self.gap - 1 + local_vq.size(1)]
+
+        vqw_pair = self.vqw_input_norm(F.gelu(self.vqw_input_fusion(
+            torch.cat([
+                self.vqw_bpe_embedding(vqw_bpe),
+                self.local_vq_embedding(local_vq),
+            ], dim=-1)
+        )))
+        h_vqw = self.vqw_backbone(vqw_pair, vqw_key_padding_mask)
+
+        h = self.stream_norm(F.gelu(self.stream_fusion(
+            torch.cat([h_bpe, h_vqw], dim=-1)
+        )))
         return self.bpe_head(h)
 
 
@@ -235,12 +314,15 @@ def grouped_bpe_nll(pair_logits, bpe_targets, bpe_to_global):
 def evaluate_local(model, loader, device):
     model.eval()
     total = dict(count=0, loss=0.0, top1=0, top5=0)
-    for distant_bpe, vq_in, bpe_gap, _vq_y, bpe_y, valid in tqdm(
+    for bpe_in, vqw_bpe, local_vq, bpe_y, bpe_valid, valid in tqdm(
         loader, desc="[eval local]", leave=False
     ):
-        distant_bpe, vq_in = distant_bpe.to(device), vq_in.to(device)
-        bpe_gap, bpe_y, valid = bpe_gap.to(device), bpe_y.to(device), valid.to(device)
-        logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
+        bpe_in, vqw_bpe = bpe_in.to(device), vqw_bpe.to(device)
+        local_vq, bpe_y = local_vq.to(device), bpe_y.to(device)
+        bpe_valid, valid = bpe_valid.to(device), valid.to(device)
+        logits = model(
+            bpe_in, vqw_bpe, local_vq, ~bpe_valid, ~valid
+        )
         mask = bpe_y.ne(-100)
         pred, target = logits[mask], bpe_y[mask]
         n = int(target.numel())
@@ -376,7 +458,7 @@ def main():
             args.max_len, args.window_layers
         ).to(device)
         selection_metric = "bpe_ppl"
-        architecture = "bpe_plus_local_vqw_direct_bpe_ar"
+        architecture = "two_stream_cat_bpe_tminus1_localvqw_tminus11"
     else:
         if codebook.get("partition_type") != "bpe_local_kmeans":
             raise ValueError("global_vqwar requires bpe_local_kmeans codebook")
@@ -416,10 +498,16 @@ def main():
     random.shuffle(samples)
     n = len(samples); n_train = int(0.8 * n); n_valid = int(0.1 * n)
     splits = (samples[:n_train], samples[n_train:n_train+n_valid], samples[n_train+n_valid:])
-    datasets = [GapPairDataset(
-        split, token_ids, vq_ids, vq_vocab_size, args.gap,
-        args.local_bpe_tokens, args.max_len
-    ) for split in splits]
+    if args.mode == "local_bpe_direct":
+        datasets = [TwoStreamLocalDataset(
+            split, token_ids, vq_ids, vq_vocab_size,
+            args.gap, args.max_len
+        ) for split in splits]
+    else:
+        datasets = [GapPairDataset(
+            split, token_ids, vq_ids, vq_vocab_size, args.gap,
+            args.local_bpe_tokens, args.max_len
+        ) for split in splits]
     loaders = [DataLoader(
         ds, batch_size=args.batch_size, shuffle=(i == 0), num_workers=4,
         pin_memory=True, persistent_workers=True
@@ -437,21 +525,32 @@ def main():
     print(f"[architecture] {architecture}")
     print(f"[alignment] distant=t-{args.gap}; recent_bpe={args.local_bpe_tokens}")
     print(f"[vocab] bpe={token_vocab_size} vqw={vq_vocab_size}")
-    print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
+    if args.mode == "local_bpe_direct":
+        print("[streams] BPE through t-1; cat(BPE,local-VQW) through t-11")
+        print("[fusion] cat(BPE hidden, VQW hidden) -> BPE")
+    else:
+        print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
     if args.mode == "global_vqwar":
         print(f"[loss] pair_ce + {args.bpe_aux_weight:g} * bpe_marginal_ce")
 
     for epoch in range(1, args.epochs + 1):
         model.train(); total_loss = 0.0; total_count = 0
         pbar = tqdm(loaders[0], desc=f"[train] epoch {epoch}/{args.epochs}")
-        for distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid in pbar:
-            distant_bpe, vq_in = distant_bpe.to(device), vq_in.to(device)
-            bpe_gap, valid = bpe_gap.to(device), valid.to(device)
+        for batch in pbar:
             optimizer.zero_grad(set_to_none=True)
             if args.mode == "local_bpe_direct":
+                bpe_in, vqw_bpe, local_vq, bpe_y, bpe_valid, valid = batch
+                bpe_in, vqw_bpe = bpe_in.to(device), vqw_bpe.to(device)
+                local_vq, bpe_y = local_vq.to(device), bpe_y.to(device)
+                bpe_valid, valid = bpe_valid.to(device), valid.to(device)
                 target = bpe_y.to(device)
-                logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
+                logits = model(
+                    bpe_in, vqw_bpe, local_vq, ~bpe_valid, ~valid
+                )
             else:
+                distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid = batch
+                vq_in, bpe_gap = vq_in.to(device), bpe_gap.to(device)
+                valid = valid.to(device)
                 target = vq_y.to(device)
                 bpe_target = bpe_y.to(device)
                 logits = model(vq_in, bpe_gap, ~valid)
