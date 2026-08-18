@@ -82,20 +82,35 @@ class GapPairDataset(Dataset):
         return distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid
 
 
-class RecentBPEFusion(nn.Module):
-    def __init__(self, token_vocab_size, local_bpe_tokens, d_model):
+class RecentBPEWindow(nn.Module):
+    """Process distant representation + ten recent BPEs as 11 tokens."""
+    def __init__(self, token_vocab_size, local_bpe_tokens, d_model,
+                 n_heads, dropout, n_layers=2):
         super().__init__()
         self.local_bpe_tokens = int(local_bpe_tokens)
         self.bpe_embedding = nn.Embedding(token_vocab_size, d_model)
-        self.relative_pos = nn.Embedding(local_bpe_tokens, d_model)
-        self.score = nn.Linear(d_model, 1, bias=False)
-        self.projection = nn.Linear(d_model, d_model, bias=False)
+        self.relative_pos = nn.Embedding(local_bpe_tokens + 1, d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
+            dropout=dropout, activation="gelu", batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, bpe_gap):
-        rel = torch.arange(self.local_bpe_tokens, device=bpe_gap.device)
-        e = self.bpe_embedding(bpe_gap) + self.relative_pos(rel)[None, None]
-        weight = torch.softmax(self.score(torch.tanh(e)), dim=2)
-        return self.projection(torch.sum(weight * e, dim=2))
+    def forward(self, distant_h, bpe_gap):
+        batch, length, _ = distant_h.shape
+        recent = self.bpe_embedding(bpe_gap)
+        window = torch.cat([distant_h.unsqueeze(2), recent], dim=2)
+        rel = torch.arange(
+            self.local_bpe_tokens + 1, device=bpe_gap.device
+        )
+        window = window + self.relative_pos(rel)[None, None]
+        window = window.reshape(
+            batch * length, self.local_bpe_tokens + 1, -1
+        )
+        window = self.transformer(window)
+        return self.norm(window[:, 0]).reshape(batch, length, -1)
 
 
 class ARBackbone(nn.Module):
@@ -125,7 +140,7 @@ class ARBackbone(nn.Module):
 class LocalBPEDirectAR(nn.Module):
     def __init__(self, token_vocab_size, local_vq_vocab_size,
                  local_bpe_tokens=10, d_model=256, n_layers=6, n_heads=8,
-                 dropout=0.1, max_len=255):
+                 dropout=0.1, max_len=255, window_layers=2):
         super().__init__()
         self.local_vq_vocab_size = int(local_vq_vocab_size)
         self.vq_pad_id = self.local_vq_vocab_size
@@ -137,11 +152,10 @@ class LocalBPEDirectAR(nn.Module):
         self.backbone = ARBackbone(
             d_model, n_layers, n_heads, dropout, max_len
         )
-        self.recent = RecentBPEFusion(
-            token_vocab_size, local_bpe_tokens, d_model
+        self.window = RecentBPEWindow(
+            token_vocab_size, local_bpe_tokens, d_model,
+            n_heads, dropout, window_layers
         )
-        self.fusion = nn.Linear(2 * d_model, d_model)
-        self.fusion_norm = nn.LayerNorm(d_model)
         self.bpe_head = nn.Linear(d_model, token_vocab_size)
 
     def forward(self, distant_bpe, local_vq, bpe_gap, key_padding_mask=None):
@@ -150,16 +164,14 @@ class LocalBPEDirectAR(nn.Module):
             + self.local_vq_embedding(local_vq)
         )
         h = self.backbone(h, key_padding_mask)
-        h = self.fusion_norm(F.gelu(self.fusion(
-            torch.cat([h, self.recent(bpe_gap)], dim=-1)
-        )))
+        h = self.window(h, bpe_gap)
         return self.bpe_head(h)
 
 
 class GlobalVQWAR(nn.Module):
     def __init__(self, vq_vocab_size, token_vocab_size, local_bpe_tokens=10,
                  d_model=256, n_layers=6, n_heads=8,
-                 dropout=0.1, max_len=255):
+                 dropout=0.1, max_len=255, window_layers=2):
         super().__init__()
         self.vq_vocab_size = int(vq_vocab_size)
         self.vq_pad_id = self.vq_vocab_size
@@ -169,18 +181,15 @@ class GlobalVQWAR(nn.Module):
         self.backbone = ARBackbone(
             d_model, n_layers, n_heads, dropout, max_len
         )
-        self.recent = RecentBPEFusion(
-            token_vocab_size, local_bpe_tokens, d_model
+        self.window = RecentBPEWindow(
+            token_vocab_size, local_bpe_tokens, d_model,
+            n_heads, dropout, window_layers
         )
-        self.fusion = nn.Linear(2 * d_model, d_model)
-        self.fusion_norm = nn.LayerNorm(d_model)
         self.vq_head = nn.Linear(d_model, self.vq_vocab_size)
 
     def forward(self, vq_in, bpe_gap, key_padding_mask=None):
         h = self.backbone(self.vq_embedding(vq_in), key_padding_mask)
-        h = self.fusion_norm(F.gelu(self.fusion(
-            torch.cat([h, self.recent(bpe_gap)], dim=-1)
-        )))
+        h = self.window(h, bpe_gap)
         return self.vq_head(h)
 
 
@@ -204,6 +213,22 @@ def accumulate_topk(logits, targets, k=5):
     return int(top[:, 0].eq(targets).sum()), int(
         top.eq(targets[:, None]).any(dim=1).sum()
     )
+
+
+def grouped_bpe_nll(pair_logits, bpe_targets, bpe_to_global):
+    """NLL after marginalizing pair-global IDs that share the target BPE."""
+    candidate_ids = bpe_to_global[bpe_targets]
+    candidate_mask = candidate_ids.ge(0)
+    safe_ids = candidate_ids.clamp_min(0)
+    candidate_logits = pair_logits.gather(1, safe_ids)
+    candidate_logits = candidate_logits.masked_fill(
+        ~candidate_mask, float("-inf")
+    )
+    correct_bpe_log_prob = (
+        torch.logsumexp(candidate_logits, dim=1)
+        - torch.logsumexp(pair_logits, dim=1)
+    )
+    return -correct_bpe_log_prob.mean()
 
 
 @torch.no_grad()
@@ -294,6 +319,8 @@ def main():
     ap.add_argument("--gap", type=int, default=11)
     ap.add_argument("--local_bpe_tokens", type=int, default=10)
     ap.add_argument("--mixture_topk", type=int, default=32)
+    ap.add_argument("--window_layers", type=int, default=2)
+    ap.add_argument("--bpe_aux_weight", type=float, default=1.0)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -345,7 +372,8 @@ def main():
             raise ValueError("local VQ ID out of range")
         model = LocalBPEDirectAR(
             token_vocab_size, vq_vocab_size, args.local_bpe_tokens,
-            args.d_model, args.n_layers, args.n_heads, args.dropout, args.max_len
+            args.d_model, args.n_layers, args.n_heads, args.dropout,
+            args.max_len, args.window_layers
         ).to(device)
         selection_metric = "bpe_ppl"
         architecture = "bpe_plus_local_vqw_direct_bpe_ar"
@@ -378,10 +406,11 @@ def main():
 
         model = GlobalVQWAR(
             vq_vocab_size, token_vocab_size, args.local_bpe_tokens,
-            args.d_model, args.n_layers, args.n_heads, args.dropout, args.max_len
+            args.d_model, args.n_layers, args.n_heads, args.dropout,
+            args.max_len, args.window_layers
         ).to(device)
-        selection_metric = "vq_ppl"
-        architecture = "bpe_local_pair_global_id_vqwar_exact_bpe_decode"
+        selection_metric = "bpe_ppl"
+        architecture = "pair_global_vqwar_11token_window_bpe_aux"
 
     samples = list(data["samples"])
     random.shuffle(samples)
@@ -399,12 +428,18 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
+    train_bpe_to_global = (
+        bpe_to_global.to(device) if bpe_to_global is not None else None
+    )
     history, best_valid = [], float("inf")
     best_path = str(Path(args.out).with_name(Path(args.out).stem + "_best.pt"))
     print(f"[mode] {args.mode}")
     print(f"[architecture] {architecture}")
     print(f"[alignment] distant=t-{args.gap}; recent_bpe={args.local_bpe_tokens}")
     print(f"[vocab] bpe={token_vocab_size} vqw={vq_vocab_size}")
+    print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
+    if args.mode == "global_vqwar":
+        print(f"[loss] pair_ce + {args.bpe_aux_weight:g} * bpe_marginal_ce")
 
     for epoch in range(1, args.epochs + 1):
         model.train(); total_loss = 0.0; total_count = 0
@@ -418,11 +453,21 @@ def main():
                 logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
             else:
                 target = vq_y.to(device)
+                bpe_target = bpe_y.to(device)
                 logits = model(vq_in, bpe_gap, ~valid)
-            loss = F.cross_entropy(
+            pair_or_bpe_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), target.reshape(-1),
                 ignore_index=-100
             )
+            if args.mode == "global_vqwar":
+                train_mask = target.ne(-100)
+                bpe_aux_loss = grouped_bpe_nll(
+                    logits[train_mask], bpe_target[train_mask],
+                    train_bpe_to_global
+                )
+                loss = pair_or_bpe_loss + args.bpe_aux_weight * bpe_aux_loss
+            else:
+                loss = pair_or_bpe_loss
             loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             count = int(target.ne(-100).sum())
@@ -451,6 +496,8 @@ def main():
             "global_to_bpe": global_to_bpe,
             "global_to_local": global_to_local,
             "bpe_to_global": bpe_to_global,
+            "window_layers": args.window_layers,
+            "bpe_aux_weight": args.bpe_aux_weight,
             "last_valid": valid_metrics, "last_test": test_metrics,
         }
         torch.save(checkpoint, args.out)
