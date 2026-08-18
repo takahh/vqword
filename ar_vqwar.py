@@ -276,8 +276,9 @@ class ARBackbone(nn.Module):
 class FeatureCatLocalAR(nn.Module):
     def __init__(self, token_vocab_size, local_vq_vocab_size,
                  d_model=256, n_layers=6, n_heads=8, dropout=0.1,
-                 max_len=255):
+                 max_len=255, use_vqw=True):
         super().__init__()
+        self.use_vqw = bool(use_vqw)
         self.local_pad_id = int(local_vq_vocab_size)
         self.bpe_embedding = nn.Embedding(token_vocab_size, d_model)
         self.local_embedding = nn.Embedding(
@@ -295,7 +296,10 @@ class FeatureCatLocalAR(nn.Module):
     def forward(self, bpe, local_vq, valid, vqw_available):
         bpe_h = self.bpe_projection(self.bpe_embedding(bpe))
         vqw_h = self.vqw_projection(self.local_embedding(local_vq))
-        vqw_h = vqw_h * vqw_available.unsqueeze(-1).to(vqw_h.dtype)
+        if self.use_vqw:
+            vqw_h = vqw_h * vqw_available.unsqueeze(-1).to(vqw_h.dtype)
+        else:
+            vqw_h = torch.zeros_like(vqw_h)
         h = self.input_norm(F.gelu(self.cat_projection(
             torch.cat([bpe_h, vqw_h], dim=-1)
         )))
@@ -555,6 +559,7 @@ def main():
     ap.add_argument("--mixture_topk", type=int, default=32)
     ap.add_argument("--window_layers", type=int, default=2)
     ap.add_argument("--bpe_aux_weight", type=float, default=1.0)
+    ap.add_argument("--disable_vqw", action="store_true")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -607,10 +612,15 @@ def main():
         vq_vocab_size = local_vq_vocab_size
         model = FeatureCatLocalAR(
             token_vocab_size, vq_vocab_size, args.d_model, args.n_layers,
-            args.n_heads, args.dropout, args.max_len
+            args.n_heads, args.dropout, args.max_len,
+            use_vqw=not args.disable_vqw
         ).to(device)
         selection_metric = "bpe_ppl"
-        architecture = "project_each_feature_cat_then_shared_transformer_hop10_mask"
+        architecture = (
+            "matched_bpe_baseline_vqw_zero"
+            if args.disable_vqw else
+            "project_each_feature_cat_then_shared_transformer_hop10_mask"
+        )
     else:
         if codebook.get("partition_type") != "bpe_local_kmeans":
             raise ValueError("global_vqwar requires bpe_local_kmeans codebook")
@@ -680,6 +690,7 @@ def main():
     if args.mode == "local_bpe_direct":
         print("[input] project BPE and local-VQW separately; feature-cat per position")
         print("[mask] predicting t: local-VQW[t-10:t-1] zeroed; shared Transformer")
+        print(f"[ablation] use_vqw={not args.disable_vqw}")
     else:
         print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
     if args.mode == "global_vqwar":
