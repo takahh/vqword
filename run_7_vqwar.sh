@@ -6,11 +6,9 @@ apt install -y lftp
 pip install torch tqdm numpy
 
 cd /
-
 if [ ! -d /vqword ]; then
   git clone https://github.com/takahh/vqword.git
 fi
-
 cd /vqword
 git pull
 
@@ -18,128 +16,32 @@ FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
 FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
 FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
-if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 {10k|25k|50k|100k} {center_scale} {1..10}"
-  echo
-  echo "Examples:"
-  echo "  USE_VQW=1 PURE_BPE_MODE=0 SAMIDARE_HOP=1 VQW_INIT_SCALE=1 $0 10k 1 10"
-  echo "  USE_VQW=0 PURE_BPE_MODE=0 SAMIDARE_HOP=0 VQW_INIT_SCALE=1 $0 10k 1 10"
-  echo "  USE_VQW=0 PURE_BPE_MODE=1 SAMIDARE_HOP=0 $0 10k 1 10"
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 {local_bpe_direct|global_vqwar}"
+  echo "  $0 local_bpe_direct"
+  echo "  $0 global_vqwar"
   exit 1
 fi
 
-# ============================================================
-# 実験設定
-# ============================================================
+AR_MODE="$1"
+case "${AR_MODE}" in
+  local_bpe_direct)
+    DATA_FILE="tinystories_vqword_bpe50257_bilateral10_center0_localbpe5_seed0_ids.pt"
+    CODEBOOK_FILE="wikitext103_vqword_bpe50257_bilateral10_center0_localbpe5_seed0.pt"
+    VQ_LABEL="localbpe5_center0"
+    ;;
+  global_vqwar)
+    DATA_FILE="tinystories_vqword_bpe50257_bilateral10_center1_deconly_dec3_global_ivf256_vqcb10k_seed0_ids.pt"
+    CODEBOOK_FILE="wikitext103_vqword_bpe50257_bilateral10_center1_deconly_dec3_global_ivf256_vqcb10k_seed0.pt"
+    VQ_LABEL="global10k_center1"
+    ;;
+  *)
+    echo "[error] mode must be local_bpe_direct or global_vqwar"
+    exit 1
+    ;;
+esac
 
-VQ_CODEBOOK_LABEL="$1"
-CENTER_SCALE="$2"
-DISTANT_HOP="$3"
-USE_HOP_EMBEDDING="${USE_HOP_EMBEDDING:-0}"
-case "${USE_HOP_EMBEDDING}" in
-  0|1) ;;
-  *)
-    echo "[error] USE_HOP_EMBEDDING must be 0 or 1"
-    exit 1
-    ;;
-esac
-USE_HOP_PROJECTION="${USE_HOP_PROJECTION:-0}"
-case "${USE_HOP_PROJECTION}" in
-  0|1) ;;
-  *)
-    echo "[error] USE_HOP_PROJECTION must be 0 or 1"
-    exit 1
-    ;;
-esac
 AR_SEED="${AR_SEED:-0}"
-USE_VQW="${USE_VQW:-1}"
-PURE_BPE_MODE="${PURE_BPE_MODE:-0}"
-SAMIDARE_HOP="${SAMIDARE_HOP:-${USE_VQW}}"
-VQW_INIT_SCALE="${VQW_INIT_SCALE:-0.1}"
-LOCAL_BPE_TOKENS="${LOCAL_BPE_TOKENS:-10}"
-MIXTURE_TOPK="${MIXTURE_TOPK:-32}"
-
-# SAMIDARE_HOP=0では、第3引数のHOP未満の距離をマスクし、
-# 指定HOP距離以上だけで固定HOPを使う。
-if ! [[ "${DISTANT_HOP}" =~ ^([1-9]|10)$ ]]; then
-  echo "[error] distant_hop must be an integer from 1 to 10"
-  exit 1
-fi
-
-# ============================================================
-# 引数検証
-# ============================================================
-
-case "${VQ_CODEBOOK_LABEL}" in
-  10k)  VQ_CODEBOOK_SIZE=10000 ;;
-  25k)  VQ_CODEBOOK_SIZE=25000 ;;
-  50k)  VQ_CODEBOOK_SIZE=50000 ;;
-  100k) VQ_CODEBOOK_SIZE=100000 ;;
-  *)
-    echo "[error] expected codebook label: 10k, 25k, 50k, or 100k"
-    exit 1
-    ;;
-esac
-
-if ! [[ "${CENTER_SCALE}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
-  echo "[error] center_scale must be a non-negative number: ${CENTER_SCALE}"
-  exit 1
-fi
-
-if ! [[ "${AR_SEED}" =~ ^[0-9]+$ ]]; then
-  echo "[error] AR_SEED must be a non-negative integer: ${AR_SEED}"
-  exit 1
-fi
-
-case "${USE_VQW}" in
-  0|1) ;;
-  *)
-    echo "[error] USE_VQW must be 0 or 1"
-    exit 1
-    ;;
-esac
-
-case "${PURE_BPE_MODE}" in
-  0|1) ;;
-  *)
-    echo "[error] PURE_BPE_MODE must be 0 or 1"
-    exit 1
-    ;;
-esac
-
-case "${SAMIDARE_HOP}" in
-  0|1) ;;
-  *)
-    echo "[error] SAMIDARE_HOP must be 0 or 1"
-    exit 1
-    ;;
-esac
-
-if [ "${PURE_BPE_MODE}" = "1" ] && [ "${USE_VQW}" != "0" ]; then
-  echo "[error] PURE_BPE_MODE=1 requires USE_VQW=0"
-  exit 1
-fi
-
-case "${CENTER_SCALE}" in
-  1.0)  CENTER_LABEL="1" ;;
-  0.30) CENTER_LABEL="0.3" ;;
-  *)    CENTER_LABEL="${CENTER_SCALE}" ;;
-esac
-
-# ============================================================
-# VQW設定
-# ============================================================
-
-BPE_VOCAB_LABEL=50257
-IVF_NLIST=256
-DISCRETIZATION_SEED=0
-MODEL_VARIANT="deconly"
-DECODER_EPOCHS=3
-
-# ============================================================
-# AR設定
-# ============================================================
-
 D_MODEL="${D_MODEL:-256}"
 N_LAYERS="${N_LAYERS:-6}"
 N_HEADS="${N_HEADS:-8}"
@@ -149,35 +51,24 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 MAX_LEN="${MAX_LEN:-255}"
-
-AR_SCRIPT="/vqword/ar_vqwar.py"
 VQ_GAP="${VQ_GAP:-11}"
+LOCAL_BPE_TOKENS="${LOCAL_BPE_TOKENS:-10}"
+MIXTURE_TOPK="${MIXTURE_TOPK:-32}"
+AR_SCRIPT="/vqword/ar_vqw_dual_mode.py"
 
-# ============================================================
-# ファイル名
-# ============================================================
-
-COMMON_SUFFIX="center${CENTER_LABEL}_${MODEL_VARIANT}_dec${DECODER_EPOCHS}_global_ivf${IVF_NLIST}_vqcb${VQ_CODEBOOK_LABEL}_seed${DISCRETIZATION_SEED}"
-
-DATA_PATTERN="/vqword/tinystories_vqword_bpe${BPE_VOCAB_LABEL}_bilateral{hop:02d}_${COMMON_SUFFIX}_ids.pt"
-
-CODEBOOK_PATTERN="/vqword/wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_bilateral{hop:02d}_${COMMON_SUFFIX}.pt"
-
-# ============================================================
-# FTPダウンロード
-# ============================================================
+if [ "${VQ_GAP}" -ne 11 ] || [ "${LOCAL_BPE_TOKENS}" -ne 10 ]; then
+  echo "[error] bilateral HOP10 requires VQ_GAP=11 and LOCAL_BPE_TOKENS=10"
+  exit 1
+fi
 
 download_file() {
   local remote_file="$1"
   local local_path="$2"
-
   if [ -s "${local_path}" ]; then
     echo "[reuse] ${local_path}"
     return
   fi
-
   echo "[download] ${remote_file}"
-
   lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<LFTP
 set ftp:ssl-allow no
 set net:max-retries 5
@@ -186,229 +77,58 @@ set cmd:fail-exit yes
 get "${remote_file}" -o "${local_path}"
 bye
 LFTP
-
-  if [ ! -s "${local_path}" ]; then
-    echo "[error] download failed: ${local_path}"
-    exit 1
-  fi
+  test -s "${local_path}" || { echo "[error] download failed"; exit 1; }
 }
 
-# ============================================================
-# HOP1..10をダウンロード
-#
-# codebook：WikiText-103で学習したトークナイザー
-# data：そのトークナイザーをTinyStoriesへ適用したAR用ID
-# ============================================================
-HOP_PADDED="10"
+download_file "${CODEBOOK_FILE}" "/vqword/${CODEBOOK_FILE}"
+download_file "${DATA_FILE}" "/vqword/${DATA_FILE}"
 
-CODEBOOK_FILE="wikitext103_vqword_bpe50257_bilateral${HOP_PADDED}_center${CENTER_LABEL}_deconly_dec3_global_ivf256_vqcb${VQ_CODEBOOK_LABEL}_seed0.pt"
-
-DATA_FILE="tinystories_vqword_bpe50257_bilateral${HOP_PADDED}_center${CENTER_LABEL}_deconly_dec3_global_ivf256_vqcb${VQ_CODEBOOK_LABEL}_seed0_ids.pt"
-
-download_file \
-  "${CODEBOOK_FILE}" \
-  "/vqword/${CODEBOOK_FILE}"
-
-download_file \
-  "${DATA_FILE}" \
-  "/vqword/${DATA_FILE}"
-# ============================================================
-# HOP1..10の事前検証
-# ============================================================
-
-python - \
-  "${DATA_PATTERN}" \
-  "${CODEBOOK_PATTERN}" \
-  "${VQ_CODEBOOK_SIZE}" \
-  "${CENTER_SCALE}" <<'PY'
+python - "${AR_MODE}" "/vqword/${DATA_FILE}" "/vqword/${CODEBOOK_FILE}" <<'PY'
 import sys
-
 import torch
 
-
-data_pattern = sys.argv[1]
-codebook_pattern = sys.argv[2]
-expected_vq_size = int(sys.argv[3])
-expected_center_scale = float(sys.argv[4])
-
-reference_tokens = None
-reference_bounds = None
-
-for hop in (10,):
-    data_path = data_pattern.format(hop=hop)
-    codebook_path = codebook_pattern.format(hop=hop)
-
-    data = torch.load(
-        data_path,
-        map_location="cpu",
-        weights_only=False,
-    )
-
-    codebook = torch.load(
-        codebook_path,
-        map_location="cpu",
-        weights_only=False,
-    )
-
-    for key in (
-        "samples",
-        "token_ids_flat",
-        "vq_ids_flat",
-    ):
-        if key not in data:
-            raise KeyError(
-                f"HOP{hop} data missing key: {key}"
-            )
-
-    if "global_centers" not in codebook:
-        raise KeyError(
-            f"HOP{hop} codebook missing global_centers"
-        )
-
-    data_hop = int(
-        data.get("hop", -1)
-    )
-
-    codebook_hop = int(
-        codebook.get("args", {}).get("hop", -1)
-    )
-
-    if data_hop != hop or codebook_hop != hop:
-        raise ValueError(
-            f"HOP mismatch at HOP{hop}: "
-            f"data={data_hop}, codebook={codebook_hop}"
-        )
-
-    tokens = (
-        data["token_ids_flat"]
-        .long()
-        .reshape(-1)
-    )
-
-    vq_ids = (
-        data["vq_ids_flat"]
-        .long()
-        .reshape(-1)
-    )
-
-    centers = codebook["global_centers"]
-
-    bounds = [
-        (
-            int(sample["start"]),
-            int(sample["end"]),
-        )
-        for sample in data["samples"]
-    ]
-
-    if tokens.numel() != vq_ids.numel():
-        raise ValueError(
-            f"HOP{hop} token/VQ length mismatch: "
-            f"tokens={tokens.numel()}, "
-            f"vq_ids={vq_ids.numel()}"
-        )
-
-    if int(centers.shape[0]) != expected_vq_size:
-        raise ValueError(
-            f"HOP{hop} VQ size mismatch: "
-            f"expected={expected_vq_size}, "
-            f"actual={centers.shape[0]}"
-        )
-
-    if vq_ids.numel() == 0:
-        raise ValueError(
-            f"HOP{hop} contains no VQ IDs"
-        )
-
-    vq_min = int(vq_ids.min().item())
-    vq_max = int(vq_ids.max().item())
-
-    if vq_min < 0 or vq_max >= int(centers.shape[0]):
-        raise ValueError(
-            f"HOP{hop} VQ ID out of range: "
-            f"{vq_min}..{vq_max}"
-        )
-
-    actual_scale = float(
-        codebook
-        .get("args", {})
-        .get("center_scale", -1.0)
-    )
-
-    if abs(actual_scale - expected_center_scale) > 1e-8:
-        raise ValueError(
-            f"HOP{hop} center scale mismatch: "
-            f"expected={expected_center_scale}, "
-            f"actual={actual_scale}"
-        )
-
-    if reference_tokens is None:
-        reference_tokens = tokens
-        reference_bounds = bounds
-    else:
-        if not torch.equal(tokens, reference_tokens):
-            raise ValueError(
-                f"HOP{hop} token_ids_flat differs from HOP1"
-            )
-
-        if bounds != reference_bounds:
-            raise ValueError(
-                f"HOP{hop} sample boundaries differ from HOP1"
-            )
-
-    used_vq = torch.unique(vq_ids).numel()
-
-    print(
-        f"[verification OK] HOP{hop:02d} "
-        f"tokens={tokens.numel():,} "
-        f"samples={len(bounds):,} "
-        f"used_vq={used_vq:,} "
-        f"centers={tuple(centers.shape)}"
-    )
+mode, data_path, codebook_path = sys.argv[1:]
+data = torch.load(data_path, map_location="cpu", weights_only=False)
+cb = torch.load(codebook_path, map_location="cpu", weights_only=False)
+hop_data = int(data.get("hop", data.get("args", {}).get("hop", -1)))
+hop_cb = int(cb.get("hop", cb.get("args", {}).get("hop", -1)))
+if hop_data != 10 or hop_cb != 10:
+    raise ValueError(f"HOP mismatch: data={hop_data}, codebook={hop_cb}")
+tokens = data["token_ids_flat"].reshape(-1)
+vq = data["vq_ids_flat"].reshape(-1)
+if tokens.numel() != vq.numel():
+    raise ValueError("token/VQ length mismatch")
+if mode == "local_bpe_direct":
+    if cb.get("partition_type") != "bpe_local_kmeans":
+        raise ValueError("local mode requires bpe_local_kmeans")
+    size = int(data.get("vq_vocab_size", cb.get("max_local_clusters", -1)))
+else:
+    size = int(cb["global_centers"].size(0))
+if int(vq.min()) < 0 or int(vq.max()) >= size:
+    raise ValueError(f"VQ IDs out of range 0..{size-1}")
+print(f"[verification OK] mode={mode} tokens={tokens.numel():,} "
+      f"samples={len(data['samples']):,} vq_vocab={size} "
+      f"vq_range={int(vq.min())}..{int(vq.max())}")
 PY
 
-# ============================================================
-# 出力名
-# ============================================================
-
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
-RUN="vqwar_hop10_gap${VQ_GAP}_localbpe${LOCAL_BPE_TOKENS}_cat_topk${MIXTURE_TOPK}_frozen_bpedec_bpe${BPE_VOCAB_LABEL}_center${CENTER_LABEL}_vqcb${VQ_CODEBOOK_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
-
+RUN="${AR_MODE}_hop10_gap11_localbpe10_${VQ_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
 LOG_PATH="/vqword/${RUN}.log"
 
-# ============================================================
-# 設定表示
-# ============================================================
-
 echo "============================================================"
-echo "[start HOP10 VQW-AR + local BPE CAT + frozen BPE decoder]"
-echo "data                  = /vqword/${DATA_FILE}"
-echo "codebook/decoder      = /vqword/${CODEBOOK_FILE}"
-echo "VQ target gap         = ${VQ_GAP}"
-echo "local BPE tokens      = ${LOCAL_BPE_TOKENS}"
-echo "fusion                = VQW hidden CAT local-BPE projection"
-echo "mixture top-k         = ${MIXTURE_TOPK}"
-echo "training objective    = VQW cross entropy only"
-echo "BPE evaluation        = argmax VQW -> frozen pretrained decoder"
-echo "center scale          = ${CENTER_SCALE}"
-echo "codebook size         = ${VQ_CODEBOOK_SIZE}"
-echo "AR seed               = ${AR_SEED}"
-echo "HOP embedding         = ${USE_HOP_EMBEDDING}"
-echo "HOP embedding         = ${USE_HOP_EMBEDDING}"
-echo "HOP projection        = ${USE_HOP_PROJECTION}"
-echo "run                   = ${RUN}"
+echo "mode              = ${AR_MODE}"
+echo "data              = /vqword/${DATA_FILE}"
+echo "codebook          = /vqword/${CODEBOOK_FILE}"
+echo "alignment         = distant t-11 + recent BPE t-10..t-1"
+echo "epochs/batch/lr   = ${EPOCHS}/${BATCH_SIZE}/${LR}"
+echo "run               = ${RUN}"
 echo "============================================================"
-
-# ============================================================
-# AR実行
-# ============================================================
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
 python "${AR_SCRIPT}" \
+  --mode "${AR_MODE}" \
   --data "/vqword/${DATA_FILE}" \
   --codebook "/vqword/${CODEBOOK_FILE}" \
   --gap "${VQ_GAP}" \
@@ -427,28 +147,9 @@ python "${AR_SCRIPT}" \
   --out "${FINAL_PATH}" \
   2>&1 | tee "${LOG_PATH}"
 
-# ============================================================
-# 出力確認
-# ============================================================
-
-for PATH_TO_CHECK in \
-  "${FINAL_PATH}" \
-  "${BEST_PATH}" \
-  "${LOG_PATH}"
-do
-  if [ ! -s "${PATH_TO_CHECK}" ]; then
-    echo "[error] missing output: ${PATH_TO_CHECK}"
-    exit 1
-  fi
+for path_to_check in "${FINAL_PATH}" "${BEST_PATH}" "${LOG_PATH}"; do
+  test -s "${path_to_check}" || { echo "[error] missing ${path_to_check}"; exit 1; }
 done
-
-grep -E \
-  '^\[epoch [0-9]+\]|^\[save best\]|^\[save final\]' \
-  "${LOG_PATH}" || true
-
-# ============================================================
-# FTPアップロード
-# ============================================================
 
 lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<LFTP
 set ftp:ssl-allow no
@@ -462,10 +163,4 @@ put "${LOG_PATH}" -o "${RUN}.log"
 bye
 LFTP
 
-echo "============================================================"
-echo "[completed]"
-echo "run   = ${RUN}"
-echo "best  = ${BEST_PATH}"
-echo "final = ${FINAL_PATH}"
-echo "log   = ${LOG_PATH}"
-echo "============================================================"
+echo "[completed] ${RUN}"
