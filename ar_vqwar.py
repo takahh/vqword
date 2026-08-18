@@ -5,8 +5,9 @@ local_bpe_direct:
   (BPE[t-11], local-VQW[t-11]) + BPE[t-10:t-1] -> BPE[t]
 
 global_vqwar:
-  global-VQW[t-11] + BPE[t-10:t-1] -> global-VQW[t]
-  -> frozen center-to-BPE decoder (evaluation only)
+  pair-global-ID(BPE, local-VQW)[t-11] + BPE[t-10:t-1]
+  -> pair-global-ID(BPE, local-VQW)[t]
+  -> exact BPE recovery from the predicted pair ID
 """
 
 import argparse
@@ -156,16 +157,15 @@ class LocalBPEDirectAR(nn.Module):
 
 
 class GlobalVQWAR(nn.Module):
-    def __init__(self, centers, token_vocab_size, local_bpe_tokens=10,
+    def __init__(self, vq_vocab_size, token_vocab_size, local_bpe_tokens=10,
                  d_model=256, n_layers=6, n_heads=8,
                  dropout=0.1, max_len=255):
         super().__init__()
-        centers = centers.float()
-        self.vq_vocab_size = int(centers.size(0))
+        self.vq_vocab_size = int(vq_vocab_size)
         self.vq_pad_id = self.vq_vocab_size
-        zero = torch.zeros(1, centers.size(1), dtype=centers.dtype)
-        self.register_buffer("center_table", torch.cat([centers, zero], 0))
-        self.input_projection = nn.Linear(centers.size(1), d_model, bias=False)
+        self.vq_embedding = nn.Embedding(
+            self.vq_vocab_size + 1, d_model, padding_idx=self.vq_pad_id
+        )
         self.backbone = ARBackbone(
             d_model, n_layers, n_heads, dropout, max_len
         )
@@ -177,44 +177,26 @@ class GlobalVQWAR(nn.Module):
         self.vq_head = nn.Linear(d_model, self.vq_vocab_size)
 
     def forward(self, vq_in, bpe_gap, key_padding_mask=None):
-        centers = F.embedding(
-            vq_in, self.center_table, padding_idx=self.vq_pad_id
-        )
-        h = self.backbone(self.input_projection(centers), key_padding_mask)
+        h = self.backbone(self.vq_embedding(vq_in), key_padding_mask)
         h = self.fusion_norm(F.gelu(self.fusion(
             torch.cat([h, self.recent(bpe_gap)], dim=-1)
         )))
         return self.vq_head(h)
 
 
-class FrozenCenterToBPE(nn.Module):
-    def __init__(self, centers, weight, bias):
-        super().__init__()
-        if weight.ndim != 2 or weight.size(1) != centers.size(1):
-            raise ValueError("decoder/center dimension mismatch")
-        self.register_buffer("centers", centers.float())
-        self.register_buffer("weight", weight.float())
-        self.register_buffer("bias", bias.float())
-
-    def forward(self, vq_ids):
-        return F.linear(F.embedding(vq_ids, self.centers), self.weight, self.bias)
-
-    def decode_centers(self, centers):
-        return F.linear(centers, self.weight, self.bias)
-
-
-def load_decoder(codebook):
-    state = codebook.get("decoder_state_dict")
-    if state is None:
-        model_state = codebook.get("model", {})
-        if "decoder.weight" in model_state and "decoder.bias" in model_state:
-            state = {
-                "weight": model_state["decoder.weight"],
-                "bias": model_state["decoder.bias"],
-            }
-    if state is None or "weight" not in state or "bias" not in state:
-        raise KeyError("No pretrained linear decoder in global codebook")
-    return state["weight"], state["bias"]
+def make_pair_global_ids(token_ids, local_vq_ids, local_vq_vocab_size):
+    """Map every observed (BPE, local-VQW) pair to a compact global ID."""
+    if int(local_vq_ids.min()) < 0:
+        raise ValueError("negative local VQ ID")
+    key = token_ids.long() * int(local_vq_vocab_size) + local_vq_ids.long()
+    unique_keys, global_ids = torch.unique(
+        key, sorted=True, return_inverse=True
+    )
+    global_to_bpe = torch.div(
+        unique_keys, int(local_vq_vocab_size), rounding_mode="floor"
+    )
+    global_to_local = unique_keys.remainder(int(local_vq_vocab_size))
+    return global_ids.long(), global_to_bpe.long(), global_to_local.long()
 
 
 def accumulate_topk(logits, targets, k=5):
@@ -249,12 +231,12 @@ def evaluate_local(model, loader, device):
 
 
 @torch.no_grad()
-def evaluate_global(model, decoder, loader, device, mixture_topk):
+def evaluate_global(model, global_to_bpe, bpe_to_global, loader, device):
     model.eval()
-    keys = ("vq", "bpe", "mix_bpe", "oracle_bpe")
-    total = {"count": 0}
-    for key in keys:
-        total.update({f"{key}_loss": 0.0, f"{key}_top1": 0, f"{key}_top5": 0})
+    global_to_bpe = global_to_bpe.to(device)
+    bpe_to_global = bpe_to_global.to(device)
+    total = dict(count=0, vq_loss=0.0, vq_top1=0, vq_top5=0,
+                 bpe_loss=0.0, bpe_top1=0)
     for _distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid in tqdm(
         loader, desc="[eval global]", leave=False
     ):
@@ -265,31 +247,37 @@ def evaluate_global(model, decoder, loader, device, mixture_topk):
         vl, vt, bt = logits[mask], vq_y[mask], bpe_y[mask]
         n = int(vt.numel()); total["count"] += n
 
-        predictions = {"vq": (vl, vt)}
-        predictions["bpe"] = (decoder(vl.argmax(-1)), bt)
-        k = min(int(mixture_topk), vl.size(-1))
-        values, ids = vl.topk(k, dim=-1)
-        mixed = torch.sum(
-            torch.softmax(values, -1).unsqueeze(-1)
-            * F.embedding(ids, decoder.centers), dim=1
+        total["vq_loss"] += float(F.cross_entropy(vl, vt, reduction="sum"))
+        a, b = accumulate_topk(vl, vt)
+        total["vq_top1"] += a; total["vq_top5"] += b
+
+        # Exact probability of the correct BPE: sum probabilities of all
+        # pair-global IDs whose first component is that BPE.
+        candidate_ids = bpe_to_global[bt]
+        candidate_mask = candidate_ids.ge(0)
+        safe_ids = candidate_ids.clamp_min(0)
+        candidate_logits = vl.gather(1, safe_ids)
+        candidate_logits = candidate_logits.masked_fill(
+            ~candidate_mask, float("-inf")
         )
-        predictions["mix_bpe"] = (decoder.decode_centers(mixed), bt)
-        predictions["oracle_bpe"] = (decoder(vt), bt)
-        for key, (pred, target) in predictions.items():
-            total[f"{key}_loss"] += float(
-                F.cross_entropy(pred, target, reduction="sum")
-            )
-            a, b = accumulate_topk(pred, target)
-            total[f"{key}_top1"] += a; total[f"{key}_top5"] += b
+        bpe_log_prob = (
+            torch.logsumexp(candidate_logits, dim=1)
+            - torch.logsumexp(vl, dim=1)
+        )
+        total["bpe_loss"] += float(-bpe_log_prob.sum())
+        predicted_bpe = global_to_bpe[vl.argmax(-1)]
+        total["bpe_top1"] += int(predicted_bpe.eq(bt).sum())
     n = max(total["count"], 1)
-    result = {"count": total["count"]}
-    for key in keys:
-        ce = total[f"{key}_loss"] / n
-        result[f"{key}_loss"] = ce
-        result[f"{key}_ppl"] = math.exp(min(ce, 20.0))
-        result[f"{key}_top1"] = total[f"{key}_top1"] / n
-        result[f"{key}_top5"] = total[f"{key}_top5"] / n
-    return result
+    vq_ce = total["vq_loss"] / n
+    bpe_ce = total["bpe_loss"] / n
+    return dict(
+        count=total["count"],
+        vq_loss=vq_ce, vq_ppl=math.exp(min(vq_ce, 20.0)),
+        vq_top1=total["vq_top1"] / n, vq_top5=total["vq_top5"] / n,
+        bpe_loss=bpe_ce, bpe_ppl=math.exp(min(bpe_ce, 20.0)),
+        bpe_top1=total["bpe_top1"] / n,
+        oracle_bpe_ppl=1.0, oracle_bpe_top1=1.0,
+    )
 
 
 def format_metrics(prefix, metrics):
@@ -342,7 +330,9 @@ def main():
         raise ValueError("token/VQ length mismatch")
     token_vocab_size = int(codebook["model"]["tok_emb.weight"].shape[0])
 
-    decoder = None
+    global_to_bpe = None
+    global_to_local = None
+    bpe_to_global = None
     if args.mode == "local_bpe_direct":
         if codebook.get("partition_type") != "bpe_local_kmeans":
             raise ValueError("local_bpe_direct requires bpe_local_kmeans codebook")
@@ -360,21 +350,38 @@ def main():
         selection_metric = "bpe_ppl"
         architecture = "bpe_plus_local_vqw_direct_bpe_ar"
     else:
-        centers = codebook["global_centers"].float()
-        vq_vocab_size = int(centers.size(0))
-        if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= vq_vocab_size:
-            raise ValueError("global VQ ID out of range")
-        dec_weight, dec_bias = load_decoder(codebook)
-        token_vocab_size = int(dec_weight.size(0))
-        decoder = FrozenCenterToBPE(
-            centers, dec_weight, dec_bias
-        ).to(device).eval()
+        if codebook.get("partition_type") != "bpe_local_kmeans":
+            raise ValueError("global_vqwar requires bpe_local_kmeans codebook")
+        local_vq_vocab_size = int(data.get(
+            "vq_vocab_size", codebook.get("max_local_clusters", -1)
+        ))
+        if local_vq_vocab_size < 1:
+            raise ValueError("invalid local vq_vocab_size")
+        if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= local_vq_vocab_size:
+            raise ValueError("local VQ ID out of range")
+        vq_ids, global_to_bpe, global_to_local = make_pair_global_ids(
+            token_ids, vq_ids, local_vq_vocab_size
+        )
+        vq_vocab_size = int(global_to_bpe.numel())
+
+        # Reverse table used to sum all pair-ID probabilities belonging to BPE.
+        counts = torch.bincount(global_to_bpe, minlength=token_vocab_size)
+        max_pairs_per_bpe = int(counts.max())
+        bpe_to_global = torch.full(
+            (token_vocab_size, max_pairs_per_bpe), -1, dtype=torch.long
+        )
+        cursor = torch.zeros(token_vocab_size, dtype=torch.long)
+        for gid, bpe in enumerate(global_to_bpe.tolist()):
+            column = int(cursor[bpe])
+            bpe_to_global[bpe, column] = gid
+            cursor[bpe] += 1
+
         model = GlobalVQWAR(
-            centers, token_vocab_size, args.local_bpe_tokens,
+            vq_vocab_size, token_vocab_size, args.local_bpe_tokens,
             args.d_model, args.n_layers, args.n_heads, args.dropout, args.max_len
         ).to(device)
         selection_metric = "vq_ppl"
-        architecture = "global_vqwid_ar_then_frozen_bpe_decoder"
+        architecture = "bpe_local_pair_global_id_vqwar_exact_bpe_decode"
 
     samples = list(data["samples"])
     random.shuffle(samples)
@@ -427,10 +434,10 @@ def main():
             test_metrics = evaluate_local(model, loaders[2], device)
         else:
             valid_metrics = evaluate_global(
-                model, decoder, loaders[1], device, args.mixture_topk
+                model, global_to_bpe, bpe_to_global, loaders[1], device
             )
             test_metrics = evaluate_global(
-                model, decoder, loaders[2], device, args.mixture_topk
+                model, global_to_bpe, bpe_to_global, loaders[2], device
             )
         print(f"[epoch {epoch}] {format_metrics('valid', valid_metrics)} "
               f"{format_metrics('test', test_metrics)}")
@@ -440,8 +447,10 @@ def main():
             "model": model.state_dict(), "args": vars(args), "history": history,
             "mode": args.mode, "architecture": architecture,
             "vq_vocab_size": vq_vocab_size, "token_vocab_size": token_vocab_size,
-            "decoder_frozen": args.mode == "global_vqwar",
-            "decoder_source": args.codebook if decoder is not None else None,
+            "pair_global_id": args.mode == "global_vqwar",
+            "global_to_bpe": global_to_bpe,
+            "global_to_local": global_to_local,
+            "bpe_to_global": bpe_to_global,
             "last_valid": valid_metrics, "last_test": test_metrics,
         }
         torch.save(checkpoint, args.out)

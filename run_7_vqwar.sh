@@ -31,9 +31,9 @@ case "${AR_MODE}" in
     VQ_LABEL="localbpe5_center0"
     ;;
   global_vqwar)
-    DATA_FILE="tinystories_vqword_bpe50257_bilateral10_center1_deconly_dec3_global_ivf256_vqcb10k_seed0_ids.pt"
-    CODEBOOK_FILE="wikitext103_vqword_bpe50257_bilateral10_center1_deconly_dec3_global_ivf256_vqcb10k_seed0.pt"
-    VQ_LABEL="global10k_center1"
+    DATA_FILE="tinystories_vqword_bpe50257_bilateral10_center0_localbpe5_seed0_ids.pt"
+    CODEBOOK_FILE="wikitext103_vqword_bpe50257_bilateral10_center0_localbpe5_seed0.pt"
+    VQ_LABEL="pairglobal_localbpe5_center0"
     ;;
   *)
     echo "[error] mode must be local_bpe_direct or global_vqwar"
@@ -88,27 +88,53 @@ import sys
 import torch
 
 mode, data_path, codebook_path = sys.argv[1:]
+
 data = torch.load(data_path, map_location="cpu", weights_only=False)
 cb = torch.load(codebook_path, map_location="cpu", weights_only=False)
+
 hop_data = int(data.get("hop", data.get("args", {}).get("hop", -1)))
 hop_cb = int(cb.get("hop", cb.get("args", {}).get("hop", -1)))
+
 if hop_data != 10 or hop_cb != 10:
     raise ValueError(f"HOP mismatch: data={hop_data}, codebook={hop_cb}")
-tokens = data["token_ids_flat"].reshape(-1)
-vq = data["vq_ids_flat"].reshape(-1)
-if tokens.numel() != vq.numel():
+
+if cb.get("partition_type") != "bpe_local_kmeans":
+    raise ValueError(
+        f"{mode} requires bpe_local_kmeans, "
+        f"got {cb.get('partition_type')!r}"
+    )
+
+tokens = data["token_ids_flat"].long().reshape(-1)
+local_vq = data["vq_ids_flat"].long().reshape(-1)
+
+if tokens.numel() != local_vq.numel():
     raise ValueError("token/VQ length mismatch")
-if mode == "local_bpe_direct":
-    if cb.get("partition_type") != "bpe_local_kmeans":
-        raise ValueError("local mode requires bpe_local_kmeans")
-    size = int(data.get("vq_vocab_size", cb.get("max_local_clusters", -1)))
-else:
-    size = int(cb["global_centers"].size(0))
-if int(vq.min()) < 0 or int(vq.max()) >= size:
-    raise ValueError(f"VQ IDs out of range 0..{size-1}")
-print(f"[verification OK] mode={mode} tokens={tokens.numel():,} "
-      f"samples={len(data['samples']):,} vq_vocab={size} "
-      f"vq_range={int(vq.min())}..{int(vq.max())}")
+
+local_vq_size = int(
+    data.get("vq_vocab_size", cb.get("max_local_clusters", -1))
+)
+if local_vq_size < 1:
+    raise ValueError(f"invalid local VQ vocabulary size: {local_vq_size}")
+
+if int(local_vq.min()) < 0 or int(local_vq.max()) >= local_vq_size:
+    raise ValueError(
+        f"local VQ IDs out of range 0..{local_vq_size - 1}"
+    )
+
+message = (
+    f"[verification OK] mode={mode} "
+    f"tokens={tokens.numel():,} "
+    f"samples={len(data['samples']):,} "
+    f"local_vq_vocab={local_vq_size} "
+    f"local_vq_range={int(local_vq.min())}..{int(local_vq.max())}"
+)
+
+if mode == "global_vqwar":
+    pair_keys = tokens * local_vq_size + local_vq
+    pair_global_vocab = int(torch.unique(pair_keys).numel())
+    message += f" pair_global_vocab={pair_global_vocab:,}"
+
+print(message)
 PY
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
