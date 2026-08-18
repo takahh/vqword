@@ -239,13 +239,10 @@ class SharedMaskedLocalAR(nn.Module):
         self.hop = int(hop)
         self.local_pad_id = int(local_vq_vocab_size)
         self.bpe_embedding = nn.Embedding(token_vocab_size, d_model)
-        self.vqw_bpe_embedding = nn.Embedding(token_vocab_size, d_model)
         self.local_embedding = nn.Embedding(
             local_vq_vocab_size + 1, d_model,
             padding_idx=self.local_pad_id,
         )
-        self.vqw_projection = nn.Linear(2 * d_model, d_model)
-        self.vqw_norm = nn.LayerNorm(d_model)
         self.position = nn.Embedding(max_len, d_model)
         self.stream_type = nn.Embedding(2, d_model)
         layer = nn.TransformerEncoderLayer(
@@ -261,9 +258,7 @@ class SharedMaskedLocalAR(nn.Module):
         length = bpe.size(1)
         pos = torch.arange(length, device=bpe.device)
         bpe_h = self.bpe_embedding(bpe) + self.position(pos)[None]
-        vqw_h = self.vqw_norm(F.gelu(self.vqw_projection(torch.cat([
-            self.vqw_bpe_embedding(bpe), self.local_embedding(local_vq)
-        ], dim=-1)))) + self.position(pos)[None]
+        vqw_h = self.local_embedding(local_vq) + self.position(pos)[None]
         bpe_h = bpe_h + self.stream_type.weight[0][None, None]
         vqw_h = vqw_h + self.stream_type.weight[1][None, None]
         h = torch.cat([bpe_h, vqw_h], dim=1)
@@ -541,7 +536,7 @@ def main():
             args.max_len
         ).to(device)
         selection_metric = "bpe_ppl"
-        architecture = "shared_transformer_cat_localvqw_delayed_mask_hop10"
+        architecture = "shared_transformer_bpe_plus_localvqw_tokens_delayed_mask_hop10"
     else:
         if codebook.get("partition_type") != "bpe_local_kmeans":
             raise ValueError("global_vqwar requires bpe_local_kmeans codebook")
@@ -608,7 +603,7 @@ def main():
     print(f"[alignment] distant=t-{args.gap}; recent_bpe={args.local_bpe_tokens}")
     print(f"[vocab] bpe={token_vocab_size} vqw={vq_vocab_size}")
     if args.mode == "local_bpe_direct":
-        print("[shared] cat(BPE[j],local-VQW[j]) auxiliary tokens")
+        print("[shared] BPE tokens + local-VQW-only auxiliary tokens")
         print("[mask] predicting t: BPE through t-1; VQW through t-11")
     else:
         print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
