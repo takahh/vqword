@@ -1,4 +1,4 @@
-　#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Two leak-free HOP10 AR modes.
 
 local_bpe_direct:
