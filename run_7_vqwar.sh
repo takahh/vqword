@@ -54,14 +54,14 @@ MAX_LEN="${MAX_LEN:-255}"
 VQ_GAP="${VQ_GAP:-11}"
 LOCAL_BPE_TOKENS="${LOCAL_BPE_TOKENS:-10}"
 MIXTURE_TOPK="${MIXTURE_TOPK:-32}"
+VQW_ALPHA_INIT="${VQW_ALPHA_INIT:-0.5}"
 AR_SCRIPT="/vqword/ar_vqwar.py"
 DISABLE_VQW="${DISABLE_VQW:-0}"
---vqw_alpha_init "${VQW_ALPHA_INIT:-0.5}"
 
 EXTRA_ARGS=()
 if [ "${DISABLE_VQW}" = "1" ]; then
   EXTRA_ARGS+=(--disable_vqw)
-  VQ_LABEL="${VQ_LABEL}_matched_bpebaseline"
+  VQ_LABEL="${VQ_LABEL}_matched_residual_bpebaseline"
 fi
 
 if [ "${VQ_GAP}" -ne 11 ] || [ "${LOCAL_BPE_TOKENS}" -ne 10 ]; then
@@ -157,10 +157,13 @@ echo "data              = /vqword/${DATA_FILE}"
 echo "codebook          = /vqword/${CODEBOOK_FILE}"
 echo "alignment         = distant t-11 + recent BPE t-10..t-1"
 echo "epochs/batch/lr   = ${EPOCHS}/${BATCH_SIZE}/${LR}"
+echo "VQW alpha init    = ${VQW_ALPHA_INIT}"
+echo "disable VQW       = ${DISABLE_VQW}"
 echo "run               = ${RUN}"
 echo "============================================================"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 python "${AR_SCRIPT}" \
   --mode "${AR_MODE}" \
   --data "/vqword/${DATA_FILE}" \
@@ -178,6 +181,7 @@ python "${AR_SCRIPT}" \
   --dropout "${DROPOUT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
+  --vqw_alpha_init "${VQW_ALPHA_INIT}" \
   --out "${FINAL_PATH}" \
   "${EXTRA_ARGS[@]}" \
   2>&1 | tee "${LOG_PATH}"
