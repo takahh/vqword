@@ -175,6 +175,49 @@ class SharedMaskedLocalDataset(Dataset):
         return bpe, local, valid
 
 
+class FeatureCatLocalDataset(Dataset):
+    """One target window: same-position BPE/local-VQW, recent VQW masked."""
+    def __init__(self, samples, token_ids, local_vq_ids, vq_pad_id,
+                 hop=10, max_len=255, train=False, eval_targets=8):
+        self.token_ids = token_ids.long().reshape(-1)
+        self.local_vq_ids = local_vq_ids.long().reshape(-1)
+        self.vq_pad_id, self.hop, self.max_len = int(vq_pad_id), int(hop), int(max_len)
+        self.train = bool(train)
+        self.examples = []
+        for sample in samples:
+            start, end = int(sample["start"]), int(sample["end"])
+            if end - start < 2:
+                continue
+            if self.train:
+                self.examples.append((start, end, None))
+            else:
+                count = min(eval_targets, end - start - 1)
+                for n in range(count):
+                    target = start + 1 + ((n + 1) * (end - start - 1) - 1) // count
+                    self.examples.append((start, end, target))
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, index):
+        sample_start, sample_end, target = self.examples[index]
+        if target is None:
+            target = random.randrange(sample_start + 1, sample_end)
+        context_start = max(sample_start, target - self.max_len)
+        length = target - context_start
+        offset = self.max_len - length
+        bpe = torch.zeros(self.max_len, dtype=torch.long)
+        local = torch.full((self.max_len,), self.vq_pad_id, dtype=torch.long)
+        valid = torch.zeros(self.max_len, dtype=torch.bool)
+        vqw_available = torch.zeros(self.max_len, dtype=torch.bool)
+        bpe[offset:] = self.token_ids[context_start:target]
+        local[offset:] = self.local_vq_ids[context_start:target]
+        valid[offset:] = True
+        positions = torch.arange(context_start, target)
+        vqw_available[offset:] = positions <= target - self.hop - 1
+        return bpe, local, valid, vqw_available, self.token_ids[target]
+
+
 class RecentBPEWindow(nn.Module):
     """Process distant representation + ten recent BPEs as 11 tokens."""
     def __init__(self, token_vocab_size, local_bpe_tokens, d_model,
@@ -228,6 +271,36 @@ class ARBackbone(nn.Module):
         return self.norm(self.transformer(
             h, mask=causal, src_key_padding_mask=key_padding_mask
         ))
+
+
+class FeatureCatLocalAR(nn.Module):
+    def __init__(self, token_vocab_size, local_vq_vocab_size,
+                 d_model=256, n_layers=6, n_heads=8, dropout=0.1,
+                 max_len=255):
+        super().__init__()
+        self.local_pad_id = int(local_vq_vocab_size)
+        self.bpe_embedding = nn.Embedding(token_vocab_size, d_model)
+        self.local_embedding = nn.Embedding(
+            local_vq_vocab_size + 1, d_model, padding_idx=self.local_pad_id
+        )
+        self.bpe_projection = nn.Linear(d_model, d_model)
+        self.vqw_projection = nn.Linear(d_model, d_model)
+        self.cat_projection = nn.Linear(2 * d_model, d_model)
+        self.input_norm = nn.LayerNorm(d_model)
+        self.backbone = ARBackbone(
+            d_model, n_layers, n_heads, dropout, max_len
+        )
+        self.bpe_head = nn.Linear(d_model, token_vocab_size)
+
+    def forward(self, bpe, local_vq, valid, vqw_available):
+        bpe_h = self.bpe_projection(self.bpe_embedding(bpe))
+        vqw_h = self.vqw_projection(self.local_embedding(local_vq))
+        vqw_h = vqw_h * vqw_available.unsqueeze(-1).to(vqw_h.dtype)
+        h = self.input_norm(F.gelu(self.cat_projection(
+            torch.cat([bpe_h, vqw_h], dim=-1)
+        )))
+        h = self.backbone(h, ~valid)
+        return self.bpe_head(h[:, -1])
 
 
 class SharedMaskedLocalAR(nn.Module):
@@ -395,13 +468,13 @@ def grouped_bpe_nll(pair_logits, bpe_targets, bpe_to_global):
 def evaluate_local(model, loader, device):
     model.eval()
     total = dict(count=0, loss=0.0, top1=0, top5=0)
-    for bpe, local_vq, valid in tqdm(
+    for bpe, local_vq, valid, vqw_available, target in tqdm(
         loader, desc="[eval local]", leave=False
     ):
-        bpe, local_vq, valid = bpe.to(device), local_vq.to(device), valid.to(device)
-        logits = model(bpe, local_vq, valid)
-        mask = valid[:, 1:]
-        pred, target = logits[:, :-1][mask], bpe[:, 1:][mask]
+        bpe, local_vq = bpe.to(device), local_vq.to(device)
+        valid, vqw_available = valid.to(device), vqw_available.to(device)
+        target = target.to(device)
+        pred = model(bpe, local_vq, valid, vqw_available)
         n = int(target.numel())
         total["count"] += n
         total["loss"] += float(F.cross_entropy(pred, target, reduction="sum"))
@@ -530,13 +603,12 @@ def main():
         if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= local_vq_vocab_size:
             raise ValueError("local VQ ID out of range")
         vq_vocab_size = local_vq_vocab_size
-        model = SharedMaskedLocalAR(
-            token_vocab_size, vq_vocab_size, args.local_bpe_tokens,
-            args.d_model, args.n_layers, args.n_heads, args.dropout,
-            args.max_len
+        model = FeatureCatLocalAR(
+            token_vocab_size, vq_vocab_size, args.d_model, args.n_layers,
+            args.n_heads, args.dropout, args.max_len
         ).to(device)
         selection_metric = "bpe_ppl"
-        architecture = "shared_transformer_bpe_plus_localvqw_tokens_delayed_mask_hop10"
+        architecture = "project_each_feature_cat_then_shared_transformer_hop10_mask"
     else:
         if codebook.get("partition_type") != "bpe_local_kmeans":
             raise ValueError("global_vqwar requires bpe_local_kmeans codebook")
@@ -577,9 +649,10 @@ def main():
     n = len(samples); n_train = int(0.8 * n); n_valid = int(0.1 * n)
     splits = (samples[:n_train], samples[n_train:n_train+n_valid], samples[n_train+n_valid:])
     if args.mode == "local_bpe_direct":
-        datasets = [SharedMaskedLocalDataset(
-            split, token_ids, vq_ids, vq_vocab_size, args.max_len
-        ) for split in splits]
+        datasets = [FeatureCatLocalDataset(
+            split, token_ids, vq_ids, vq_vocab_size,
+            args.local_bpe_tokens, args.max_len, train=(i == 0)
+        ) for i, split in enumerate(splits)]
     else:
         datasets = [GapPairDataset(
             split, token_ids, vq_ids, vq_vocab_size, args.gap,
@@ -603,8 +676,8 @@ def main():
     print(f"[alignment] distant=t-{args.gap}; recent_bpe={args.local_bpe_tokens}")
     print(f"[vocab] bpe={token_vocab_size} vqw={vq_vocab_size}")
     if args.mode == "local_bpe_direct":
-        print("[shared] BPE tokens + local-VQW-only auxiliary tokens")
-        print("[mask] predicting t: BPE through t-1; VQW through t-11")
+        print("[input] project BPE and local-VQW separately; feature-cat per position")
+        print("[mask] predicting t: local-VQW[t-10:t-1] zeroed; shared Transformer")
     else:
         print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
     if args.mode == "global_vqwar":
@@ -616,12 +689,11 @@ def main():
         for batch in pbar:
             optimizer.zero_grad(set_to_none=True)
             if args.mode == "local_bpe_direct":
-                bpe, local_vq, valid = batch
-                bpe, local_vq, valid = bpe.to(device), local_vq.to(device), valid.to(device)
-                all_logits = model(bpe, local_vq, valid)
-                train_mask = valid[:, 1:]
-                logits = all_logits[:, :-1][train_mask]
-                target = bpe[:, 1:][train_mask]
+                bpe, local_vq, valid, vqw_available, target = batch
+                bpe, local_vq = bpe.to(device), local_vq.to(device)
+                valid, vqw_available = valid.to(device), vqw_available.to(device)
+                target = target.to(device)
+                logits = model(bpe, local_vq, valid, vqw_available)
             else:
                 distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid = batch
                 vq_in, bpe_gap = vq_in.to(device), bpe_gap.to(device)
