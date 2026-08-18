@@ -3,8 +3,8 @@
 
 local_bpe_direct:
   BPE stream sees through BPE[t-1].
-  VQW stream sees through cat(BPE, local-VQW)[t-11].
-  cat(BPE hidden, VQW hidden) -> BPE[t]
+  VQW is available through local-VQW[t-11].
+  BPE hidden + learned-alpha * pair-conditioned VQW residual -> BPE[t]
 
 global_vqwar:
   pair-global-ID(BPE, local-VQW)[t-11] + BPE[t-10:t-1]
@@ -273,10 +273,10 @@ class ARBackbone(nn.Module):
         ))
 
 
-class FeatureCatLocalAR(nn.Module):
+class ResidualLocalAR(nn.Module):
     def __init__(self, token_vocab_size, local_vq_vocab_size,
                  d_model=256, n_layers=6, n_heads=8, dropout=0.1,
-                 max_len=255, use_vqw=True):
+                 max_len=255, use_vqw=True, alpha_init=0.5):
         super().__init__()
         self.use_vqw = bool(use_vqw)
         self.local_pad_id = int(local_vq_vocab_size)
@@ -286,23 +286,41 @@ class FeatureCatLocalAR(nn.Module):
         )
         self.bpe_projection = nn.Linear(d_model, d_model)
         self.vqw_projection = nn.Linear(d_model, d_model)
-        self.cat_projection = nn.Linear(2 * d_model, d_model)
+        self.vqw_adapter = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        # A bounded, interpretable scalar gate.  The matched BPE baseline keeps
+        # the same module but forces the effective alpha to exactly zero.
+        eps = 1e-6
+        alpha_init = min(max(float(alpha_init), eps), 1.0 - eps)
+        self.alpha_logit = nn.Parameter(torch.tensor(
+            math.log(alpha_init / (1.0 - alpha_init)), dtype=torch.float32
+        ))
         self.input_norm = nn.LayerNorm(d_model)
         self.backbone = ARBackbone(
             d_model, n_layers, n_heads, dropout, max_len
         )
         self.bpe_head = nn.Linear(d_model, token_vocab_size)
 
+    def effective_alpha(self):
+        if not self.use_vqw:
+            return self.alpha_logit.new_zeros(())
+        return torch.sigmoid(self.alpha_logit)
+
     def forward(self, bpe, local_vq, valid, vqw_available):
         bpe_h = self.bpe_projection(self.bpe_embedding(bpe))
         vqw_h = self.vqw_projection(self.local_embedding(local_vq))
-        if self.use_vqw:
-            vqw_h = vqw_h * vqw_available.unsqueeze(-1).to(vqw_h.dtype)
-        else:
-            vqw_h = torch.zeros_like(vqw_h)
-        h = self.input_norm(F.gelu(self.cat_projection(
-            torch.cat([bpe_h, vqw_h], dim=-1)
-        )))
+        available = vqw_available.unsqueeze(-1).to(vqw_h.dtype)
+        vqw_h = vqw_h * available
+
+        # local VQ IDs are BPE-local, so form the correction jointly from the
+        # BPE identity and its local cluster ID.  Mask the correction itself so
+        # recent positions cannot acquire an extra BPE-only adapter path.
+        delta = self.vqw_adapter(torch.cat([bpe_h, vqw_h], dim=-1))
+        delta = delta * available
+        h = self.input_norm(bpe_h + self.effective_alpha() * delta)
         h = self.backbone(h, ~valid)
         last = valid.long().sum(dim=1).sub(1)
         batch = torch.arange(h.size(0), device=h.device)
@@ -569,10 +587,13 @@ def main():
     ap.add_argument("--n_heads", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--max_len", type=int, default=255)
+    ap.add_argument("--vqw_alpha_init", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     if args.local_bpe_tokens != args.gap - 1:
         ap.error("--local_bpe_tokens must equal --gap - 1")
+    if not 0.0 < args.vqw_alpha_init < 1.0:
+        ap.error("--vqw_alpha_init must be strictly between 0 and 1")
 
     random.seed(args.seed); torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -610,16 +631,17 @@ def main():
         if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= local_vq_vocab_size:
             raise ValueError("local VQ ID out of range")
         vq_vocab_size = local_vq_vocab_size
-        model = FeatureCatLocalAR(
+        model = ResidualLocalAR(
             token_vocab_size, vq_vocab_size, args.d_model, args.n_layers,
             args.n_heads, args.dropout, args.max_len,
-            use_vqw=not args.disable_vqw
+            use_vqw=not args.disable_vqw,
+            alpha_init=args.vqw_alpha_init,
         ).to(device)
         selection_metric = "bpe_ppl"
         architecture = (
-            "matched_bpe_baseline_vqw_zero"
+            "matched_residual_bpe_baseline_alpha_zero"
             if args.disable_vqw else
-            "project_each_feature_cat_then_shared_transformer_hop10_mask"
+            "bpe_residual_pair_conditioned_vqw_adapter_learned_alpha"
         )
     else:
         if codebook.get("partition_type") != "bpe_local_kmeans":
@@ -688,9 +710,10 @@ def main():
     print(f"[alignment] distant=t-{args.gap}; recent_bpe={args.local_bpe_tokens}")
     print(f"[vocab] bpe={token_vocab_size} vqw={vq_vocab_size}")
     if args.mode == "local_bpe_direct":
-        print("[input] project BPE and local-VQW separately; feature-cat per position")
-        print("[mask] predicting t: local-VQW[t-10:t-1] zeroed; shared Transformer")
+        print("[input] BPE main path + pair-conditioned local-VQW residual")
+        print("[mask] predicting t: VQW residual[t-10:t-1] zeroed")
         print(f"[ablation] use_vqw={not args.disable_vqw}")
+        print(f"[alpha] init={args.vqw_alpha_init:g}; learned sigmoid scalar")
     else:
         print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
     if args.mode == "global_vqwar":
@@ -743,9 +766,17 @@ def main():
             test_metrics = evaluate_global(
                 model, global_to_bpe, bpe_to_global, loaders[2], device
             )
-        print(f"[epoch {epoch}] {format_metrics('valid', valid_metrics)} "
+        alpha = (
+            float(model.effective_alpha().detach())
+            if args.mode == "local_bpe_direct" else None
+        )
+        alpha_text = f" alpha={alpha:.6f}" if alpha is not None else ""
+        print(f"[epoch {epoch}]{alpha_text} "
+              f"{format_metrics('valid', valid_metrics)} "
               f"{format_metrics('test', test_metrics)}")
-        history.append({"epoch": epoch, "train_loss": total_loss/max(total_count, 1),
+        history.append({"epoch": epoch,
+                        "train_loss": total_loss/max(total_count, 1),
+                        "alpha": alpha,
                         "valid": valid_metrics, "test": test_metrics})
         checkpoint = {
             "model": model.state_dict(), "args": vars(args), "history": history,
@@ -761,6 +792,7 @@ def main():
             "bpe_to_global": bpe_to_global,
             "window_layers": args.window_layers,
             "bpe_aux_weight": args.bpe_aux_weight,
+            "learned_vqw_alpha": alpha,
             "last_valid": valid_metrics, "last_test": test_metrics,
         }
         torch.save(checkpoint, args.out)
