@@ -200,17 +200,17 @@ class ARBackbone(nn.Module):
 
 
 class LocalBPEDirectAR(nn.Module):
-    def __init__(self, token_vocab_size, local_vq_vocab_size,
+    def __init__(self, token_vocab_size, pair_vq_vocab_size,
                  local_bpe_tokens=10, d_model=256, n_layers=6, n_heads=8,
                  dropout=0.1, max_len=255, window_layers=2):
         super().__init__()
-        self.local_vq_vocab_size = int(local_vq_vocab_size)
-        self.vq_pad_id = self.local_vq_vocab_size
+        self.pair_vq_vocab_size = int(pair_vq_vocab_size)
+        self.vq_pad_id = self.pair_vq_vocab_size
         self.gap = int(local_bpe_tokens) + 1
         self.bpe_embedding = nn.Embedding(token_vocab_size, d_model)
         self.vqw_bpe_embedding = nn.Embedding(token_vocab_size, d_model)
-        self.local_vq_embedding = nn.Embedding(
-            self.local_vq_vocab_size + 1, d_model,
+        self.pair_vq_embedding = nn.Embedding(
+            self.pair_vq_vocab_size + 1, d_model,
             padding_idx=self.vq_pad_id,
         )
         self.vqw_input_fusion = nn.Linear(2 * d_model, d_model)
@@ -225,18 +225,18 @@ class LocalBPEDirectAR(nn.Module):
         self.stream_norm = nn.LayerNorm(d_model)
         self.bpe_head = nn.Linear(d_model, token_vocab_size)
 
-    def forward(self, bpe_in, vqw_bpe, local_vq,
+    def forward(self, bpe_in, vqw_bpe, pair_vq,
                 bpe_key_padding_mask=None, vqw_key_padding_mask=None):
         h_bpe_all = self.bpe_backbone(
             self.bpe_embedding(bpe_in), bpe_key_padding_mask
         )
         # Output aligned to targets: position gap-1 ends at BPE[t-1].
-        h_bpe = h_bpe_all[:, self.gap - 1:self.gap - 1 + local_vq.size(1)]
+        h_bpe = h_bpe_all[:, self.gap - 1:self.gap - 1 + pair_vq.size(1)]
 
         vqw_pair = self.vqw_input_norm(F.gelu(self.vqw_input_fusion(
             torch.cat([
                 self.vqw_bpe_embedding(vqw_bpe),
-                self.local_vq_embedding(local_vq),
+                self.pair_vq_embedding(pair_vq),
             ], dim=-1)
         )))
         h_vqw = self.vqw_backbone(vqw_pair, vqw_key_padding_mask)
@@ -445,20 +445,24 @@ def main():
     if args.mode == "local_bpe_direct":
         if codebook.get("partition_type") != "bpe_local_kmeans":
             raise ValueError("local_bpe_direct requires bpe_local_kmeans codebook")
-        vq_vocab_size = int(data.get(
+        local_vq_vocab_size = int(data.get(
             "vq_vocab_size", codebook.get("max_local_clusters", -1)
         ))
-        if vq_vocab_size < 1:
+        if local_vq_vocab_size < 1:
             raise ValueError("invalid local vq_vocab_size")
-        if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= vq_vocab_size:
+        if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= local_vq_vocab_size:
             raise ValueError("local VQ ID out of range")
+        vq_ids, global_to_bpe, global_to_local = make_pair_global_ids(
+            token_ids, vq_ids, local_vq_vocab_size
+        )
+        vq_vocab_size = int(global_to_bpe.numel())
         model = LocalBPEDirectAR(
             token_vocab_size, vq_vocab_size, args.local_bpe_tokens,
             args.d_model, args.n_layers, args.n_heads, args.dropout,
             args.max_len, args.window_layers
         ).to(device)
         selection_metric = "bpe_ppl"
-        architecture = "two_stream_cat_bpe_tminus1_localvqw_tminus11"
+        architecture = "two_stream_cat_bpe_tminus1_pairvqw_tminus11"
     else:
         if codebook.get("partition_type") != "bpe_local_kmeans":
             raise ValueError("global_vqwar requires bpe_local_kmeans codebook")
@@ -526,7 +530,7 @@ def main():
     print(f"[alignment] distant=t-{args.gap}; recent_bpe={args.local_bpe_tokens}")
     print(f"[vocab] bpe={token_vocab_size} vqw={vq_vocab_size}")
     if args.mode == "local_bpe_direct":
-        print("[streams] BPE through t-1; cat(BPE,local-VQW) through t-11")
+        print("[streams] BPE through t-1; cat(BPE,pair-specific-VQW) through t-11")
         print("[fusion] cat(BPE hidden, VQW hidden) -> BPE")
     else:
         print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
@@ -591,7 +595,11 @@ def main():
             "model": model.state_dict(), "args": vars(args), "history": history,
             "mode": args.mode, "architecture": architecture,
             "vq_vocab_size": vq_vocab_size, "token_vocab_size": token_vocab_size,
-            "pair_global_id": args.mode == "global_vqwar",
+            "pair_global_id": True,
+            "pair_global_role": (
+                "auxiliary_input" if args.mode == "local_bpe_direct"
+                else "ar_input_and_target"
+            ),
             "global_to_bpe": global_to_bpe,
             "global_to_local": global_to_local,
             "bpe_to_global": bpe_to_global,
