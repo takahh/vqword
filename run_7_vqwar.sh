@@ -54,7 +54,7 @@ MAX_LEN="${MAX_LEN:-255}"
 VQ_GAP="${VQ_GAP:-11}"
 LOCAL_BPE_TOKENS="${LOCAL_BPE_TOKENS:-10}"
 MIXTURE_TOPK="${MIXTURE_TOPK:-32}"
-AR_SCRIPT="/vqword/ar_vqw_dual_mode.py"
+AR_SCRIPT="/vqword/ar_vqwar.py"
 
 if [ "${VQ_GAP}" -ne 11 ] || [ "${LOCAL_BPE_TOKENS}" -ne 10 ]; then
   echo "[error] bilateral HOP10 requires VQ_GAP=11 and LOCAL_BPE_TOKENS=10"
