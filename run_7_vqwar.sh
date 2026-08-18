@@ -55,6 +55,13 @@ VQ_GAP="${VQ_GAP:-11}"
 LOCAL_BPE_TOKENS="${LOCAL_BPE_TOKENS:-10}"
 MIXTURE_TOPK="${MIXTURE_TOPK:-32}"
 AR_SCRIPT="/vqword/ar_vqwar.py"
+DISABLE_VQW="${DISABLE_VQW:-0}"
+
+EXTRA_ARGS=()
+if [ "${DISABLE_VQW}" = "1" ]; then
+  EXTRA_ARGS+=(--disable_vqw)
+  VQ_LABEL="${VQ_LABEL}_matched_bpebaseline"
+fi
 
 if [ "${VQ_GAP}" -ne 11 ] || [ "${LOCAL_BPE_TOKENS}" -ne 10 ]; then
   echo "[error] bilateral HOP10 requires VQ_GAP=11 and LOCAL_BPE_TOKENS=10"
@@ -171,6 +178,7 @@ python "${AR_SCRIPT}" \
   --max_len "${MAX_LEN}" \
   --seed "${AR_SEED}" \
   --out "${FINAL_PATH}" \
+  "${EXTRA_ARGS[@]}" \
   2>&1 | tee "${LOG_PATH}"
 
 for path_to_check in "${FINAL_PATH}" "${BEST_PATH}" "${LOG_PATH}"; do
