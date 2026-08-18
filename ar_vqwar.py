@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+　#!/usr/bin/env python3
 """Two leak-free HOP10 AR modes.
 
 local_bpe_direct:
@@ -205,16 +205,16 @@ class FeatureCatLocalDataset(Dataset):
             target = random.randrange(sample_start + 1, sample_end)
         context_start = max(sample_start, target - self.max_len)
         length = target - context_start
-        offset = self.max_len - length
+        offset = 0
         bpe = torch.zeros(self.max_len, dtype=torch.long)
         local = torch.full((self.max_len,), self.vq_pad_id, dtype=torch.long)
         valid = torch.zeros(self.max_len, dtype=torch.bool)
         vqw_available = torch.zeros(self.max_len, dtype=torch.bool)
-        bpe[offset:] = self.token_ids[context_start:target]
-        local[offset:] = self.local_vq_ids[context_start:target]
-        valid[offset:] = True
+        bpe[:length] = self.token_ids[context_start:target]
+        local[:length] = self.local_vq_ids[context_start:target]
+        valid[:length] = True
         positions = torch.arange(context_start, target)
-        vqw_available[offset:] = positions <= target - self.hop - 1
+        vqw_available[:length] = positions <= target - self.hop - 1
         return bpe, local, valid, vqw_available, self.token_ids[target]
 
 
@@ -300,7 +300,9 @@ class FeatureCatLocalAR(nn.Module):
             torch.cat([bpe_h, vqw_h], dim=-1)
         )))
         h = self.backbone(h, ~valid)
-        return self.bpe_head(h[:, -1])
+        last = valid.long().sum(dim=1).sub(1)
+        batch = torch.arange(h.size(0), device=h.device)
+        return self.bpe_head(h[batch, last])
 
 
 class SharedMaskedLocalAR(nn.Module):
