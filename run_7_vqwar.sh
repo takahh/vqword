@@ -56,6 +56,7 @@ LOCAL_BPE_TOKENS="${LOCAL_BPE_TOKENS:-10}"
 MIXTURE_TOPK="${MIXTURE_TOPK:-32}"
 AR_SCRIPT="/vqword/ar_vqwar.py"
 DISABLE_VQW="${DISABLE_VQW:-0}"
+--vqw_alpha_init "${VQW_ALPHA_INIT:-0.5}"
 
 EXTRA_ARGS=()
 if [ "${DISABLE_VQW}" = "1" ]; then
