@@ -4,7 +4,7 @@
 local_bpe_direct:
   BPE stream sees through BPE[t-1].
   VQW is available through local-VQW[t-11].
-  BPE hidden + learned-alpha * VQW-only residual -> BPE[t]
+  gated-cat(BPE hidden, learned-alpha * conditioned VQW feature) -> BPE[t]
 
 global_vqwar:
   pair-global-ID(BPE, local-VQW)[t-11] + BPE[t-10:t-1]
@@ -273,7 +273,7 @@ class ARBackbone(nn.Module):
         ))
 
 
-class ResidualLocalAR(nn.Module):
+class GatedCatLocalAR(nn.Module):
     def __init__(self, token_vocab_size, local_vq_vocab_size,
                  d_model=256, n_layers=6, n_heads=8, dropout=0.1,
                  max_len=255, use_vqw=True, alpha_init=0.5):
@@ -285,12 +285,22 @@ class ResidualLocalAR(nn.Module):
             local_vq_vocab_size + 1, d_model, padding_idx=self.local_pad_id
         )
         self.bpe_projection = nn.Linear(d_model, d_model)
-        self.vqw_projection = nn.Linear(d_model, d_model)
-        self.vqw_adapter = nn.Sequential(
+        # Map the local-VQW embedding into its own normalized feature space
+        # before it interacts with the BPE feature.
+        self.vqw_projection = nn.Sequential(
             nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
+        # local VQ IDs are BPE-local, so interpret them jointly with BPE.
+        self.vqw_adapter = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
+        # Preserve BPE and the gated auxiliary feature as separate channels
+        # until this learned fusion projection.
+        self.fuse_projection = nn.Linear(2 * d_model, d_model)
         # A bounded, interpretable scalar gate.  The matched BPE baseline keeps
         # the same module but forces the effective alpha to exactly zero.
         eps = 1e-6
@@ -315,14 +325,15 @@ class ResidualLocalAR(nn.Module):
         available = vqw_available.unsqueeze(-1).to(vqw_h.dtype)
         vqw_h = vqw_h * available
 
-        # Keep BPE exclusively on the main path.  The residual branch receives
-        # only local-VQW information, so an improvement cannot come from a
-        # second nonlinear BPE path.  Mask the correction itself as well,
-        # because Linear biases would otherwise make unavailable positions
-        # nonzero again.
-        delta = self.vqw_adapter(vqw_h)
+        # Build a BPE-conditioned auxiliary feature.  Mask the adapter output
+        # itself because Linear biases would otherwise make unavailable
+        # positions nonzero again.
+        delta = self.vqw_adapter(torch.cat([bpe_h, vqw_h], dim=-1))
         delta = delta * available
-        h = self.input_norm(bpe_h + self.effective_alpha() * delta)
+        gated_delta = self.effective_alpha() * delta
+        h = self.input_norm(F.gelu(self.fuse_projection(
+            torch.cat([bpe_h, gated_delta], dim=-1)
+        )))
         h = self.backbone(h, ~valid)
         last = valid.long().sum(dim=1).sub(1)
         batch = torch.arange(h.size(0), device=h.device)
@@ -633,7 +644,7 @@ def main():
         if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= local_vq_vocab_size:
             raise ValueError("local VQ ID out of range")
         vq_vocab_size = local_vq_vocab_size
-        model = ResidualLocalAR(
+        model = GatedCatLocalAR(
             token_vocab_size, vq_vocab_size, args.d_model, args.n_layers,
             args.n_heads, args.dropout, args.max_len,
             use_vqw=not args.disable_vqw,
@@ -641,9 +652,9 @@ def main():
         ).to(device)
         selection_metric = "bpe_ppl"
         architecture = (
-            "matched_residual_bpe_baseline_alpha_zero"
+            "matched_gated_cat_bpe_baseline_alpha_zero"
             if args.disable_vqw else
-            "bpe_main_plus_vqw_only_residual_adapter_learned_alpha"
+            "separate_bpe_vqw_projection_conditioned_adapter_gated_cat_fusion"
         )
     else:
         if codebook.get("partition_type") != "bpe_local_kmeans":
@@ -712,8 +723,8 @@ def main():
     print(f"[alignment] distant=t-{args.gap}; recent_bpe={args.local_bpe_tokens}")
     print(f"[vocab] bpe={token_vocab_size} vqw={vq_vocab_size}")
     if args.mode == "local_bpe_direct":
-        print("[input] BPE main path + local-VQW-only residual")
-        print("[mask] predicting t: VQW residual[t-10:t-1] zeroed")
+        print("[input] separate BPE/VQW projection; conditioned adapter; gated feature-cat")
+        print("[mask] predicting t: VQW auxiliary feature[t-10:t-1] zeroed")
         print(f"[ablation] use_vqw={not args.disable_vqw}")
         print(f"[alpha] init={args.vqw_alpha_init:g}; learned sigmoid scalar")
     else:
