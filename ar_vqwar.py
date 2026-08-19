@@ -441,13 +441,18 @@ class LocalBPEDirectAR(nn.Module):
 class GlobalVQWAR(nn.Module):
     def __init__(self, vq_vocab_size, token_vocab_size, local_bpe_tokens=10,
                  d_model=256, n_layers=6, n_heads=8,
-                 dropout=0.1, max_len=255, window_layers=2):
+                 dropout=0.1, max_len=255, window_layers=2,
+                 use_vqw=True):
         super().__init__()
+        self.use_vqw = bool(use_vqw)
         self.vq_vocab_size = int(vq_vocab_size)
         self.vq_pad_id = self.vq_vocab_size
         self.vq_embedding = nn.Embedding(
             self.vq_vocab_size + 1, d_model, padding_idx=self.vq_pad_id
         )
+        # Matched ablation input: retain the distant BPE at t-11 while
+        # removing only its local-VQW subtype information.
+        self.distant_bpe_embedding = nn.Embedding(token_vocab_size, d_model)
         self.backbone = ARBackbone(
             d_model, n_layers, n_heads, dropout, max_len
         )
@@ -457,8 +462,14 @@ class GlobalVQWAR(nn.Module):
         )
         self.vq_head = nn.Linear(d_model, self.vq_vocab_size)
 
-    def forward(self, vq_in, bpe_gap, key_padding_mask=None):
-        h = self.backbone(self.vq_embedding(vq_in), key_padding_mask)
+    def forward(self, distant_bpe, vq_in, bpe_gap,
+                key_padding_mask=None):
+        source_h = (
+            self.vq_embedding(vq_in)
+            if self.use_vqw else
+            self.distant_bpe_embedding(distant_bpe)
+        )
+        h = self.backbone(source_h, key_padding_mask)
         h = self.window(h, bpe_gap)
         return self.vq_head(h)
 
@@ -531,12 +542,13 @@ def evaluate_global(model, global_to_bpe, bpe_to_global, loader, device):
     bpe_to_global = bpe_to_global.to(device)
     total = dict(count=0, vq_loss=0.0, vq_top1=0, vq_top5=0,
                  bpe_loss=0.0, bpe_top1=0)
-    for _distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid in tqdm(
+    for distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid in tqdm(
         loader, desc="[eval global]", leave=False
     ):
+        distant_bpe = distant_bpe.to(device)
         vq_in, vq_y = vq_in.to(device), vq_y.to(device)
         bpe_gap, bpe_y, valid = bpe_gap.to(device), bpe_y.to(device), valid.to(device)
-        logits = model(vq_in, bpe_gap, ~valid)
+        logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
         mask = vq_y.ne(-100)
         vl, vt, bt = logits[mask], vq_y[mask], bpe_y[mask]
         n = int(vt.numel()); total["count"] += n
@@ -686,10 +698,15 @@ def main():
         model = GlobalVQWAR(
             vq_vocab_size, token_vocab_size, args.local_bpe_tokens,
             args.d_model, args.n_layers, args.n_heads, args.dropout,
-            args.max_len, args.window_layers
+            args.max_len, args.window_layers,
+            use_vqw=not args.disable_vqw,
         ).to(device)
         selection_metric = "bpe_ppl"
-        architecture = "pair_global_vqwar_11token_window_bpe_aux"
+        architecture = (
+            "matched_global_bpe_tminus11_11token_window_pair_head"
+            if args.disable_vqw else
+            "pair_global_vqwar_11token_window_bpe_aux"
+        )
 
     samples = list(data["samples"])
     random.shuffle(samples)
@@ -729,6 +746,8 @@ def main():
         print(f"[alpha] init={args.vqw_alpha_init:g}; learned sigmoid scalar")
     else:
         print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
+        print(f"[ablation] use_vqw={not args.disable_vqw}; "
+              f"distant_input={'pair-global VQW' if not args.disable_vqw else 'BPE'}")
     if args.mode == "global_vqwar":
         print(f"[loss] pair_ce + {args.bpe_aux_weight:g} * bpe_marginal_ce")
 
@@ -745,11 +764,12 @@ def main():
                 logits = model(bpe, local_vq, valid, vqw_available)
             else:
                 distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid = batch
+                distant_bpe = distant_bpe.to(device)
                 vq_in, bpe_gap = vq_in.to(device), bpe_gap.to(device)
                 valid = valid.to(device)
                 target = vq_y.to(device)
                 bpe_target = bpe_y.to(device)
-                logits = model(vq_in, bpe_gap, ~valid)
+                logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
             pair_or_bpe_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), target.reshape(-1),
                 ignore_index=-100
@@ -798,8 +818,13 @@ def main():
             "pair_global_id": args.mode == "global_vqwar",
             "pair_global_role": (
                 "none_local_vqw_input" if args.mode == "local_bpe_direct"
-                else "ar_input_and_target"
+                else (
+                    "ar_input_and_target"
+                    if not args.disable_vqw else
+                    "target_only_distant_input_is_bpe"
+                )
             ),
+            "use_vqw": not args.disable_vqw,
             "global_to_bpe": global_to_bpe,
             "global_to_local": global_to_local,
             "bpe_to_global": bpe_to_global,
