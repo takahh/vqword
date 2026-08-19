@@ -4,7 +4,7 @@ set -euo pipefail
 # WikiText-103: shared-space, recurrent-HOP BPE-local VQWord generation
 #
 # One tied GNN cell is applied repeatedly. Intermediate states for
-# HOP=MIN_HOP..MAX_HOP are discretized with one shared BPE-local codebook.
+# HOP=MIN_HOP..MAX_HOP are discretized with independent BPE-local codebooks.
 # HOP is not embedded in the token.
 #
 # Usage:
@@ -135,7 +135,7 @@ PY
 
 MIN_HOP_PADDED="$(printf '%02d' "${MIN_HOP}")"
 MAX_HOP_PADDED="$(printf '%02d' "${MAX_HOP}")"
-TAG="bpe${BPE_VOCAB_LABEL}_sharedhop${MIN_HOP_PADDED}to${MAX_HOP_PADDED}_center${CENTER_SCALE}_localbpe${LOCAL_CLUSTERS}_seed${SEED}"
+TAG="bpe${BPE_VOCAB_LABEL}_tiedgnn_separatehop${MIN_HOP_PADDED}to${MAX_HOP_PADDED}_center${CENTER_SCALE}_localbpe${LOCAL_CLUSTERS}_seed${SEED}"
 
 OUT="wikitext103_vqword_${TAG}.pt"
 DICTIONARY="wikitext103_vqword_${TAG}_dictionary.pt"
@@ -151,7 +151,7 @@ echo "============================================================"
 echo "[train] shared recurrent HOP VQWord"
 echo "HOP range          = ${MIN_HOP}..${MAX_HOP}"
 echo "tied GNN           = yes"
-echo "shared codebook    = yes"
+echo "shared codebook    = no (independent per HOP)"
 echo "HOP embedding      = no"
 echo "center scale       = ${CENTER_SCALE}"
 echo "local clusters     = ${LOCAL_CLUSTERS}"
@@ -185,7 +185,7 @@ for path in "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"; do
   fi
 done
 
-# Verify that the output really came from the new shared-HOP implementation.
+# Verify tied GNN plus independent per-HOP codebooks.
 python3 - "${OUT_PATH}" "${IDS_PATH}" "${MIN_HOP}" "${MAX_HOP}" <<'PY'
 import sys
 import torch
@@ -202,8 +202,8 @@ for name, obj in (("model", model), ("ids", ids)):
         )
     if obj.get("shared_gnn_across_hops") is not True:
         raise ValueError(f"{name} does not declare a shared GNN")
-    if obj.get("shared_codebook_across_hops") is not True:
-        raise ValueError(f"{name} does not declare a shared codebook")
+    if obj.get("shared_codebook_across_hops") is not False:
+        raise ValueError(f"{name} does not declare per-HOP codebooks")
     if obj.get("hop_embedding") is not False:
         raise ValueError(f"{name} unexpectedly uses a HOP embedding")
 
@@ -214,6 +214,8 @@ if matrix.ndim != 2 or matrix.size(0) != len(expected_hops):
     )
 if matrix.size(1) != ids["bpe_ids"].numel():
     raise ValueError("BPE/VQ position count mismatch")
+if ids.get("k_by_bpe_by_hop", torch.empty(0)).shape[0] != len(expected_hops):
+    raise ValueError("missing per-HOP k_by_bpe metadata")
 if not torch.equal(ids["local_vq_ids"], matrix[-1]):
     raise ValueError("maximum-HOP compatibility alias mismatch")
 
@@ -226,7 +228,7 @@ PY
 printf "min_hop\tmax_hop\tlocal_clusters\ttied_gnn\tshared_codebook\thop_embedding\tmodel\tdictionary\tids\n" > "${MANIFEST_PATH}"
 printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
   "${MIN_HOP}" "${MAX_HOP}" "${LOCAL_CLUSTERS}" \
-  "true" "true" "false" \
+  "true" "false" "false" \
   "${OUT}" "${DICTIONARY}" "${IDS}" >> "${MANIFEST_PATH}"
 
 lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF_LFTP
