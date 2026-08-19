@@ -10,6 +10,10 @@ global_vqwar:
   pair-global-ID(BPE, local-VQW)[t-11] + BPE[t-10:t-1]
   -> pair-global-ID(BPE, local-VQW)[t]
   -> exact BPE recovery from the predicted pair ID
+
+global_vqwar + --disable_vqw:
+  BPE[t-11] + BPE[t-10:t-1]
+  -> BPE[t] directly (no pair-global input, target, head, or loss)
 """
 
 import argparse
@@ -460,7 +464,8 @@ class GlobalVQWAR(nn.Module):
             token_vocab_size, local_bpe_tokens, d_model,
             n_heads, dropout, window_layers
         )
-        self.vq_head = nn.Linear(d_model, self.vq_vocab_size)
+        output_size = self.vq_vocab_size if self.use_vqw else token_vocab_size
+        self.output_head = nn.Linear(d_model, output_size)
 
     def forward(self, distant_bpe, vq_in, bpe_gap,
                 key_padding_mask=None):
@@ -471,7 +476,7 @@ class GlobalVQWAR(nn.Module):
         )
         h = self.backbone(source_h, key_padding_mask)
         h = self.window(h, bpe_gap)
-        return self.vq_head(h)
+        return self.output_head(h)
 
 
 def make_pair_global_ids(token_ids, local_vq_ids, local_vq_vocab_size):
@@ -586,6 +591,40 @@ def evaluate_global(model, global_to_bpe, bpe_to_global, loader, device):
     )
 
 
+@torch.no_grad()
+def evaluate_global_bpe(model, loader, device):
+    """Evaluate the --disable_vqw global-mode ablation as direct BPE AR."""
+    model.eval()
+    total = dict(count=0, bpe_loss=0.0, bpe_top1=0, bpe_top5=0)
+    for distant_bpe, vq_in, bpe_gap, _vq_y, bpe_y, valid in tqdm(
+        loader, desc="[eval global BPE]", leave=False
+    ):
+        distant_bpe = distant_bpe.to(device)
+        vq_in = vq_in.to(device)
+        bpe_gap = bpe_gap.to(device)
+        bpe_y = bpe_y.to(device)
+        valid = valid.to(device)
+        logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
+        mask = bpe_y.ne(-100)
+        pred, target = logits[mask], bpe_y[mask]
+        n = int(target.numel())
+        total["count"] += n
+        total["bpe_loss"] += float(
+            F.cross_entropy(pred, target, reduction="sum")
+        )
+        a, b = accumulate_topk(pred, target)
+        total["bpe_top1"] += a
+        total["bpe_top5"] += b
+    n = max(total["count"], 1)
+    ce = total["bpe_loss"] / n
+    return dict(
+        count=total["count"], bpe_loss=ce,
+        bpe_ppl=math.exp(min(ce, 20.0)),
+        bpe_top1=total["bpe_top1"] / n,
+        bpe_top5=total["bpe_top5"] / n,
+    )
+
+
 def format_metrics(prefix, metrics):
     names = [key for key in metrics if key.endswith(("_ppl", "_top1"))]
     return " ".join(f"{prefix}_{key}={metrics[key]:.4f}" for key in names)
@@ -678,22 +717,30 @@ def main():
             raise ValueError("invalid local vq_vocab_size")
         if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= local_vq_vocab_size:
             raise ValueError("local VQ ID out of range")
-        vq_ids, global_to_bpe, global_to_local = make_pair_global_ids(
-            token_ids, vq_ids, local_vq_vocab_size
-        )
-        vq_vocab_size = int(global_to_bpe.numel())
+        if args.disable_vqw:
+            # Keep the original local IDs only as an ignored dataset field.
+            # No pair-global vocabulary or reverse mapping is constructed.
+            vq_vocab_size = local_vq_vocab_size
+        else:
+            vq_ids, global_to_bpe, global_to_local = make_pair_global_ids(
+                token_ids, vq_ids, local_vq_vocab_size
+            )
+            vq_vocab_size = int(global_to_bpe.numel())
 
-        # Reverse table used to sum all pair-ID probabilities belonging to BPE.
-        counts = torch.bincount(global_to_bpe, minlength=token_vocab_size)
-        max_pairs_per_bpe = int(counts.max())
-        bpe_to_global = torch.full(
-            (token_vocab_size, max_pairs_per_bpe), -1, dtype=torch.long
-        )
-        cursor = torch.zeros(token_vocab_size, dtype=torch.long)
-        for gid, bpe in enumerate(global_to_bpe.tolist()):
-            column = int(cursor[bpe])
-            bpe_to_global[bpe, column] = gid
-            cursor[bpe] += 1
+            # Reverse table used to sum pair-ID probabilities by BPE.
+            counts = torch.bincount(
+                global_to_bpe, minlength=token_vocab_size
+            )
+            max_pairs_per_bpe = int(counts.max())
+            bpe_to_global = torch.full(
+                (token_vocab_size, max_pairs_per_bpe), -1,
+                dtype=torch.long
+            )
+            cursor = torch.zeros(token_vocab_size, dtype=torch.long)
+            for gid, bpe in enumerate(global_to_bpe.tolist()):
+                column = int(cursor[bpe])
+                bpe_to_global[bpe, column] = gid
+                cursor[bpe] += 1
 
         model = GlobalVQWAR(
             vq_vocab_size, token_vocab_size, args.local_bpe_tokens,
@@ -703,7 +750,7 @@ def main():
         ).to(device)
         selection_metric = "bpe_ppl"
         architecture = (
-            "matched_global_bpe_tminus11_11token_window_pair_head"
+            "matched_global_bpe_tminus11_11token_window_bpe_head"
             if args.disable_vqw else
             "pair_global_vqwar_11token_window_bpe_aux"
         )
@@ -749,7 +796,10 @@ def main():
         print(f"[ablation] use_vqw={not args.disable_vqw}; "
               f"distant_input={'pair-global VQW' if not args.disable_vqw else 'BPE'}")
     if args.mode == "global_vqwar":
-        print(f"[loss] pair_ce + {args.bpe_aux_weight:g} * bpe_marginal_ce")
+        if args.disable_vqw:
+            print("[target] BPE; [loss] bpe_ce")
+        else:
+            print(f"[loss] pair_ce + {args.bpe_aux_weight:g} * bpe_marginal_ce")
 
     for epoch in range(1, args.epochs + 1):
         model.train(); total_loss = 0.0; total_count = 0
@@ -767,14 +817,15 @@ def main():
                 distant_bpe = distant_bpe.to(device)
                 vq_in, bpe_gap = vq_in.to(device), bpe_gap.to(device)
                 valid = valid.to(device)
-                target = vq_y.to(device)
+                pair_target = vq_y.to(device)
                 bpe_target = bpe_y.to(device)
+                target = bpe_target if args.disable_vqw else pair_target
                 logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
             pair_or_bpe_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), target.reshape(-1),
                 ignore_index=-100
             )
-            if args.mode == "global_vqwar":
+            if args.mode == "global_vqwar" and not args.disable_vqw:
                 train_mask = target.ne(-100)
                 bpe_aux_loss = grouped_bpe_nll(
                     logits[train_mask], bpe_target[train_mask],
@@ -793,12 +844,16 @@ def main():
             valid_metrics = evaluate_local(model, loaders[1], device)
             test_metrics = evaluate_local(model, loaders[2], device)
         else:
-            valid_metrics = evaluate_global(
-                model, global_to_bpe, bpe_to_global, loaders[1], device
-            )
-            test_metrics = evaluate_global(
-                model, global_to_bpe, bpe_to_global, loaders[2], device
-            )
+            if args.disable_vqw:
+                valid_metrics = evaluate_global_bpe(model, loaders[1], device)
+                test_metrics = evaluate_global_bpe(model, loaders[2], device)
+            else:
+                valid_metrics = evaluate_global(
+                    model, global_to_bpe, bpe_to_global, loaders[1], device
+                )
+                test_metrics = evaluate_global(
+                    model, global_to_bpe, bpe_to_global, loaders[2], device
+                )
         alpha = (
             float(model.effective_alpha().detach())
             if args.mode == "local_bpe_direct" else None
@@ -815,13 +870,15 @@ def main():
             "model": model.state_dict(), "args": vars(args), "history": history,
             "mode": args.mode, "architecture": architecture,
             "vq_vocab_size": vq_vocab_size, "token_vocab_size": token_vocab_size,
-            "pair_global_id": args.mode == "global_vqwar",
+            "pair_global_id": (
+                args.mode == "global_vqwar" and not args.disable_vqw
+            ),
             "pair_global_role": (
                 "none_local_vqw_input" if args.mode == "local_bpe_direct"
                 else (
                     "ar_input_and_target"
                     if not args.disable_vqw else
-                    "target_only_distant_input_is_bpe"
+                    "disabled_bpe_input_and_target"
                 )
             ),
             "use_vqw": not args.disable_vqw,
