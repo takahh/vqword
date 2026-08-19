@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import os
 from collections import Counter, defaultdict
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -150,8 +152,8 @@ def fit_bpe_local_kmeans_shared_hops(
     """Fit one BPE-local codebook jointly over all requested HOP states.
 
     The GNN cell, latent axes, projection (identity here), and cluster centers
-    are shared. HOP is not part of the token ID. The returned ID matrix has
-    shape [num_hops, num_positions].
+    are shared. HOP is not part of the token ID. ID assignment is performed
+    separately, one HOP at a time, so completed HOPs can be checkpointed.
     """
     hops = [int(h) for h in hops]
     if not hops or len(set(hops)) != len(hops):
@@ -198,37 +200,66 @@ def fit_bpe_local_kmeans_shared_hops(
             torch.from_numpy(km.cluster_centers_).float(), dim=-1
         )
 
-    # Padded center table makes assignment vectorized across BPE partitions.
+    return centers_by_bpe, k_by_bpe
+
+
+def atomic_torch_save(obj, path):
+    """Write a PyTorch file atomically to avoid accepting partial files."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
+@torch.no_grad()
+def assign_bpe_local_ids_one_hop(
+    model,
+    ctx,
+    tgt,
+    hop,
+    centers_by_bpe,
+    k_by_bpe,
+    batch_size,
+    device,
+    max_clusters,
+    vocab_size,
+):
+    """Assign every physical position for exactly one recurrent HOP."""
+    if not centers_by_bpe:
+        raise ValueError("centers_by_bpe is empty")
+
     d_model = next(iter(centers_by_bpe.values())).size(1)
     center_table = torch.zeros(
-        vocab_size, int(max_clusters), d_model, dtype=torch.float32
+        int(vocab_size), int(max_clusters), d_model, dtype=torch.float32
     )
     valid_center = torch.zeros(
-        vocab_size, int(max_clusters), dtype=torch.bool
+        int(vocab_size), int(max_clusters), dtype=torch.bool
     )
     for bpe_id, centers in centers_by_bpe.items():
         k = centers.size(0)
-        center_table[bpe_id, :k] = centers
-        valid_center[bpe_id, :k] = True
+        center_table[int(bpe_id), :k] = centers
+        valid_center[int(bpe_id), :k] = True
     center_table = center_table.to(device)
     valid_center = valid_center.to(device)
 
-    ids_by_hop = torch.empty((len(hops), len(tgt)), dtype=torch.long)
+    ids = torch.empty(len(tgt), dtype=torch.long)
     for start in tqdm(
-        range(0, len(ctx), batch_size), desc="[assign shared-HOP IDs]"
+        range(0, len(ctx), batch_size), desc=f"[assign HOP{int(hop)} IDs]"
     ):
         end = min(start + batch_size, len(ctx))
         yb = tgt[start:end].to(device)
-        states = model.encode_context_hops(ctx[start:end].to(device), hops)
+        z = model.encode_context_hops(
+            ctx[start:end].to(device), [int(hop)]
+        )[int(hop)]
         candidate_centers = center_table[yb]
         candidate_valid = valid_center[yb]
-        for row, hop in enumerate(hops):
-            z = F.normalize(states[hop].float(), dim=-1)
-            sim = torch.einsum("bd,bkd->bk", z, candidate_centers)
-            sim = sim.masked_fill(~candidate_valid, float("-inf"))
-            ids_by_hop[row, start:end] = sim.argmax(dim=1).cpu()
+        z = F.normalize(z.float(), dim=-1)
+        sim = torch.einsum("bd,bkd->bk", z, candidate_centers)
+        sim = sim.masked_fill(~candidate_valid, float("-inf"))
+        ids[start:end] = sim.argmax(dim=1).cpu()
 
-    return ids_by_hop, centers_by_bpe, k_by_bpe
+    return ids
 
 @torch.no_grad()
 def fit_bpe_local_kmeans(
@@ -1228,6 +1259,19 @@ def main():
     ap.add_argument("--k_block", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="vqword_global_ivf.pt")
+    ap.add_argument(
+        "--hop_parts_dir",
+        default=None,
+        help=(
+            "directory for per-HOP checkpoints; default: "
+            "<out_without_.pt>_hop_parts"
+        ),
+    )
+    ap.add_argument(
+        "--cleanup_hop_parts",
+        action="store_true",
+        help="remove per-HOP ID files after the final IDs file is saved",
+    )
 
     args = ap.parse_args()
 
@@ -1302,19 +1346,112 @@ def main():
         f"[shared HOP] hops={hops} tied_gnn=True "
         f"shared_codebook=True hop_embedding=False"
     )
-    local_vq_ids_by_hop, centers_by_bpe, k_by_bpe = (
-        fit_bpe_local_kmeans_shared_hops(
-        model=model,
-        ctx=ctx,
-        tgt=tgt,
-        hops=hops,
-        batch_size=args.batch_size,
-        device=device,
-        max_clusters=args.local_clusters,
-        seed=args.seed,
-        vocab_size=vocab_size,
-        sample_positions_per_bpe=args.cluster_samples_per_bpe,
-    ))
+    out_path = Path(args.out)
+    hop_parts_dir = Path(
+        args.hop_parts_dir
+        if args.hop_parts_dir is not None else
+        str(out_path.with_suffix("")) + "_hop_parts"
+    )
+    hop_parts_dir.mkdir(parents=True, exist_ok=True)
+    shared_checkpoint = hop_parts_dir / "shared_codebook.pt"
+
+    checkpoint_signature = {
+        "hops": hops,
+        "seed": int(args.seed),
+        "local_clusters": int(args.local_clusters),
+        "cluster_samples_per_bpe": int(args.cluster_samples_per_bpe),
+        "d_model": int(args.d_model),
+        "center_scale": float(args.center_scale),
+        "tokenizer_name": args.tokenizer,
+        "vocab_size": int(vocab_size),
+        "num_positions": int(len(tgt)),
+        "encoder_max_hop": int(encoder_max_hop),
+    }
+
+    if shared_checkpoint.exists():
+        saved = torch.load(shared_checkpoint, map_location="cpu")
+        if saved.get("signature") != checkpoint_signature:
+            raise RuntimeError(
+                f"checkpoint settings do not match current run: "
+                f"{shared_checkpoint}. Remove that directory or choose a "
+                "different --hop_parts_dir."
+            )
+        model.load_state_dict(saved["model"])
+        centers_by_bpe = saved["centers_by_bpe"]
+        k_by_bpe = saved["k_by_bpe"]
+        print(f"[resume shared codebook] {shared_checkpoint}")
+    else:
+        centers_by_bpe, k_by_bpe = fit_bpe_local_kmeans_shared_hops(
+            model=model,
+            ctx=ctx,
+            tgt=tgt,
+            hops=hops,
+            batch_size=args.batch_size,
+            device=device,
+            max_clusters=args.local_clusters,
+            seed=args.seed,
+            vocab_size=vocab_size,
+            sample_positions_per_bpe=args.cluster_samples_per_bpe,
+        )
+        atomic_torch_save(
+            {
+                "signature": checkpoint_signature,
+                "model": model.state_dict(),
+                "centers_by_bpe": centers_by_bpe,
+                "k_by_bpe": k_by_bpe,
+            },
+            shared_checkpoint,
+        )
+        print(f"[save shared codebook] {shared_checkpoint}")
+
+    # Assign and persist one HOP at a time. A completed part is reused after
+    # interruption, while atomic writes prevent a partial part being accepted.
+    hop_part_paths = []
+    id_dtype = torch.uint8 if args.local_clusters <= 256 else torch.int16
+    for hop in hops:
+        part_path = hop_parts_dir / f"hop_{int(hop):03d}_ids.pt"
+        hop_part_paths.append(part_path)
+        if part_path.exists():
+            part = torch.load(part_path, map_location="cpu")
+            if (
+                part.get("signature") != checkpoint_signature
+                or int(part.get("hop", -1)) != int(hop)
+                or len(part.get("local_vq_ids", [])) != len(tgt)
+            ):
+                raise RuntimeError(
+                    f"invalid or mismatched HOP checkpoint: {part_path}"
+                )
+            print(f"[resume HOP{hop}] {part_path}")
+            continue
+
+        hop_ids = assign_bpe_local_ids_one_hop(
+            model=model,
+            ctx=ctx,
+            tgt=tgt,
+            hop=hop,
+            centers_by_bpe=centers_by_bpe,
+            k_by_bpe=k_by_bpe,
+            batch_size=args.batch_size,
+            device=device,
+            max_clusters=args.local_clusters,
+            vocab_size=vocab_size,
+        )
+        atomic_torch_save(
+            {
+                "signature": checkpoint_signature,
+                "hop": int(hop),
+                "local_vq_ids": hop_ids.to(id_dtype),
+            },
+            part_path,
+        )
+        print(f"[save HOP{hop}] {part_path}")
+        del hop_ids
+
+    print("[merge HOP parts]")
+    local_vq_ids_by_hop = torch.stack([
+        torch.load(path, map_location="cpu")["local_vq_ids"]
+        for path in hop_part_paths
+    ], dim=0)
 
     # The pair itself is the token: no lossy VQW -> BPE decoder is needed.
     # local_vq_id only has meaning inside its accompanying BPE partition.
@@ -1362,9 +1499,9 @@ def main():
     }
 
     dictionary_out = args.out.replace(".pt", "_dictionary.pt")
-    torch.save(dictionary, dictionary_out)
+    atomic_torch_save(dictionary, dictionary_out)
     print(f"[save dictionary] {dictionary_out}")
-    torch.save(
+    atomic_torch_save(
         {
             "model": model.state_dict(),
             "centers_by_bpe": centers_by_bpe,
@@ -1393,7 +1530,7 @@ def main():
         args.out,
     )
     ids_out = args.out.replace(".pt", "_ids.pt")
-    torch.save(
+    atomic_torch_save(
         {
             "bpe_ids": tgt.to(torch.int32),
             "local_vq_ids_by_hop": local_vq_ids_by_hop.to(
@@ -1432,6 +1569,11 @@ def main():
 
     print(f"[save model] {args.out}")
     print(f"[save ids] {ids_out}")
+
+    if args.cleanup_hop_parts:
+        for path in hop_part_paths:
+            path.unlink(missing_ok=True)
+        print(f"[cleanup HOP parts] {hop_parts_dir}")
 
 
 if __name__ == "__main__":
