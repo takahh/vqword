@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import json
-import subprocess
-import sys
-from pathlib import Path
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -66,12 +62,17 @@ class VQWordGNN(nn.Module):
         vocab_size,
         d_model=256,
         hop=3,
-        n_layers=3,
+        n_layers=1,
         dropout=0.1,
         center_scale=1.0,
     ):
         super().__init__()
-        self.hop = hop
+        if int(n_layers) != 1:
+            raise ValueError(
+                "shared recurrent HOP mode requires --n_layers 1: "
+                "one application of the tied GNN cell must equal one HOP"
+            )
+        self.hop = int(hop)
 
         # 両側hop個 + 現在位置
         self.seq_len = 2 * hop + 1
@@ -80,14 +81,19 @@ class VQWordGNN(nn.Module):
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(self.seq_len, d_model)
-        self.layers = nn.ModuleList([
-            AdjGNNLayer(d_model) for _ in range(n_layers)
-        ])
+        # A single parameter-tied message-passing cell is reused for every
+        # HOP.  This is what keeps HOP1..HOP10 in one learned coordinate
+        # system instead of creating an independent encoder per HOP.
+        self.shared_gnn = AdjGNNLayer(d_model)
         self.dropout = nn.Dropout(dropout)
         self.decoder = nn.Linear(d_model, vocab_size)
 
-    def encode_context(self, ctx_ids):
+    def encode_context_hops(self, ctx_ids, requested_hops=None):
         batch_size, length = ctx_ids.shape
+        if length != self.seq_len:
+            raise ValueError(
+                f"expected context width {self.seq_len}, got {length}"
+            )
         pos = torch.arange(length, device=ctx_ids.device)
         pos = pos.unsqueeze(0).expand(batch_size, length)
 
@@ -95,18 +101,134 @@ class VQWordGNN(nn.Module):
         tok_h[:, self.center_idx, :] *= self.center_scale
 
         h = self.dropout(tok_h + self.pos_emb(pos))
-        adj = make_adj_within_window(length, self.hop, ctx_ids.device)
+        # Only immediate neighbours are connected. Reusing the same cell once
+        # expands the receptive field by exactly one token on each side.
+        adj = make_adj_within_window(length, 1, ctx_ids.device)
+        wanted = (
+            set(range(self.hop + 1))
+            if requested_hops is None else
+            {int(x) for x in requested_hops}
+        )
+        if min(wanted, default=0) < 0 or max(wanted, default=0) > self.hop:
+            raise ValueError(f"requested HOPs outside 0..{self.hop}: {wanted}")
 
-        for layer in self.layers:
-            h = layer(h, adj)
+        states = {}
+        if 0 in wanted:
+            states[0] = F.normalize(h[:, self.center_idx], dim=-1)
+        for current_hop in range(1, self.hop + 1):
+            h = self.shared_gnn(h, adj)
+            if current_hop in wanted:
+                states[current_hop] = F.normalize(
+                    h[:, self.center_idx], dim=-1
+                )
+        return states
 
-        return F.normalize(h[:, self.center_idx], dim=-1)
+    def encode_context(self, ctx_ids, hop=None):
+        selected_hop = self.hop if hop is None else int(hop)
+        return self.encode_context_hops(ctx_ids, [selected_hop])[selected_hop]
 
     def forward(self, ctx_ids, target_ids):
         z = self.encode_context(ctx_ids)
         logits = self.decoder(z)
         loss = F.cross_entropy(logits, target_ids)
         return loss, logits, z
+
+
+@torch.no_grad()
+def fit_bpe_local_kmeans_shared_hops(
+    model,
+    ctx,
+    tgt,
+    hops,
+    batch_size,
+    device,
+    max_clusters=5,
+    seed=0,
+    vocab_size=None,
+    sample_positions_per_bpe=256,
+):
+    """Fit one BPE-local codebook jointly over all requested HOP states.
+
+    The GNN cell, latent axes, projection (identity here), and cluster centers
+    are shared. HOP is not part of the token ID. The returned ID matrix has
+    shape [num_hops, num_positions].
+    """
+    hops = [int(h) for h in hops]
+    if not hops or len(set(hops)) != len(hops):
+        raise ValueError(f"invalid HOP list: {hops}")
+    if vocab_size is None:
+        vocab_size = int(tgt.max().item()) + 1
+    vocab_size = int(vocab_size)
+    rng = torch.Generator().manual_seed(int(seed))
+    centers_by_bpe = {}
+    k_by_bpe = torch.zeros(vocab_size, dtype=torch.long)
+
+    # Fit each shared local codebook from the same sampled physical positions
+    # observed at every requested HOP. This avoids retaining N*H latent vectors.
+    for bpe_tensor in tqdm(torch.unique(tgt), desc="[shared-HOP BPE-local KMeans]"):
+        bpe_id = int(bpe_tensor)
+        indices = torch.where(tgt == bpe_id)[0]
+        if len(indices) > int(sample_positions_per_bpe):
+            perm = torch.randperm(len(indices), generator=rng)
+            indices = indices[perm[:int(sample_positions_per_bpe)]]
+
+        pieces = []
+        for start in range(0, len(indices), batch_size):
+            idx = indices[start:start + batch_size]
+            states = model.encode_context_hops(ctx[idx].to(device), hops)
+            pieces.extend(states[h].cpu() for h in hops)
+        x = F.normalize(torch.cat(pieces, dim=0).float(), dim=-1)
+        k = min(int(max_clusters), x.size(0))
+        k_by_bpe[bpe_id] = k
+        if k == 1:
+            centers_by_bpe[bpe_id] = F.normalize(
+                x.mean(dim=0, keepdim=True), dim=-1
+            )
+            continue
+        km = MiniBatchKMeans(
+            n_clusters=k,
+            init="k-means++",
+            n_init=3,
+            batch_size=min(4096, max(k, x.size(0))),
+            random_state=seed,
+            reassignment_ratio=0.01,
+        )
+        km.fit(x.numpy().astype(np.float32, copy=False))
+        centers_by_bpe[bpe_id] = F.normalize(
+            torch.from_numpy(km.cluster_centers_).float(), dim=-1
+        )
+
+    # Padded center table makes assignment vectorized across BPE partitions.
+    d_model = next(iter(centers_by_bpe.values())).size(1)
+    center_table = torch.zeros(
+        vocab_size, int(max_clusters), d_model, dtype=torch.float32
+    )
+    valid_center = torch.zeros(
+        vocab_size, int(max_clusters), dtype=torch.bool
+    )
+    for bpe_id, centers in centers_by_bpe.items():
+        k = centers.size(0)
+        center_table[bpe_id, :k] = centers
+        valid_center[bpe_id, :k] = True
+    center_table = center_table.to(device)
+    valid_center = valid_center.to(device)
+
+    ids_by_hop = torch.empty((len(hops), len(tgt)), dtype=torch.long)
+    for start in tqdm(
+        range(0, len(ctx), batch_size), desc="[assign shared-HOP IDs]"
+    ):
+        end = min(start + batch_size, len(ctx))
+        yb = tgt[start:end].to(device)
+        states = model.encode_context_hops(ctx[start:end].to(device), hops)
+        candidate_centers = center_table[yb]
+        candidate_valid = valid_center[yb]
+        for row, hop in enumerate(hops):
+            z = F.normalize(states[hop].float(), dim=-1)
+            sim = torch.einsum("bd,bkd->bk", z, candidate_centers)
+            sim = sim.masked_fill(~candidate_valid, float("-inf"))
+            ids_by_hop[row, start:end] = sim.argmax(dim=1).cpu()
+
+    return ids_by_hop, centers_by_bpe, k_by_bpe
 
 @torch.no_grad()
 def fit_bpe_local_kmeans(
@@ -1041,14 +1163,17 @@ def main():
     ap.add_argument(
         "--all_hops",
         action="store_true",
-        help="run bilateral discretization independently for hop=1..max_hop",
+        help="use one tied GNN and one shared codebook for min_hop..max_hop",
     )
     ap.add_argument("--min_hop", type=int, default=1)
     ap.add_argument("--max_hop", type=int, default=10)
 
     # Model
     ap.add_argument("--d_model", type=int, default=256)
-    ap.add_argument("--n_layers", type=int, default=3)
+    ap.add_argument(
+        "--n_layers", type=int, default=1,
+        help="must be 1: one tied GNN-cell application equals one HOP",
+    )
     ap.add_argument("--center_scale", type=float, default=1.0)
 
     ap.add_argument(
@@ -1094,78 +1219,32 @@ def main():
 
     # Utilities
     ap.add_argument("--batch_size", type=int, default=1024)
+    ap.add_argument(
+        "--cluster_samples_per_bpe",
+        type=int,
+        default=256,
+        help="physical positions sampled per BPE for shared-HOP KMeans",
+    )
     ap.add_argument("--k_block", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="vqword_global_ivf.pt")
 
     args = ap.parse_args()
 
-    # Parent launcher: execute ten fully independent discretization runs.
-    # Each child saves model/dictionary/ID data with a hop-specific filename.
+    if args.n_layers != 1:
+        raise ValueError("set --n_layers 1 for exact tied recurrent HOPs")
     if args.all_hops:
         if args.min_hop < 0 or args.max_hop < args.min_hop:
             raise ValueError(
-                f"invalid hop range: min_hop={args.min_hop}, max_hop={args.max_hop}"
+                f"invalid hop range: min_hop={args.min_hop}, "
+                f"max_hop={args.max_hop}"
             )
-
-        base_out = Path(args.out)
-        suffix = base_out.suffix or ".pt"
-        stem = base_out.stem if base_out.suffix else base_out.name
-        parent = base_out.parent
-        parent.mkdir(parents=True, exist_ok=True)
-
-        # Remove launcher-only and single-hop/output arguments from argv.
-        raw = sys.argv[1:]
-        cleaned = []
-        skip_next = False
-        value_options = {"--hop", "--min_hop", "--max_hop", "--out"}
-        for item in raw:
-            if skip_next:
-                skip_next = False
-                continue
-            if item == "--all_hops":
-                continue
-            if item in value_options:
-                skip_next = True
-                continue
-            if any(item.startswith(opt + "=") for opt in value_options):
-                continue
-            cleaned.append(item)
-
-        manifest = {
-            "type": "bilateral_multihop_discretization",
-            "min_hop": int(args.min_hop),
-            "max_hop": int(args.max_hop),
-            "runs": {},
-        }
-
-        for hop in range(args.min_hop, args.max_hop + 1):
-            hop_out = parent / f"{stem}_bilateral_hop{hop:02d}{suffix}"
-            cmd = [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                *cleaned,
-                "--hop",
-                str(hop),
-                "--out",
-                str(hop_out),
-            ]
-            print("=" * 80)
-            print(f"[multi-hop launcher] bilateral hop={hop}")
-            print(f"[multi-hop launcher] out={hop_out}")
-            print("=" * 80)
-            subprocess.run(cmd, check=True)
-
-            manifest["runs"][str(hop)] = {
-                "model": str(hop_out),
-                "dictionary": str(hop_out).replace(".pt", "_dictionary.pt"),
-                "ids": str(hop_out).replace(".pt", "_ids.pt"),
-            }
-
-        manifest_out = parent / f"{stem}_bilateral_hops_{args.min_hop:02d}_{args.max_hop:02d}_manifest.json"
-        manifest_out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        print(f"[multi-hop launcher] manifest={manifest_out}")
-        return
+        hops = list(range(args.min_hop, args.max_hop + 1))
+    else:
+        if args.hop < 0:
+            raise ValueError("--hop must be non-negative")
+        hops = [int(args.hop)]
+    encoder_max_hop = max(hops)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -1195,7 +1274,7 @@ def main():
         ids = tok.encode(ex[args.text_col], add_special_tokens=False)[:args.seq_len]
         if len(ids) < 2:
             continue
-        ctx, tgt = make_windows(ids, args.hop, pad_id)
+        ctx, tgt = make_windows(ids, encoder_max_hop, pad_id)
         all_ctx.append(ctx)
         all_tgt.append(tgt)
 
@@ -1209,7 +1288,7 @@ def main():
     model = VQWordGNN(
         vocab_size=vocab_size,
         d_model=args.d_model,
-        hop=args.hop,
+        hop=encoder_max_hop,
         n_layers=args.n_layers,
         center_scale=args.center_scale,
     ).to(device)
@@ -1219,25 +1298,33 @@ def main():
     # in the representation before clustering.
     model.eval()
 
-    local_vq_ids, centers_by_bpe, k_by_bpe = fit_bpe_local_kmeans(
+    print(
+        f"[shared HOP] hops={hops} tied_gnn=True "
+        f"shared_codebook=True hop_embedding=False"
+    )
+    local_vq_ids_by_hop, centers_by_bpe, k_by_bpe = (
+        fit_bpe_local_kmeans_shared_hops(
         model=model,
         ctx=ctx,
         tgt=tgt,
+        hops=hops,
         batch_size=args.batch_size,
         device=device,
         max_clusters=args.local_clusters,
         seed=args.seed,
         vocab_size=vocab_size,
-    )
+        sample_positions_per_bpe=args.cluster_samples_per_bpe,
+    ))
 
     # The pair itself is the token: no lossy VQW -> BPE decoder is needed.
     # local_vq_id only has meaning inside its accompanying BPE partition.
     pair_counts = torch.zeros(
         (vocab_size, args.local_clusters), dtype=torch.int64
     )
+    repeated_bpe = tgt.long().repeat(len(hops))
     pair_counts.index_put_(
-        (tgt.long(), local_vq_ids.long()),
-        torch.ones_like(tgt, dtype=torch.int64),
+        (repeated_bpe, local_vq_ids_by_hop.reshape(-1).long()),
+        torch.ones_like(repeated_bpe, dtype=torch.int64),
         accumulate=True,
     )
     observed_bpes = k_by_bpe > 0
@@ -1265,8 +1352,13 @@ def main():
         "id_scheme": "(bpe_id, local_vq_id)",
         "reconstruction": "exact_from_bpe_id",
         "context_type": "bilateral",
-        "hop": int(args.hop),
-        "context_width": int(2 * args.hop + 1),
+        "hop": int(encoder_max_hop),
+        "hops": hops,
+        "hop_axis": 0,
+        "context_width": int(2 * encoder_max_hop + 1),
+        "shared_gnn_across_hops": True,
+        "shared_codebook_across_hops": True,
+        "hop_embedding": False,
     }
 
     dictionary_out = args.out.replace(".pt", "_dictionary.pt")
@@ -1289,8 +1381,12 @@ def main():
             "max_local_clusters": int(args.local_clusters),
 
             "context_type": "bilateral",
-            "hop": int(args.hop),
-            "context_width": int(2 * args.hop + 1),
+            "hop": int(encoder_max_hop),
+            "hops": hops,
+            "context_width": int(2 * encoder_max_hop + 1),
+            "shared_gnn_across_hops": True,
+            "shared_codebook_across_hops": True,
+            "hop_embedding": False,
 
             "id_scheme": "(bpe_id, local_vq_id)",
         },
@@ -1300,7 +1396,11 @@ def main():
     torch.save(
         {
             "bpe_ids": tgt.to(torch.int32),
-            "local_vq_ids": local_vq_ids.to(
+            "local_vq_ids_by_hop": local_vq_ids_by_hop.to(
+                torch.uint8 if args.local_clusters <= 256 else torch.int16
+            ),
+            # Backward-compatible alias: the final row is the largest HOP.
+            "local_vq_ids": local_vq_ids_by_hop[-1].to(
                 torch.uint8 if args.local_clusters <= 256 else torch.int16
             ),
             "k_by_bpe": k_by_bpe,
@@ -1313,8 +1413,14 @@ def main():
             "max_local_clusters": args.local_clusters,
 
             "id_scheme": "(bpe_id, local_vq_id)",
-            "hop": int(args.hop),
-            "context_width": int(2 * args.hop + 1),
+            "hop": int(encoder_max_hop),
+            "hops": hops,
+            "hop_axis": 0,
+            "hop_to_row": {int(h): i for i, h in enumerate(hops)},
+            "context_width": int(2 * encoder_max_hop + 1),
+            "shared_gnn_across_hops": True,
+            "shared_codebook_across_hops": True,
+            "hop_embedding": False,
 
             "bpe_id_to_token": [
                 tok.convert_ids_to_tokens(i)
