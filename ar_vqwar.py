@@ -4,7 +4,7 @@
 local_bpe_direct:
   BPE stream sees through BPE[t-1].
   VQW is available through local-VQW[t-11].
-  BPE hidden + learned-alpha * pair-conditioned VQW residual -> BPE[t]
+  BPE hidden + learned-alpha * VQW-only residual -> BPE[t]
 
 global_vqwar:
   pair-global-ID(BPE, local-VQW)[t-11] + BPE[t-10:t-1]
@@ -287,7 +287,7 @@ class ResidualLocalAR(nn.Module):
         self.bpe_projection = nn.Linear(d_model, d_model)
         self.vqw_projection = nn.Linear(d_model, d_model)
         self.vqw_adapter = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
+            nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
@@ -315,10 +315,12 @@ class ResidualLocalAR(nn.Module):
         available = vqw_available.unsqueeze(-1).to(vqw_h.dtype)
         vqw_h = vqw_h * available
 
-        # local VQ IDs are BPE-local, so form the correction jointly from the
-        # BPE identity and its local cluster ID.  Mask the correction itself so
-        # recent positions cannot acquire an extra BPE-only adapter path.
-        delta = self.vqw_adapter(torch.cat([bpe_h, vqw_h], dim=-1))
+        # Keep BPE exclusively on the main path.  The residual branch receives
+        # only local-VQW information, so an improvement cannot come from a
+        # second nonlinear BPE path.  Mask the correction itself as well,
+        # because Linear biases would otherwise make unavailable positions
+        # nonzero again.
+        delta = self.vqw_adapter(vqw_h)
         delta = delta * available
         h = self.input_norm(bpe_h + self.effective_alpha() * delta)
         h = self.backbone(h, ~valid)
@@ -641,7 +643,7 @@ def main():
         architecture = (
             "matched_residual_bpe_baseline_alpha_zero"
             if args.disable_vqw else
-            "bpe_residual_pair_conditioned_vqw_adapter_learned_alpha"
+            "bpe_main_plus_vqw_only_residual_adapter_learned_alpha"
         )
     else:
         if codebook.get("partition_type") != "bpe_local_kmeans":
@@ -710,7 +712,7 @@ def main():
     print(f"[alignment] distant=t-{args.gap}; recent_bpe={args.local_bpe_tokens}")
     print(f"[vocab] bpe={token_vocab_size} vqw={vq_vocab_size}")
     if args.mode == "local_bpe_direct":
-        print("[input] BPE main path + pair-conditioned local-VQW residual")
+        print("[input] BPE main path + local-VQW-only residual")
         print("[mask] predicting t: VQW residual[t-10:t-1] zeroed")
         print(f"[ablation] use_vqw={not args.disable_vqw}")
         print(f"[alpha] init={args.vqw_alpha_init:g}; learned sigmoid scalar")
