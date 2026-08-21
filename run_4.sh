@@ -85,12 +85,16 @@ EOF
 import sys, torch
 p, expected_hop, expected_k, expected_vocab = sys.argv[1], *map(int, sys.argv[2:])
 c = torch.load(p, map_location="cpu", weights_only=False)
-required = {"model", "args", "centers_by_bpe_by_hop", "k_by_bpe_by_hop", "hops",
-            "max_local_clusters", "partition_type", "shared_gnn_across_hops",
-            "shared_codebook_across_hops"}
-missing = sorted(required - set(c))
+required = {
+    "signature",
+    "hop",
+    "local_vq_ids",
+    "centers_by_bpe",
+    "k_by_bpe",
+}
+missing = required - set(obj.keys())
 if missing:
-    raise ValueError(f"HOP{expected_hop}: missing checkpoint keys: {missing}")
+    raise ValueError(f"HOP{hop}: missing ID-file keys: {sorted(missing)}")
 hops = [int(h) for h in c["hops"]]
 if hops != [expected_hop]:
     raise ValueError(f"expected only HOP{expected_hop}, got {hops}")
