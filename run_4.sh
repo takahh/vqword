@@ -28,16 +28,15 @@ git pull
 
 BPE_VOCAB_LABEL=50257
 
-if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 {local_clusters} {hop}"
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 {local_clusters}"
   echo
   echo "Example:"
-  echo "  $0 5 10"
+  echo "  $0 5"
   exit 1
 fi
 
 LOCAL_CLUSTERS="$1"
-HOP="$2"
 
 if ! [[ "${LOCAL_CLUSTERS}" =~ ^[0-9]+$ ]]; then
   echo "[error] local_clusters must be positive integer"
@@ -46,11 +45,6 @@ fi
 
 if [ "${LOCAL_CLUSTERS}" -lt 1 ]; then
   echo "[error] local_clusters must be >= 1"
-  exit 1
-fi
-
-if ! [[ "${HOP}" =~ ^[0-9]+$ ]]; then
-  echo "[error] hop must be non-negative integer"
   exit 1
 fi
 
@@ -116,6 +110,12 @@ if [ ! -f "${ASSIGN_SCRIPT}" ]; then
   exit 1
 fi
 
+
+# ============================================================
+# HOP 1..10 assignment
+# ============================================================
+
+for HOP in $(seq 1 10); do
 
 # ============================================================
 # filenames
@@ -553,3 +553,11 @@ echo "${OUT}"
 echo "============================================================"
 
 rm -f "${VQ_CKPT_PATH}"
+
+done
+
+echo
+echo "============================================================"
+echo "[all completed] HOP=1..10"
+echo "local_clusters=${LOCAL_CLUSTERS}"
+echo "============================================================"
