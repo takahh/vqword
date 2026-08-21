@@ -1,4 +1,4 @@
-```
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -481,4 +481,3 @@ echo "[all completed]"
 echo "HOP1..10 downloaded and processed separately"
 echo "local_clusters=${LOCAL_CLUSTERS}"
 echo "============================================================"
-```

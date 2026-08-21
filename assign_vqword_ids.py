@@ -1,4 +1,4 @@
-```
+
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
@@ -605,5 +605,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-```
