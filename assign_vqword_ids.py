@@ -1,3 +1,4 @@
+```
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
@@ -233,7 +234,12 @@ def render_out_path(pattern, hop):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", default=None,
+                    help="legacy combined checkpoint")
+    ap.add_argument("--model_ckpt", default=None,
+                    help="shared tied-GNN model checkpoint")
+    ap.add_argument("--codebook_ckpt", default=None,
+                    help="single-HOP codebook checkpoint")
     ap.add_argument("--dataset", default="roneneldan/TinyStories")
     ap.add_argument("--dataset_config", default=None)
     ap.add_argument("--split", default="train")
@@ -261,35 +267,153 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[device]", device)
 
-    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    required = {
-        "model",
-        "args",
-        "centers_by_bpe_by_hop",
-        "k_by_bpe_by_hop",
-        "hops",
-        "max_local_clusters",
-    }
-    missing = sorted(required - set(ckpt.keys()))
-    if missing:
-        raise ValueError(f"tied-GNN checkpoint missing keys: {missing}")
-
-    if ckpt.get("shared_gnn_across_hops") is not True:
-        raise ValueError("checkpoint is not marked shared_gnn_across_hops=True")
-    if ckpt.get("shared_codebook_across_hops") is not False:
-        raise ValueError("expected separate codebooks: shared_codebook_across_hops=False")
-    if ckpt.get("partition_type") != "bpe_local_kmeans":
-        raise ValueError(f"unexpected partition_type={ckpt.get('partition_type')}")
-
-    available_hops = [int(h) for h in ckpt["hops"]]
-    requested_hops = [int(h) for h in args.hops]
-    if len(set(requested_hops)) != len(requested_hops):
-        raise ValueError(f"duplicate HOP in --hops: {requested_hops}")
-    for hop in requested_hops:
-        if hop not in available_hops:
+    # ---------------------------------------------------------
+    # Load either:
+    #   (A) legacy combined checkpoint via --ckpt
+    # or
+    #   (B) shared model + one-HOP codebook via
+    #       --model_ckpt / --codebook_ckpt
+    # ---------------------------------------------------------
+    if args.model_ckpt or args.codebook_ckpt:
+        if not args.model_ckpt or not args.codebook_ckpt:
             raise ValueError(
-                f"requested HOP{hop} is absent; checkpoint has {available_hops}"
+                "--model_ckpt and --codebook_ckpt must be supplied together"
             )
+
+        model_ckpt = torch.load(
+            args.model_ckpt, map_location="cpu", weights_only=False
+        )
+        codebook_ckpt = torch.load(
+            args.codebook_ckpt, map_location="cpu", weights_only=False
+        )
+
+        required_model = {
+            "model",
+            "args",
+            "hops",
+            "max_local_clusters",
+        }
+        missing_model = sorted(required_model - set(model_ckpt.keys()))
+        if missing_model:
+            raise ValueError(
+                f"shared model checkpoint missing keys: {missing_model}"
+            )
+
+        required_codebook = {
+            "hop",
+            "centers_by_bpe",
+            "k_by_bpe",
+        }
+        missing_codebook = sorted(
+            required_codebook - set(codebook_ckpt.keys())
+        )
+        if missing_codebook:
+            raise ValueError(
+                f"HOP codebook checkpoint missing keys: {missing_codebook}"
+            )
+
+        if model_ckpt.get("shared_gnn_across_hops") is not True:
+            raise ValueError(
+                "shared model is not marked shared_gnn_across_hops=True"
+            )
+        if model_ckpt.get("shared_codebook_across_hops") is not False:
+            raise ValueError(
+                "expected separate codebooks: "
+                "shared_codebook_across_hops=False"
+            )
+        if model_ckpt.get("partition_type") != "bpe_local_kmeans":
+            raise ValueError(
+                f"unexpected partition_type="
+                f"{model_ckpt.get('partition_type')}"
+            )
+
+        hop_value = int(codebook_ckpt["hop"])
+        requested_hops = [int(h) for h in args.hops]
+        if requested_hops != [hop_value]:
+            raise ValueError(
+                f"single-HOP codebook is HOP{hop_value}, "
+                f"but --hops={requested_hops}"
+            )
+
+        ckpt = model_ckpt
+        available_hops = [int(h) for h in ckpt["hops"]]
+
+        if hop_value not in available_hops:
+            raise ValueError(
+                f"HOP{hop_value} not listed in shared model hops="
+                f"{available_hops}"
+            )
+
+        centers_all = {
+            hop_value: codebook_ckpt["centers_by_bpe"]
+        }
+        k_single = torch.as_tensor(
+            codebook_ckpt["k_by_bpe"]
+        ).long().cpu()
+        k_all = k_single.unsqueeze(0)
+        hop_to_row = {hop_value: 0}
+
+        print("[checkpoint mode] shared-model + single-HOP codebook")
+        print("[shared model]", args.model_ckpt)
+        print("[codebook]", args.codebook_ckpt)
+
+    else:
+        if args.ckpt is None:
+            raise ValueError(
+                "provide either --ckpt or both "
+                "--model_ckpt and --codebook_ckpt"
+            )
+
+        ckpt = torch.load(
+            args.ckpt, map_location="cpu", weights_only=False
+        )
+        required = {
+            "model",
+            "args",
+            "centers_by_bpe_by_hop",
+            "k_by_bpe_by_hop",
+            "hops",
+            "max_local_clusters",
+        }
+        missing = sorted(required - set(ckpt.keys()))
+        if missing:
+            raise ValueError(
+                f"tied-GNN checkpoint missing keys: {missing}"
+            )
+
+        if ckpt.get("shared_gnn_across_hops") is not True:
+            raise ValueError(
+                "checkpoint is not marked shared_gnn_across_hops=True"
+            )
+        if ckpt.get("shared_codebook_across_hops") is not False:
+            raise ValueError(
+                "expected separate codebooks: "
+                "shared_codebook_across_hops=False"
+            )
+        if ckpt.get("partition_type") != "bpe_local_kmeans":
+            raise ValueError(
+                f"unexpected partition_type="
+                f"{ckpt.get('partition_type')}"
+            )
+
+        available_hops = [int(h) for h in ckpt["hops"]]
+        requested_hops = [int(h) for h in args.hops]
+        if len(set(requested_hops)) != len(requested_hops):
+            raise ValueError(
+                f"duplicate HOP in --hops: {requested_hops}"
+            )
+        for hop in requested_hops:
+            if hop not in available_hops:
+                raise ValueError(
+                    f"requested HOP{hop} is absent; "
+                    f"checkpoint has {available_hops}"
+                )
+
+        centers_all = ckpt["centers_by_bpe_by_hop"]
+        k_all = ckpt["k_by_bpe_by_hop"].long().cpu()
+        hop_to_row = {
+            int(h): i for i, h in enumerate(available_hops)
+        }
 
     cargs = ckpt["args"]
     encoder_max_hop = int(ckpt.get("hop", max(available_hops)))
@@ -327,13 +451,14 @@ def main():
     model.eval()
 
     max_local_clusters = int(ckpt["max_local_clusters"])
-    k_all = ckpt["k_by_bpe_by_hop"].long().cpu()
     if k_all.ndim != 2:
-        raise ValueError(f"k_by_bpe_by_hop must be rank-2, got {tuple(k_all.shape)}")
-    if k_all.size(0) != len(available_hops) or k_all.size(1) != vocab_size:
         raise ValueError(
-            "k_by_bpe_by_hop shape mismatch: "
-            f"{tuple(k_all.shape)} vs ({len(available_hops)}, {vocab_size})"
+            f"k_by_bpe table must be rank-2, got {tuple(k_all.shape)}"
+        )
+    if k_all.size(1) != vocab_size:
+        raise ValueError(
+            f"k_by_bpe vocab mismatch: "
+            f"{tuple(k_all.shape)} vs vocab_size={vocab_size}"
         )
 
     # Tokenize once. Every HOP uses the same physical positions and the same
@@ -380,12 +505,10 @@ def main():
     print("[checkpoint hops]", available_hops)
     print("[requested hops]", requested_hops)
 
-    centers_all = ckpt["centers_by_bpe_by_hop"]
-
     for hop in requested_hops:
         print("=" * 68)
         print(f"[HOP{hop}] assignment")
-        row = get_hop_row(ckpt, hop)
+        row = hop_to_row[int(hop)]
         k_by_bpe = k_all[row]
         centers_by_bpe = normalize_centers_dict(centers_all[int(hop)])
 
@@ -442,6 +565,8 @@ def main():
             "context_type": ckpt.get("context_type", "bilateral"),
             "context_width": int(ckpt.get("context_width", 2 * encoder_max_hop + 1)),
             "ckpt": args.ckpt,
+            "model_ckpt": args.model_ckpt,
+            "codebook_ckpt": args.codebook_ckpt,
             "tokenizer": tokenizer_name,
             "partitioned": True,
             "partition_type": "bpe_local_kmeans",
@@ -480,3 +605,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+```

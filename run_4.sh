@@ -1,3 +1,4 @@
+```
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -47,6 +48,9 @@ FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
 CKPT_PREFIX="wikitext103_vqword_bpe${BPE_VOCAB_LABEL}_tiedgnn_separatehop01to10_center0_localbpe${LOCAL_CLUSTERS}_seed${DISCRETIZATION_SEED}"
 
+SHARED_MODEL="${CKPT_PREFIX}_shared_model.pt"
+SHARED_MODEL_PATH="/vqword/${SHARED_MODEL}"
+
 OUT_PATTERN="/vqword/tinystories_vqword_bpe${BPE_VOCAB_LABEL}_tiedgnn_separatehop{hop02}_center0_localbpe${LOCAL_CLUSTERS}_seed${DISCRETIZATION_SEED}_ids.pt"
 
 # ============================================================
@@ -80,6 +84,75 @@ tar -xzf "/vqword/${BPE_ARCHIVE}" -C /vqword
   echo "[error] assignment script missing: ${ASSIGN_SCRIPT}"
   exit 1
 }
+
+# ============================================================
+# Download the one shared tied-GNN model checkpoint
+# ============================================================
+
+rm -f "${SHARED_MODEL_PATH}"
+
+echo "============================================================"
+echo "[download shared model] ${SHARED_MODEL}"
+echo "============================================================"
+
+lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
+set ftp:ssl-allow no
+set net:max-retries 5
+set net:timeout 60
+set cmd:fail-exit yes
+get "${SHARED_MODEL}" -o "${SHARED_MODEL_PATH}"
+bye
+EOF
+
+python - "${SHARED_MODEL_PATH}" "${LOCAL_CLUSTERS}" "${BPE_VOCAB_LABEL}" <<'PY'
+import sys, torch
+
+p = sys.argv[1]
+expected_k = int(sys.argv[2])
+expected_vocab = int(sys.argv[3])
+
+c = torch.load(p, map_location="cpu", weights_only=False)
+
+required = {
+    "model",
+    "args",
+    "hops",
+    "max_local_clusters",
+    "shared_gnn_across_hops",
+    "shared_codebook_across_hops",
+    "partition_type",
+}
+missing = required - set(c.keys())
+if missing:
+    raise ValueError(
+        f"shared model missing keys: {sorted(missing)}"
+    )
+
+if c["shared_gnn_across_hops"] is not True:
+    raise ValueError("shared_gnn_across_hops must be True")
+if c["shared_codebook_across_hops"] is not False:
+    raise ValueError("shared_codebook_across_hops must be False")
+if c["partition_type"] != "bpe_local_kmeans":
+    raise ValueError(
+        f"unexpected partition_type={c['partition_type']}"
+    )
+if int(c["max_local_clusters"]) != expected_k:
+    raise ValueError(
+        f"local cluster mismatch: "
+        f"{c['max_local_clusters']} != {expected_k}"
+    )
+
+vocab = int(c["model"]["tok_emb.weight"].shape[0])
+if vocab != expected_vocab:
+    raise ValueError(
+        f"BPE vocab mismatch: {vocab} != {expected_vocab}"
+    )
+
+print(
+    f"[shared model check] OK "
+    f"hops={c['hops']} vocab={vocab}"
+)
+PY
 
 # ============================================================
 # HOP1..10
@@ -259,7 +332,8 @@ PY
   echo "============================================================"
 
   python "${ASSIGN_SCRIPT}" \
-    --ckpt "${VQ_FILE_PATH}" \
+    --model_ckpt "${SHARED_MODEL_PATH}" \
+    --codebook_ckpt "${VQ_FILE_PATH}" \
     --dataset roneneldan/TinyStories \
     --split train \
     --text_col text \
@@ -444,3 +518,4 @@ echo "[all completed]"
 echo "HOP1..10 downloaded and processed separately"
 echo "local_clusters=${LOCAL_CLUSTERS}"
 echo "============================================================"
+```
