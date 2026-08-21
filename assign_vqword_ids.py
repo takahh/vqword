@@ -1,203 +1,234 @@
 #!/usr/bin/env python3
 import argparse
+from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from train_vqword import VQWordGNN, make_windows
+
+def make_adj_within_window(length, hop, device):
+    idx = torch.arange(length, device=device)
+    dist = (idx[:, None] - idx[None, :]).abs()
+    adj = (dist <= int(hop)).float()
+    adj = adj / adj.sum(dim=1, keepdim=True).clamp_min(1.0)
+    return adj
+
+
+class AdjGNNLayer(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.self_lin = nn.Linear(d_model, d_model)
+        self.nei_lin = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, h, adj):
+        m = torch.einsum("ij,bjd->bid", adj, h)
+        out = self.self_lin(h) + self.nei_lin(m)
+        out = F.gelu(out)
+        return self.norm(h + out)
+
+
+class VQWordGNN(nn.Module):
+    """Exact tied recurrent GNN architecture used by the shared-HOP checkpoint."""
+
+    def __init__(
+        self,
+        vocab_size,
+        d_model=256,
+        hop=10,
+        n_layers=1,
+        dropout=0.1,
+        center_scale=1.0,
+    ):
+        super().__init__()
+        if int(n_layers) != 1:
+            raise ValueError("tied recurrent HOP checkpoint requires n_layers=1")
+        self.hop = int(hop)
+        self.seq_len = 2 * self.hop + 1
+        self.center_idx = self.hop
+        self.center_scale = float(center_scale)
+
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(self.seq_len, d_model)
+        self.shared_gnn = AdjGNNLayer(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.decoder = nn.Linear(d_model, vocab_size)
+
+    def encode_context_hops(self, ctx_ids, requested_hops):
+        wanted = sorted({int(h) for h in requested_hops})
+        if not wanted:
+            return {}
+        if wanted[0] < 0 or wanted[-1] > self.hop:
+            raise ValueError(f"requested HOPs outside 0..{self.hop}: {wanted}")
+
+        batch_size, length = ctx_ids.shape
+        if length != self.seq_len:
+            raise ValueError(
+                f"expected context width {self.seq_len}, got {length}"
+            )
+
+        pos = torch.arange(length, device=ctx_ids.device)
+        pos = pos.unsqueeze(0).expand(batch_size, length)
+        tok_h = self.tok_emb(ctx_ids)
+        tok_h[:, self.center_idx, :] *= self.center_scale
+        h = self.dropout(tok_h + self.pos_emb(pos))
+
+        adj = make_adj_within_window(length, 1, ctx_ids.device)
+        wanted_set = set(wanted)
+        states = {}
+        if 0 in wanted_set:
+            states[0] = F.normalize(h[:, self.center_idx], dim=-1)
+
+        # Stop at the largest requested HOP; no needless recurrent passes.
+        for current_hop in range(1, wanted[-1] + 1):
+            h = self.shared_gnn(h, adj)
+            if current_hop in wanted_set:
+                states[current_hop] = F.normalize(
+                    h[:, self.center_idx], dim=-1
+                )
+        return states
+
+
+def make_windows(token_ids, max_hop, pad_id):
+    ids = torch.tensor(token_ids, dtype=torch.long)
+    padded = F.pad(ids, (max_hop, max_hop), value=pad_id)
+    width = 2 * max_hop + 1
+    ctx = torch.stack([padded[i:i + width] for i in range(len(ids))])
+    return ctx, ids
+
+
+def get_hop_row(ckpt, hop):
+    hops = [int(h) for h in ckpt.get("hops", [])]
+    if not hops:
+        raise ValueError("checkpoint is missing non-empty 'hops' metadata")
+    try:
+        return hops.index(int(hop))
+    except ValueError as exc:
+        raise ValueError(f"HOP{hop} not present in checkpoint hops={hops}") from exc
+
+
+def normalize_centers_dict(raw):
+    return {int(k): v for k, v in raw.items()}
+
+
+def build_center_table(
+    centers_by_bpe,
+    k_by_bpe,
+    vocab_size,
+    max_local_clusters,
+    d_model,
+    device,
+):
+    # One HOP table at a time: ~vocab * K * d_model, avoiding 10x GPU memory.
+    table = torch.zeros(
+        vocab_size,
+        max_local_clusters,
+        d_model,
+        dtype=torch.float32,
+    )
+    valid = torch.zeros(
+        vocab_size,
+        max_local_clusters,
+        dtype=torch.bool,
+    )
+
+    for bpe_id, centers in centers_by_bpe.items():
+        bpe_id = int(bpe_id)
+        if not (0 <= bpe_id < vocab_size):
+            raise ValueError(f"invalid BPE ID in centers_by_bpe: {bpe_id}")
+        if not torch.is_tensor(centers):
+            centers = torch.tensor(centers)
+        centers = F.normalize(centers.float(), dim=-1)
+        k = int(centers.size(0))
+        expected_k = int(k_by_bpe[bpe_id].item())
+        if k != expected_k:
+            raise ValueError(
+                f"HOP codebook mismatch for BPE {bpe_id}: "
+                f"centers={k}, k_by_bpe={expected_k}"
+            )
+        if k > max_local_clusters:
+            raise ValueError(
+                f"BPE {bpe_id}: k={k} exceeds max_local_clusters={max_local_clusters}"
+            )
+        table[bpe_id, :k] = centers
+        valid[bpe_id, :k] = True
+
+    return table.to(device), valid.to(device)
 
 
 @torch.no_grad()
-def assign_blockwise(z, centers, k_block=4096):
-    z = F.normalize(z.float(), dim=-1)
-    centers = F.normalize(centers.float(), dim=-1)
-
-    best_sim = torch.full((z.size(0),), -1e9, device=z.device)
-    best_id = torch.zeros(z.size(0), dtype=torch.long, device=z.device)
-
-    for start in range(0, centers.size(0), k_block):
-        c = centers[start:start + k_block]
-        sim = z @ c.T
-        value, index = sim.max(dim=1)
-
-        mask = value > best_sim
-        best_sim[mask] = value[mask]
-        best_id[mask] = index[mask] + start
-
-    return best_id
-
-
-@torch.no_grad()
-def assign_ids_bpe_local(
+def assign_one_hop(
     model,
     ctx,
     tgt,
+    hop,
     centers_by_bpe,
     k_by_bpe,
+    max_local_clusters,
     batch_size,
     device,
-    k_block,
-    missing_bpe_policy="zero",
+    missing_bpe_policy,
 ):
-    """
-    Assign a local VQ ID within each target BPE partition.
-
-    Output:
-      local_vq_ids[i] is the local cluster ID for token tgt[i].
-      missing_bpe_ids contains BPE IDs that had no learned local centers.
-
-    missing_bpe_policy:
-      "zero": assign local_vq_id=0 when a BPE has no centers.
-      "error": raise immediately.
-    """
     model.eval()
+    vocab_size = int(k_by_bpe.numel())
+    d_model = int(model.tok_emb.embedding_dim)
+    center_table, valid_center = build_center_table(
+        centers_by_bpe=centers_by_bpe,
+        k_by_bpe=k_by_bpe,
+        vocab_size=vocab_size,
+        max_local_clusters=max_local_clusters,
+        d_model=d_model,
+        device=device,
+    )
 
-    local_vq_ids = torch.empty(len(ctx), dtype=torch.long)
+    out = torch.empty(len(tgt), dtype=torch.long)
     missing_bpe_ids = set()
 
     for start in tqdm(
         range(0, len(ctx), batch_size),
-        desc="[assign BPE-local]",
-    ):
-        end = min(start + batch_size, len(ctx))
-
-        xb = ctx[start:end].to(device)
-        tb = tgt[start:end].long().to(device)
-
-        z = F.normalize(
-            model.encode_context(xb).float(),
-            dim=-1,
-        )
-
-        batch_local_ids = torch.empty(
-            z.size(0),
-            dtype=torch.long,
-            device=device,
-        )
-
-        for bpe_id in torch.unique(tb).tolist():
-            bpe_id = int(bpe_id)
-            mask = tb == bpe_id
-
-            centers = centers_by_bpe.get(bpe_id)
-            expected_k = (
-                int(k_by_bpe[bpe_id].item())
-                if 0 <= bpe_id < k_by_bpe.numel()
-                else 0
-            )
-
-            if centers is None or expected_k <= 0:
-                if missing_bpe_policy == "error":
-                    raise RuntimeError(
-                        f"No local centers for BPE ID {bpe_id}: "
-                        f"k_by_bpe={expected_k}"
-                    )
-
-                missing_bpe_ids.add(bpe_id)
-                batch_local_ids[mask] = 0
-                continue
-
-            if not torch.is_tensor(centers):
-                centers = torch.tensor(centers)
-
-            if centers.ndim != 2:
-                raise RuntimeError(
-                    f"Invalid centers for BPE ID {bpe_id}: "
-                    f"shape={tuple(centers.shape)}"
-                )
-
-            actual_k = int(centers.size(0))
-            if actual_k != expected_k:
-                raise RuntimeError(
-                    f"k mismatch for BPE ID {bpe_id}: "
-                    f"k_by_bpe={expected_k}, centers={actual_k}"
-                )
-
-            centers = F.normalize(
-                centers.to(device).float(),
-                dim=-1,
-            )
-
-            local_ids = assign_blockwise(
-                z[mask],
-                centers,
-                k_block=k_block,
-            )
-
-            if local_ids.numel() and int(local_ids.max()) >= actual_k:
-                raise RuntimeError(
-                    f"Local ID out of range for BPE ID {bpe_id}: "
-                    f"max={int(local_ids.max())}, k={actual_k}"
-                )
-
-            batch_local_ids[mask] = local_ids
-
-        local_vq_ids[start:end] = batch_local_ids.cpu()
-
-    return local_vq_ids, sorted(missing_bpe_ids)
-
-
-@torch.no_grad()
-def assign_ids_global_ivf(
-    model,
-    ctx,
-    ivf_centers,
-    global_centers,
-    global_offsets,
-    batch_size,
-    device,
-    k_block,
-):
-    model.eval()
-
-    coarse = F.normalize(ivf_centers.to(device).float(), dim=-1)
-    fine = F.normalize(global_centers.to(device).float(), dim=-1)
-    offsets = global_offsets.long().cpu()
-
-    vq_ids = torch.empty(len(ctx), dtype=torch.long)
-    ivf_ids_all = torch.empty(len(ctx), dtype=torch.long)
-
-    for start in tqdm(
-        range(0, len(ctx), batch_size),
-        desc="[assign global IVF]",
+        desc=f"[assign HOP{hop}]",
     ):
         end = min(start + batch_size, len(ctx))
         xb = ctx[start:end].to(device)
+        yb = tgt[start:end].long().to(device)
 
-        z = F.normalize(model.encode_context(xb).float(), dim=-1)
-        ivf_ids = assign_blockwise(z, coarse, k_block=k_block)
+        z = model.encode_context_hops(xb, [hop])[hop]
+        candidate_centers = center_table[yb]
+        candidate_valid = valid_center[yb]
+        has_any = candidate_valid.any(dim=1)
 
-        batch_global_ids = torch.empty(
-            z.size(0),
-            dtype=torch.long,
-            device=device,
-        )
-
-        for list_id in torch.unique(ivf_ids).tolist():
-            mask = ivf_ids == list_id
-            begin = int(offsets[list_id].item())
-            finish = int(offsets[list_id + 1].item())
-
-            if finish <= begin:
+        if not has_any.all():
+            missing_ids = torch.unique(yb[~has_any]).tolist()
+            missing_bpe_ids.update(int(x) for x in missing_ids)
+            if missing_bpe_policy == "error":
                 raise RuntimeError(
-                    f"IVF list {list_id} has no fine centers: "
-                    f"offsets=({begin}, {finish})"
+                    f"HOP{hop}: BPEs without centers encountered: {missing_ids[:30]}"
                 )
 
-            local_ids = assign_blockwise(
-                z[mask],
-                fine[begin:finish],
-                k_block=k_block,
-            )
-            batch_global_ids[mask] = local_ids + begin
+        sim = torch.einsum("bd,bkd->bk", z.float(), candidate_centers)
+        sim = sim.masked_fill(~candidate_valid, float("-inf"))
+        local_ids = sim.argmax(dim=1)
+        # For missing-center BPEs argmax(all -inf) is implementation-defined;
+        # force the documented zero fallback explicitly.
+        local_ids[~has_any] = 0
+        out[start:end] = local_ids.cpu()
 
-        vq_ids[start:end] = batch_global_ids.cpu()
-        ivf_ids_all[start:end] = ivf_ids.cpu()
+    del center_table, valid_center
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-    return vq_ids, ivf_ids_all
+    return out, sorted(missing_bpe_ids)
+
+
+def render_out_path(pattern, hop):
+    # Supports {hop}, {hop02}; the latter keeps filenames lexically ordered.
+    return pattern.replace("{hop02}", f"{int(hop):02d}").replace(
+        "{hop}", str(int(hop))
+    )
 
 
 def main():
@@ -210,242 +241,126 @@ def main():
     ap.add_argument("--max_samples", type=int, default=20000)
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=512)
-    ap.add_argument("--k_block", type=int, default=4096)
     ap.add_argument("--tokenizer", default=None)
-    ap.add_argument("--out", default="vqword_ids.pt")
+    ap.add_argument("--hops", type=int, nargs="+", default=list(range(1, 11)))
+    ap.add_argument(
+        "--out_pattern",
+        required=True,
+        help="Output path containing {hop} or {hop02}",
+    )
     ap.add_argument(
         "--missing_bpe_policy",
         choices=["zero", "error"],
         default="zero",
-        help=(
-            "For BPE-local checkpoints, what to do when a target BPE has no "
-            "learned local centers. Default: zero."
-        ),
     )
     args = ap.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if "{hop}" not in args.out_pattern and "{hop02}" not in args.out_pattern:
+        raise ValueError("--out_pattern must contain {hop} or {hop02}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[device]", device)
 
-    ckpt = torch.load(
-        args.ckpt,
-        map_location="cpu",
-        weights_only=False,
-    )
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    required = {
+        "model",
+        "args",
+        "centers_by_bpe_by_hop",
+        "k_by_bpe_by_hop",
+        "hops",
+        "max_local_clusters",
+    }
+    missing = sorted(required - set(ckpt.keys()))
+    if missing:
+        raise ValueError(f"tied-GNN checkpoint missing keys: {missing}")
 
-    if "model" not in ckpt or "args" not in ckpt:
-        raise ValueError("Checkpoint must contain 'model' and 'args'")
+    if ckpt.get("shared_gnn_across_hops") is not True:
+        raise ValueError("checkpoint is not marked shared_gnn_across_hops=True")
+    if ckpt.get("shared_codebook_across_hops") is not False:
+        raise ValueError("expected separate codebooks: shared_codebook_across_hops=False")
+    if ckpt.get("partition_type") != "bpe_local_kmeans":
+        raise ValueError(f"unexpected partition_type={ckpt.get('partition_type')}")
+
+    available_hops = [int(h) for h in ckpt["hops"]]
+    requested_hops = [int(h) for h in args.hops]
+    if len(set(requested_hops)) != len(requested_hops):
+        raise ValueError(f"duplicate HOP in --hops: {requested_hops}")
+    for hop in requested_hops:
+        if hop not in available_hops:
+            raise ValueError(
+                f"requested HOP{hop} is absent; checkpoint has {available_hops}"
+            )
 
     cargs = ckpt["args"]
-
-    # --------------------------------------------------------
-    # Detect checkpoint type
-    # --------------------------------------------------------
-    is_bpe_local = (
-        ckpt.get("partition_type") == "bpe_local_kmeans"
-        and "centers_by_bpe" in ckpt
-        and "k_by_bpe" in ckpt
-    )
-
-    is_global_ivf = all(
-        key in ckpt
-        for key in (
-            "ivf_centers",
-            "global_centers",
-            "global_offsets",
-            "vq_vocab_size",
-        )
-    )
-
-    if is_bpe_local:
-        assignment_mode = "bpe_local"
-    elif is_global_ivf:
-        assignment_mode = "global_ivf"
-    else:
+    encoder_max_hop = int(ckpt.get("hop", max(available_hops)))
+    if encoder_max_hop != max(available_hops):
         raise ValueError(
-            "Unknown checkpoint format. Expected either:\n"
-            "  BPE-local: partition_type=bpe_local_kmeans, "
-            "centers_by_bpe, k_by_bpe\n"
-            "or\n"
-            "  global-IVF: ivf_centers, global_centers, "
-            "global_offsets, vq_vocab_size"
+            f"checkpoint max-hop mismatch: hop={encoder_max_hop}, hops={available_hops}"
         )
 
-    print("[assignment_mode]", assignment_mode)
-
-    # --------------------------------------------------------
-    # Tokenizer
-    # --------------------------------------------------------
-    tokenizer_name = (
-        args.tokenizer
-        or ckpt.get("tokenizer_name")
-        or cargs.get("tokenizer")
-    )
+    tokenizer_name = args.tokenizer or ckpt.get("tokenizer_name") or cargs.get("tokenizer")
     if tokenizer_name is None:
-        raise ValueError(
-            "Tokenizer is not specified in arguments or checkpoint"
-        )
-
+        raise ValueError("tokenizer is unavailable")
     print("[tokenizer]", tokenizer_name)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     vocab_size = int(ckpt["model"]["tok_emb.weight"].shape[0])
-
     pad_id = ckpt.get("pad_token_id", tokenizer.pad_token_id)
     if pad_id is None:
         raise ValueError("pad_token_id is unavailable")
     pad_id = int(pad_id)
-
-    unk_id = ckpt.get("unk_token_id")
-    if unk_id is None:
-        unk_id = tokenizer.unk_token_id
+    unk_id = tokenizer.unk_token_id
     if unk_id is None:
         unk_id = pad_id
     unk_id = int(unk_id)
 
-    # --------------------------------------------------------
-    # Model
-    # --------------------------------------------------------
     model = VQWordGNN(
         vocab_size=vocab_size,
         d_model=int(cargs["d_model"]),
-        hop=int(cargs["hop"]),
-        n_layers=int(cargs["n_layers"]),
+        hop=encoder_max_hop,
+        n_layers=int(cargs.get("n_layers", 1)),
         center_scale=float(cargs.get("center_scale", 1.0)),
     ).to(device)
-
-    ckpt_pos_shape = ckpt["model"]["pos_emb.weight"].shape
-
-    if model.pos_emb.weight.shape != ckpt_pos_shape:
-        model.pos_emb = torch.nn.Embedding(
-            ckpt_pos_shape[0],
-            ckpt_pos_shape[1],
-        ).to(device)
-
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
 
-    # --------------------------------------------------------
-    # Check clustering metadata
-    # --------------------------------------------------------
-    if assignment_mode == "bpe_local":
-        centers_by_bpe = ckpt["centers_by_bpe"]
-        k_by_bpe = ckpt["k_by_bpe"].long().cpu()
-
-        if k_by_bpe.numel() != vocab_size:
-            raise ValueError(
-                "k_by_bpe length must equal BPE vocabulary size: "
-                f"{k_by_bpe.numel()} vs {vocab_size}"
-            )
-
-        max_local_clusters = int(
-            ckpt.get(
-                "max_local_clusters",
-                int(k_by_bpe.max().item()) if k_by_bpe.numel() else 0,
-            )
+    max_local_clusters = int(ckpt["max_local_clusters"])
+    k_all = ckpt["k_by_bpe_by_hop"].long().cpu()
+    if k_all.ndim != 2:
+        raise ValueError(f"k_by_bpe_by_hop must be rank-2, got {tuple(k_all.shape)}")
+    if k_all.size(0) != len(available_hops) or k_all.size(1) != vocab_size:
+        raise ValueError(
+            "k_by_bpe_by_hop shape mismatch: "
+            f"{tuple(k_all.shape)} vs ({len(available_hops)}, {vocab_size})"
         )
 
-        if max_local_clusters <= 0:
-            raise ValueError(
-                f"Invalid max_local_clusters={max_local_clusters}"
-            )
-
-        for bpe_id, centers in centers_by_bpe.items():
-            bpe_id = int(bpe_id)
-
-            if not (0 <= bpe_id < vocab_size):
-                raise ValueError(
-                    f"centers_by_bpe contains invalid BPE ID {bpe_id}"
-                )
-
-            if not torch.is_tensor(centers):
-                centers = torch.tensor(centers)
-
-            expected_k = int(k_by_bpe[bpe_id].item())
-            actual_k = int(centers.size(0))
-
-            if expected_k != actual_k:
-                raise ValueError(
-                    f"Checkpoint k mismatch for BPE ID {bpe_id}: "
-                    f"k_by_bpe={expected_k}, centers={actual_k}"
-                )
-
-            if actual_k > max_local_clusters:
-                raise ValueError(
-                    f"BPE ID {bpe_id} has {actual_k} centers, "
-                    f"larger than max_local_clusters={max_local_clusters}"
-                )
-
-        print("[partition_type]", ckpt.get("partition_type"))
-        print("[id_scheme]", ckpt.get("id_scheme"))
-        print("[max_local_clusters]", max_local_clusters)
-        print("[BPEs with centers]", len(centers_by_bpe))
-
-    else:
-        ivf_centers = ckpt["ivf_centers"]
-        global_centers = ckpt["global_centers"]
-        global_offsets = ckpt["global_offsets"].long()
-
-        if global_offsets.numel() != ivf_centers.size(0) + 1:
-            raise ValueError(
-                "global_offsets length must equal ivf_nlist + 1: "
-                f"{global_offsets.numel()} vs {ivf_centers.size(0) + 1}"
-            )
-
-        if int(global_offsets[-1]) != global_centers.size(0):
-            raise ValueError(
-                "Last global offset must equal number of global centers: "
-                f"{int(global_offsets[-1])} vs {global_centers.size(0)}"
-            )
-
-    # --------------------------------------------------------
-    # Dataset
-    # --------------------------------------------------------
+    # Tokenize once. Every HOP uses the same physical positions and the same
+    # max-HOP bilateral window, exactly as in tied-GNN training.
+    print("[data] loading/tokenizing once for all HOPs")
     if args.dataset_config is None:
         ds = load_dataset(args.dataset, split=args.split)
     else:
-        ds = load_dataset(
-            args.dataset,
-            args.dataset_config,
-            split=args.split,
-        )
+        ds = load_dataset(args.dataset, args.dataset_config, split=args.split)
 
     all_ctx = []
     all_tgt = []
     samples = []
     cursor = 0
-
-    print("[data] tokenizing")
     limit = min(args.max_samples, len(ds))
 
-    for sample_idx, ex in enumerate(
-        tqdm(ds.select(range(limit)), desc="[tokenize]")
-    ):
+    for sample_idx, ex in enumerate(tqdm(ds.select(range(limit)), desc="[tokenize]")):
         token_ids = tokenizer.encode(
-            ex[args.text_col],
-            add_special_tokens=False,
+            ex[args.text_col], add_special_tokens=False
         )[:args.seq_len]
-
         if len(token_ids) < 2:
             continue
-
-        token_ids = [
-            token_id if token_id < vocab_size else unk_id
-            for token_id in token_ids
-        ]
-
-        ctx_i, tgt_i = make_windows(
-            token_ids,
-            int(cargs["hop"]),
-            pad_id,
-        )
-
+        token_ids = [tid if tid < vocab_size else unk_id for tid in token_ids]
+        ctx_i, tgt_i = make_windows(token_ids, encoder_max_hop, pad_id)
         start = cursor
         end = start + len(tgt_i)
         cursor = end
-
         samples.append(
             {
                 "sample_idx": int(sample_idx),
@@ -458,144 +373,94 @@ def main():
         all_tgt.append(tgt_i)
 
     if not all_ctx:
-        raise ValueError("No windows were created")
-
+        raise ValueError("No usable tokenized samples")
     ctx = torch.cat(all_ctx, dim=0)
     tgt = torch.cat(all_tgt, dim=0)
-
     print("[data] windows", f"{len(tgt):,}")
+    print("[checkpoint hops]", available_hops)
+    print("[requested hops]", requested_hops)
 
-    # --------------------------------------------------------
-    # Assignment
-    # --------------------------------------------------------
-    common = {
-        "samples": samples,
-        "token_ids_flat": tgt.to(torch.int32),
-        "offsets": [
-            (
-                s["sample_idx"],
-                s["start"],
-                s["end"],
-                s["length"],
+    centers_all = ckpt["centers_by_bpe_by_hop"]
+
+    for hop in requested_hops:
+        print("=" * 68)
+        print(f"[HOP{hop}] assignment")
+        row = get_hop_row(ckpt, hop)
+        k_by_bpe = k_all[row]
+        centers_by_bpe = normalize_centers_dict(centers_all[int(hop)])
+
+        if int(k_by_bpe.max().item()) > max_local_clusters:
+            raise ValueError(
+                f"HOP{hop}: max k={int(k_by_bpe.max())} > {max_local_clusters}"
             )
-            for s in samples
-        ],
-        "pad_token_id": pad_id,
-        "unk_token_id": unk_id,
-        "vocab_type": ckpt.get("vocab_type", "byte_bpe"),
-        "hop": int(cargs["hop"]),
-        "center_scale": float(cargs.get("center_scale", 1.0)),
-        "context_type": ckpt.get("context_type"),
-        "context_width": ckpt.get("context_width"),
-        "ckpt": args.ckpt,
-        "tokenizer": tokenizer_name,
-    }
 
-    if assignment_mode == "bpe_local":
-        local_vq_ids, missing_bpe_ids = assign_ids_bpe_local(
+        local_ids, missing_bpe_ids = assign_one_hop(
             model=model,
             ctx=ctx,
             tgt=tgt,
+            hop=hop,
             centers_by_bpe=centers_by_bpe,
             k_by_bpe=k_by_bpe,
+            max_local_clusters=max_local_clusters,
             batch_size=args.batch_size,
             device=device,
-            k_block=args.k_block,
             missing_bpe_policy=args.missing_bpe_policy,
         )
 
-        # Validate IDs for BPEs that actually have learned centers.
-        token_ids_long = tgt.long().reshape(-1)
-        local_ids_long = local_vq_ids.long().reshape(-1)
-        token_k = k_by_bpe[token_ids_long]
-
-        seen_mask = token_k > 0
-        if seen_mask.any():
-            bad = local_ids_long[seen_mask] >= token_k[seen_mask]
+        token_k = k_by_bpe[tgt.long()]
+        has_centers = token_k > 0
+        if has_centers.any():
+            bad = local_ids[has_centers] >= token_k[has_centers]
             if bad.any():
-                seen_positions = torch.nonzero(seen_mask, as_tuple=False).reshape(-1)
-                rel_idx = int(torch.nonzero(bad, as_tuple=False)[0].item())
-                idx = int(seen_positions[rel_idx].item())
-                bpe_id = int(token_ids_long[idx].item())
-                raise RuntimeError(
-                    f"Invalid local VQ ID at position {idx}: "
-                    f"bpe={bpe_id}, "
-                    f"local={int(local_ids_long[idx].item())}, "
-                    f"k={int(k_by_bpe[bpe_id].item())}"
-                )
+                raise RuntimeError(f"HOP{hop}: local VQ ID outside BPE-specific range")
+        missing_mask = ~has_centers
+        if missing_mask.any() and not torch.all(local_ids[missing_mask] == 0):
+            raise RuntimeError(f"HOP{hop}: missing-center BPE did not map to ID 0")
 
-        if local_vq_ids.numel() and int(local_vq_ids.max()) >= max_local_clusters:
-            raise RuntimeError(
-                f"Assigned local VQ ID {int(local_vq_ids.max())} "
-                f"exceeds max_local_clusters={max_local_clusters}"
-            )
-
-        # For pair representation, VQ vocabulary is only the local-ID axis.
-        # This preserves compatibility with loaders that expect vq_ids_flat,
-        # vq_vocab_size and vq_pad_id.
+        out_path = Path(render_out_path(args.out_pattern, hop))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_data = {
-            **common,
-            "vq_ids_flat": local_vq_ids.to(torch.int16),
-            "local_vq_ids_flat": local_vq_ids.to(torch.int16),
+            "samples": samples,
+            "token_ids_flat": tgt.to(torch.int32),
+            "offsets": [
+                (s["sample_idx"], s["start"], s["end"], s["length"])
+                for s in samples
+            ],
+            "vq_ids_flat": local_ids.to(torch.int16),
+            "local_vq_ids_flat": local_ids.to(torch.int16),
             "k_by_bpe": k_by_bpe.to(torch.int16),
             "max_local_clusters": max_local_clusters,
             "vq_vocab_size": max_local_clusters,
             "vq_pad_id": max_local_clusters,
+            "pad_token_id": pad_id,
+            "unk_token_id": unk_id,
+            "vocab_type": ckpt.get("vocab_type", "byte_bpe"),
+            "hop": int(hop),
+            "available_hops": available_hops,
+            "encoder_max_hop": encoder_max_hop,
+            "center_scale": float(cargs.get("center_scale", 1.0)),
+            "context_type": ckpt.get("context_type", "bilateral"),
+            "context_width": int(ckpt.get("context_width", 2 * encoder_max_hop + 1)),
+            "ckpt": args.ckpt,
+            "tokenizer": tokenizer_name,
             "partitioned": True,
             "partition_type": "bpe_local_kmeans",
             "id_scheme": "(bpe_id, local_vq_id)",
+            "shared_gnn_across_hops": True,
+            "shared_codebook_across_hops": False,
             "missing_bpe_policy": args.missing_bpe_policy,
             "missing_bpe_ids": missing_bpe_ids,
         }
+        torch.save(out_data, out_path)
 
-        torch.save(out_data, args.out)
-
-        print("[local VQ min/max]", int(local_vq_ids.min()), int(local_vq_ids.max()))
-        print("[vq_vocab_size]", max_local_clusters)
-        print("[vq_pad_id]", max_local_clusters)
+        print("[save]", out_path)
+        print("[tokens]", local_ids.numel())
+        print("[local VQ min/max]", int(local_ids.min()), int(local_ids.max()))
         print("[missing BPE types]", len(missing_bpe_ids))
-        if missing_bpe_ids:
-            print("[missing BPE IDs first 30]", missing_bpe_ids[:30])
+        print("[missing BPE token count]", int(missing_mask.sum()))
 
-    else:
-        vq_ids, ivf_ids = assign_ids_global_ivf(
-            model=model,
-            ctx=ctx,
-            ivf_centers=ivf_centers,
-            global_centers=global_centers,
-            global_offsets=global_offsets,
-            batch_size=args.batch_size,
-            device=device,
-            k_block=args.k_block,
-        )
-
-        vq_vocab_size = int(ckpt["vq_vocab_size"])
-
-        if vq_ids.numel() and int(vq_ids.max()) >= vq_vocab_size:
-            raise RuntimeError(
-                f"Assigned ID {int(vq_ids.max())} "
-                f"exceeds vq_vocab_size={vq_vocab_size}"
-            )
-
-        vq_pad_id = vq_vocab_size
-
-        out_data = {
-            **common,
-            "vq_ids_flat": vq_ids.to(torch.int32),
-            "ivf_ids_flat": ivf_ids.to(torch.int32),
-            "vq_vocab_size": vq_vocab_size,
-            "vq_pad_id": vq_pad_id,
-            "partitioned": False,
-            "partition_type": "global_ivf_then_kmeans",
-            "id_scheme": "global_ivf_then_local_kmeans",
-        }
-
-        torch.save(out_data, args.out)
-
-        print("[vq_vocab_size]", vq_vocab_size)
-        print("[vq_pad_id]", vq_pad_id)
-
-    print("[save]", args.out)
+    print("=" * 68)
+    print("[all completed]", requested_hops)
 
 
 if __name__ == "__main__":
