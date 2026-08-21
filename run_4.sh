@@ -86,73 +86,20 @@ tar -xzf "/vqword/${BPE_ARCHIVE}" -C /vqword
 }
 
 # ============================================================
-# Download the one shared tied-GNN model checkpoint
+# Shared model
+#
+# The original generator does not train the GNN before clustering.
+# Therefore the tied-GNN weights can be deterministically rebuilt from
+# the seed/config stored in the HOP-part signature.  HOP1 is downloaded
+# first in the loop below and used to rebuild the one shared model.
 # ============================================================
 
-rm -f "${SHARED_MODEL_PATH}"
-
-echo "============================================================"
-echo "[download shared model] ${SHARED_MODEL}"
-echo "============================================================"
-
-lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<EOF
-set ftp:ssl-allow no
-set net:max-retries 5
-set net:timeout 60
-set cmd:fail-exit yes
-get "${SHARED_MODEL}" -o "${SHARED_MODEL_PATH}"
-bye
-EOF
-
-python - "${SHARED_MODEL_PATH}" "${LOCAL_CLUSTERS}" "${BPE_VOCAB_LABEL}" <<'PY'
-import sys, torch
-
-p = sys.argv[1]
-expected_k = int(sys.argv[2])
-expected_vocab = int(sys.argv[3])
-
-c = torch.load(p, map_location="cpu", weights_only=False)
-
-required = {
-    "model",
-    "args",
-    "hops",
-    "max_local_clusters",
-    "shared_gnn_across_hops",
-    "shared_codebook_across_hops",
-    "partition_type",
+REBUILD_SHARED_SCRIPT="/vqword/rebuild_shared_model_from_hop.py"
+[ -f "${REBUILD_SHARED_SCRIPT}" ] || {
+  echo "[error] missing helper: ${REBUILD_SHARED_SCRIPT}"
+  exit 1
 }
-missing = required - set(c.keys())
-if missing:
-    raise ValueError(
-        f"shared model missing keys: {sorted(missing)}"
-    )
-
-if c["shared_gnn_across_hops"] is not True:
-    raise ValueError("shared_gnn_across_hops must be True")
-if c["shared_codebook_across_hops"] is not False:
-    raise ValueError("shared_codebook_across_hops must be False")
-if c["partition_type"] != "bpe_local_kmeans":
-    raise ValueError(
-        f"unexpected partition_type={c['partition_type']}"
-    )
-if int(c["max_local_clusters"]) != expected_k:
-    raise ValueError(
-        f"local cluster mismatch: "
-        f"{c['max_local_clusters']} != {expected_k}"
-    )
-
-vocab = int(c["model"]["tok_emb.weight"].shape[0])
-if vocab != expected_vocab:
-    raise ValueError(
-        f"BPE vocab mismatch: {vocab} != {expected_vocab}"
-    )
-
-print(
-    f"[shared model check] OK "
-    f"hops={c['hops']} vocab={vocab}"
-)
-PY
+rm -f "${SHARED_MODEL_PATH}"
 
 # ============================================================
 # HOP1..10
@@ -196,6 +143,22 @@ set cmd:fail-exit yes
 get "${VQ_FILE}" -o "${VQ_FILE_PATH}"
 bye
 EOF
+
+  # Rebuild the one common tied-GNN model from HOP1 metadata.
+  # No large merged checkpoint and no shared-model FTP file is required.
+  if [ "${HOP}" -eq 1 ]; then
+    echo "============================================================"
+    echo "[HOP1] rebuild shared tied-GNN model"
+    echo "============================================================"
+    python "${REBUILD_SHARED_SCRIPT}" \
+      --hop_file "${VQ_FILE_PATH}" \
+      --out "${SHARED_MODEL_PATH}"
+
+    [ -f "${SHARED_MODEL_PATH}" ] || {
+      echo "[error] shared model reconstruction failed"
+      exit 1
+    }
+  fi
 
   # ==========================================================
   # Validate downloaded per-HOP file
