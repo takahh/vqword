@@ -451,6 +451,21 @@ def main():
             "missing_bpe_policy": args.missing_bpe_policy,
             "missing_bpe_ids": missing_bpe_ids,
         }
+        print("=== SAVE DEBUG ===")
+        print("len(samples):", len(samples))
+        print("tgt:", tgt.shape, tgt.dtype,
+              tgt.numel() * tgt.element_size() / 1024 ** 3, "GiB")
+        print("local_ids:", local_ids.shape, local_ids.dtype,
+              local_ids.numel() * local_ids.element_size() / 1024 ** 3, "GiB")
+
+        for k, v in out_data.items():
+            if torch.is_tensor(v):
+                print(
+                    k,
+                    tuple(v.shape),
+                    v.dtype,
+                    f"{v.numel() * v.element_size() / 1024 ** 3:.3f} GiB"
+                )
         torch.save(out_data, out_path)
 
         print("[save]", out_path)
