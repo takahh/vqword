@@ -3,21 +3,19 @@ set -euo pipefail
 
 # WikiText-103: shared-space, recurrent-HOP BPE-local VQWord generation
 #
-# One tied GNN cell is applied repeatedly. Intermediate states for
-# HOP=MIN_HOP..MAX_HOP are discretized with independent BPE-local codebooks.
-# HOP is not embedded in the token.
+# Each completed HOP part is:
+#   1) saved locally,
+#   2) immediately uploaded to FTP.
+#
+# On restart, if a local HOP part is missing, the training script first tries
+# to restore the matching part from FTP and resumes without recomputing it.
 #
 # Usage:
-#   FTP_PASS='...' bash run_vqword_bpe_local_sharedhop_wikitext.sh 5 0.0 10
+#   FTP_PASS='...' bash run_3.sh 5 0.0 10
 #
-# Arguments:
-#   $1: maximum local clusters per BPE
-#   $2: center scale
-#   $3: maximum bilateral HOP
-#
-# Optional environment variables:
-#   MIN_HOP=1                    first saved HOP (set 0 to include HOP0)
-#   CLUSTER_SAMPLES_PER_BPE=256 physical positions sampled per BPE for KMeans
+# Optional:
+#   MIN_HOP=1
+#   CLUSTER_SAMPLES_PER_BPE=256
 
 if [ "$#" -ne 3 ]; then
   echo "Usage: $0 {local_clusters} {center_scale} {max_hop}"
@@ -84,9 +82,6 @@ BPE_VOCAB_LABEL=50257
 BPE_VOCAB_SIZE=50257
 SEED=0
 D_MODEL=256
-
-# Exact shared recurrent HOP semantics require one tied cell application
-# per HOP. The training script rejects any other value.
 N_LAYERS=1
 
 BPE_ARCHIVE="bpe_wikitext103_${BPE_VOCAB_LABEL}.tar.gz"
@@ -96,9 +91,10 @@ TOKENIZER_DIR="/vqword/bpe_wikitext103_${BPE_VOCAB_LABEL}"
 TRAIN_SCRIPT="train_vqword_reconstruct.py"
 TRAIN_SCRIPT_PATH="/vqword/${TRAIN_SCRIPT}"
 
-FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
-FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
-FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
+# Export these so train_vqword_reconstruct.py can upload/recover each HOP part.
+export FTP_USER="${FTP_USER:-chicappa.jp-wakou}"
+export FTP_PASS="${FTP_PASS:?Set FTP_PASS before running this script}"
+export FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
 if [ ! -f "${TRAIN_SCRIPT_PATH}" ]; then
   echo "[error] training script was not found: ${TRAIN_SCRIPT_PATH}"
@@ -156,6 +152,7 @@ echo "HOP embedding      = no"
 echo "center scale       = ${CENTER_SCALE}"
 echo "local clusters     = ${LOCAL_CLUSTERS}"
 echo "cluster samples/BPE= ${CLUSTER_SAMPLES_PER_BPE}"
+echo "FTP HOP backup     = enabled"
 echo "output             = ${OUT_PATH}"
 echo "============================================================"
 
@@ -176,6 +173,7 @@ python3 "${TRAIN_SCRIPT_PATH}" \
   --cluster_samples_per_bpe "${CLUSTER_SAMPLES_PER_BPE}" \
   --batch_size 1024 \
   --seed "${SEED}" \
+  --ftp_sync_hop_parts \
   --out "${OUT_PATH}"
 
 for path in "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"; do
@@ -185,7 +183,6 @@ for path in "${OUT_PATH}" "${DICTIONARY_PATH}" "${IDS_PATH}"; do
   fi
 done
 
-# Verify tied GNN plus independent per-HOP codebooks.
 python3 - "${OUT_PATH}" "${IDS_PATH}" "${MIN_HOP}" "${MAX_HOP}" <<'PY'
 import sys
 import torch

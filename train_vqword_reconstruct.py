@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -205,6 +206,72 @@ def atomic_torch_save(obj, path):
     tmp_path = path.with_name(path.name + ".tmp")
     torch.save(obj, tmp_path)
     os.replace(tmp_path, path)
+
+
+def hop_remote_name(out_path, hop):
+    """Unique remote filename for a per-HOP checkpoint."""
+    out_path = Path(out_path)
+    return f"{out_path.stem}_hop_{int(hop):03d}_ids.pt"
+
+
+def _ftp_env():
+    user = os.environ.get("FTP_USER", "chicappa.jp-wakou")
+    password = os.environ.get("FTP_PASS")
+    host = os.environ.get("FTP_HOST", "ftp.lolipop.jp")
+    if not password:
+        raise RuntimeError(
+            "FTP_PASS is required when --ftp_sync_hop_parts is enabled"
+        )
+    return user, password, host
+
+
+def ftp_upload_file(local_path, remote_name):
+    """Upload one completed checkpoint with lftp; fail hard on upload errors."""
+    local_path = Path(local_path)
+    user, password, host = _ftp_env()
+    cmd = (
+        "set ftp:ssl-allow no; "
+        "set net:max-retries 5; "
+        "set net:timeout 30; "
+        "set cmd:fail-exit yes; "
+        f'put "{local_path}" -o "{remote_name}"; '
+        "bye"
+    )
+    subprocess.run(
+        ["lftp", "-u", f"{user},{password}", host, "-e", cmd],
+        check=True,
+    )
+    print(f"[FTP upload OK] {local_path} -> {remote_name}")
+
+
+def ftp_try_download_file(remote_name, local_path):
+    """Try to restore one HOP checkpoint. Missing remote files are not fatal."""
+    local_path = Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = local_path.with_name(local_path.name + ".download")
+    tmp_path.unlink(missing_ok=True)
+
+    user, password, host = _ftp_env()
+    cmd = (
+        "set ftp:ssl-allow no; "
+        "set net:max-retries 2; "
+        "set net:timeout 30; "
+        "set cmd:fail-exit yes; "
+        f'get "{remote_name}" -o "{tmp_path}"; '
+        "bye"
+    )
+    result = subprocess.run(
+        ["lftp", "-u", f"{user},{password}", host, "-e", cmd],
+        check=False,
+    )
+    if result.returncode != 0 or not tmp_path.is_file() or tmp_path.stat().st_size == 0:
+        tmp_path.unlink(missing_ok=True)
+        print(f"[FTP resume miss] {remote_name}")
+        return False
+
+    os.replace(tmp_path, local_path)
+    print(f"[FTP resume restored] {remote_name} -> {local_path}")
+    return True
 
 
 @torch.no_grad()
@@ -1267,6 +1334,14 @@ def main():
         action="store_true",
         help="remove per-HOP ID files after the final IDs file is saved",
     )
+    ap.add_argument(
+        "--ftp_sync_hop_parts",
+        action="store_true",
+        help=(
+            "upload every completed HOP part immediately with lftp; "
+            "on restart, restore missing local HOP parts from FTP first"
+        ),
+    )
 
     args = ap.parse_args()
 
@@ -1368,8 +1443,16 @@ def main():
     for hop in hops:
         part_path = hop_parts_dir / f"hop_{int(hop):03d}_ids.pt"
         hop_part_paths.append(part_path)
+        remote_part_name = hop_remote_name(out_path, hop)
+
+        # Recover already-completed HOPs after container recreation.
+        if args.ftp_sync_hop_parts and not part_path.exists():
+            ftp_try_download_file(remote_part_name, part_path)
+
         if part_path.exists():
-            part = torch.load(part_path, map_location="cpu")
+            part = torch.load(
+                part_path, map_location="cpu", weights_only=False
+            )
             if (
                 part.get("signature") != checkpoint_signature
                 or int(part.get("hop", -1)) != int(hop)
@@ -1418,6 +1501,11 @@ def main():
             part_path,
         )
         print(f"[save HOP{hop} codebook+IDs] {part_path}")
+
+        # Back up this HOP before starting the next long computation.
+        if args.ftp_sync_hop_parts:
+            ftp_upload_file(part_path, remote_part_name)
+
         del hop_ids, centers_by_bpe, k_by_bpe
 
     print("[merge HOP parts]")
@@ -1566,3 +1654,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
