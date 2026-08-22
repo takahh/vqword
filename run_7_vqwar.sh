@@ -26,14 +26,10 @@ fi
 AR_MODE="$1"
 case "${AR_MODE}" in
   local_bpe_direct)
-    DATA_FILE="tinystories_vqword_bpe50257_tiedgnn_separatehop10_center0_localbpe5_seed0_ids.pt"
-    CODEBOOK_FILE="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0_shared_model.pt"
-    VQ_LABEL="localbpe5_center0"
+    VQ_LABEL="samidare_localbpe5_center0"
     ;;
   global_vqwar)
-    DATA_FILE="tinystories_vqword_bpe50257_tiedgnn_separatehop10_center0_localbpe5_seed0_ids.pt"
-    CODEBOOK_FILE="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0_shared_model.pt"
-    VQ_LABEL="pairglobal_localbpe5_center0"
+    VQ_LABEL="samidare_pairglobal_localbpe5_center0"
     ;;
   *)
     echo "[error] mode must be local_bpe_direct or global_vqwar"
@@ -65,17 +61,19 @@ if [ "${DISABLE_VQW}" = "1" ]; then
 fi
 
 if [ "${VQ_GAP}" -ne 11 ] || [ "${LOCAL_BPE_TOKENS}" -ne 10 ]; then
-  echo "[error] bilateral HOP10 requires VQ_GAP=11 and LOCAL_BPE_TOKENS=10"
+  echo "[error] HOP1..10 samidare requires VQ_GAP=11 and LOCAL_BPE_TOKENS=10"
   exit 1
 fi
 
 download_file() {
   local remote_file="$1"
   local local_path="$2"
+
   if [ -s "${local_path}" ]; then
     echo "[reuse] ${local_path}"
     return
   fi
+
   echo "[download] ${remote_file}"
   lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<LFTP
 set ftp:ssl-allow no
@@ -85,118 +83,174 @@ set cmd:fail-exit yes
 get "${remote_file}" -o "${local_path}"
 bye
 LFTP
-  test -s "${local_path}" || { echo "[error] download failed"; exit 1; }
+
+  test -s "${local_path}" || {
+    echo "[error] download failed: ${remote_file}"
+    exit 1
+  }
 }
 
 # ============================================================
-# Rebuild the shared tied-GNN model from the HOP1 part.
-# The large merged ~2GB checkpoint is intentionally not downloaded.
+# HOP1..10 samidare inputs
+#
+# For prediction target t:
+#   t-11 and older : HOP10
+#   t-10           : HOP9
+#   ...
+#   t-3            : HOP2
+#   t-2            : HOP1
+#   t-1            : no VQW
+#
+# Both local_bpe_direct and global_vqwar use all ten HOPs.
 # ============================================================
-CKPT_PREFIX="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0"
-HOP1_FILE="${CKPT_PREFIX}_hop_001_ids.pt"
-HOP1_PATH="/vqword/${HOP1_FILE}"
-CODEBOOK_PATH="/vqword/${CODEBOOK_FILE}"
 
-if [ -f /vqword/rebuild_shared_model_from_hop.py ]; then
-  REBUILD_SCRIPT="/vqword/rebuild_shared_model_from_hop.py"
-elif [ -f /vqword/rebuild_shared_gnn.py ]; then
-  REBUILD_SCRIPT="/vqword/rebuild_shared_gnn.py"
-else
-  echo "[error] rebuild helper not found"
-  echo "        expected /vqword/rebuild_shared_model_from_hop.py"
-  echo "        or       /vqword/rebuild_shared_gnn.py"
-  exit 1
-fi
+DATA_PREFIX="tinystories_vqword_bpe50257_tiedgnn_separatehop"
+DATA_SUFFIX="_center0_localbpe5_seed0_ids.pt"
 
-download_file "${HOP1_FILE}" "${HOP1_PATH}"
+CB_PREFIX="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0"
+CB_SUFFIX="_ids.pt"
 
-echo "============================================================"
-echo "[rebuild] shared tied-GNN model from HOP1"
-echo "helper            = ${REBUILD_SCRIPT}"
-echo "hop source        = ${HOP1_PATH}"
-echo "codebook output   = ${CODEBOOK_PATH}"
-echo "============================================================"
+DATA_HOPS=()
+CODEBOOK_HOPS=()
 
-rm -f "${CODEBOOK_PATH}"
-python "${REBUILD_SCRIPT}" \
-  --hop_file "${HOP1_PATH}" \
-  --out "${CODEBOOK_PATH}"
+for HOP in $(seq 1 10); do
+  HOP2=$(printf "%02d" "${HOP}")
+  HOP3=$(printf "%03d" "${HOP}")
 
-test -s "${CODEBOOK_PATH}" || {
-  echo "[error] shared-model rebuild failed: ${CODEBOOK_PATH}"
-  exit 1
-}
+  DATA_FILE="${DATA_PREFIX}${HOP2}${DATA_SUFFIX}"
+  DATA_PATH="/vqword/${DATA_FILE}"
 
-# HOP1 is no longer needed after reconstruction.
-rm -f "${HOP1_PATH}"
+  # Each HOP-specific WikiText file contains the metadata/codebook needed
+  # for that HOP.  Do not use the old single HOP10 file or the merged ~2GB
+  # checkpoint for the multi-HOP AR input.
+  CB_FILE="${CB_PREFIX}_hop_${HOP3}${CB_SUFFIX}"
+  CB_PATH="/vqword/${CB_FILE}"
 
-download_file "${DATA_FILE}" "/vqword/${DATA_FILE}"
+  download_file "${DATA_FILE}" "${DATA_PATH}"
+  download_file "${CB_FILE}" "${CB_PATH}"
 
-python - "${AR_MODE}" "/vqword/${DATA_FILE}" "/vqword/${CODEBOOK_FILE}" <<'PY'
+  DATA_HOPS+=("${DATA_PATH}")
+  CODEBOOK_HOPS+=("${CB_PATH}")
+done
+
+# ============================================================
+# Verify all ten HOPs before starting the long AR run.
+# ============================================================
+python - "${AR_MODE}" "${DATA_HOPS[@]}" -- "${CODEBOOK_HOPS[@]}" <<'PY'
 import sys
 import torch
 
-mode, data_path, codebook_path = sys.argv[1:]
+mode = sys.argv[1]
+sep = sys.argv.index("--")
+data_paths = sys.argv[2:sep]
+codebook_paths = sys.argv[sep + 1:]
 
-data = torch.load(data_path, map_location="cpu", weights_only=False)
-cb = torch.load(codebook_path, map_location="cpu", weights_only=False)
-
-hop_data = int(data.get("hop", data.get("args", {}).get("hop", -1)))
-hop_cb = int(cb.get("hop", cb.get("args", {}).get("hop", -1)))
-
-if hop_data != 10 or hop_cb != 10:
-    raise ValueError(f"HOP mismatch: data={hop_data}, codebook={hop_cb}")
-
-if cb.get("partition_type") != "bpe_local_kmeans":
+if len(data_paths) != 10 or len(codebook_paths) != 10:
     raise ValueError(
-        f"{mode} requires bpe_local_kmeans, "
-        f"got {cb.get('partition_type')!r}"
+        f"expected 10 data and 10 codebook files, "
+        f"got {len(data_paths)} and {len(codebook_paths)}"
     )
 
-tokens = data["token_ids_flat"].long().reshape(-1)
-local_vq = data["vq_ids_flat"].long().reshape(-1)
+reference_tokens = None
+reference_samples = None
+local_sizes = []
+rows = []
 
-if tokens.numel() != local_vq.numel():
-    raise ValueError("token/VQ length mismatch")
+for expected_hop, (data_path, cb_path) in enumerate(
+    zip(data_paths, codebook_paths), 1
+):
+    data = torch.load(data_path, map_location="cpu", weights_only=False)
+    cb = torch.load(cb_path, map_location="cpu", weights_only=False)
 
-local_vq_size = int(
-    data.get("vq_vocab_size", cb.get("max_local_clusters", -1))
-)
-if local_vq_size < 1:
-    raise ValueError(f"invalid local VQ vocabulary size: {local_vq_size}")
+    hop_data = int(data.get("hop", data.get("args", {}).get("hop", -1)))
+    hop_cb = int(cb.get("hop", cb.get("args", {}).get("hop", -1)))
 
-if int(local_vq.min()) < 0 or int(local_vq.max()) >= local_vq_size:
-    raise ValueError(
-        f"local VQ IDs out of range 0..{local_vq_size - 1}"
+    if hop_data != expected_hop or hop_cb != expected_hop:
+        raise ValueError(
+            f"HOP{expected_hop} mismatch: "
+            f"data={hop_data}, codebook={hop_cb}"
+        )
+
+    if cb.get("partition_type") != "bpe_local_kmeans":
+        raise ValueError(
+            f"HOP{expected_hop}: {mode} requires bpe_local_kmeans, "
+            f"got {cb.get('partition_type')!r}"
+        )
+
+    for key in ("samples", "token_ids_flat", "vq_ids_flat"):
+        if key not in data:
+            raise KeyError(f"HOP{expected_hop} data missing {key}")
+
+    tokens = data["token_ids_flat"].long().reshape(-1)
+    local_vq = data["vq_ids_flat"].long().reshape(-1)
+
+    if tokens.numel() != local_vq.numel():
+        raise ValueError(f"HOP{expected_hop}: token/VQ length mismatch")
+
+    if reference_tokens is None:
+        reference_tokens = tokens
+        reference_samples = len(data["samples"])
+    else:
+        if not torch.equal(tokens, reference_tokens):
+            raise ValueError(f"HOP{expected_hop}: token_ids differ from HOP1")
+        if len(data["samples"]) != reference_samples:
+            raise ValueError(f"HOP{expected_hop}: sample count differs from HOP1")
+
+    local_vq_size = int(
+        data.get("vq_vocab_size", cb.get("max_local_clusters", -1))
+    )
+    if local_vq_size < 1:
+        raise ValueError(
+            f"HOP{expected_hop}: invalid local VQ vocabulary size "
+            f"{local_vq_size}"
+        )
+
+    vmin = int(local_vq.min())
+    vmax = int(local_vq.max())
+    if vmin < 0 or vmax >= local_vq_size:
+        raise ValueError(
+            f"HOP{expected_hop}: local VQ IDs out of range "
+            f"{vmin}..{vmax}, vocab={local_vq_size}"
+        )
+
+    local_sizes.append(local_vq_size)
+    rows.append(
+        f"HOP{expected_hop:02d}: "
+        f"tokens={tokens.numel():,} "
+        f"samples={len(data['samples']):,} "
+        f"local_vq_vocab={local_vq_size} "
+        f"range={vmin}..{vmax}"
     )
 
-message = (
-    f"[verification OK] mode={mode} "
-    f"tokens={tokens.numel():,} "
-    f"samples={len(data['samples']):,} "
-    f"local_vq_vocab={local_vq_size} "
-    f"local_vq_range={int(local_vq.min())}..{int(local_vq.max())}"
-)
+print(f"[verification OK] mode={mode}; HOP1..10 aligned")
+for row in rows:
+    print("  " + row)
 
 if mode == "global_vqwar":
+    # Output target remains HOP10 (BPE, local-VQW) pair-global.
+    hop10_data = torch.load(data_paths[9], map_location="cpu", weights_only=False)
+    tokens = hop10_data["token_ids_flat"].long().reshape(-1)
+    local_vq = hop10_data["vq_ids_flat"].long().reshape(-1)
+    local_vq_size = local_sizes[9]
     pair_keys = tokens * local_vq_size + local_vq
     pair_global_vocab = int(torch.unique(pair_keys).numel())
-    message += f" pair_global_vocab={pair_global_vocab:,}"
-
-print(message)
+    print(f"  HOP10 target pair_global_vocab={pair_global_vocab:,}")
 PY
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RUN="${AR_MODE}_hop10_gap11_localbpe10_${VQ_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
+RUN="${AR_MODE}_samidare_hop01to10_gap11_localbpe10_${VQ_LABEL}_arseed${AR_SEED}_${TIMESTAMP}"
 FINAL_PATH="/vqword/${RUN}.pt"
 BEST_PATH="/vqword/${RUN}_best.pt"
 LOG_PATH="/vqword/${RUN}.log"
 
 echo "============================================================"
 echo "mode              = ${AR_MODE}"
-echo "data              = /vqword/${DATA_FILE}"
-echo "codebook          = /vqword/${CODEBOOK_FILE}"
-echo "alignment         = distant t-11 + recent BPE t-10..t-1"
+echo "HOP input         = HOP1..10 samidare"
+echo "alignment         = <=t-11:HOP10, t-10:HOP9, ..., t-2:HOP1, t-1:none"
+echo "data HOP1         = ${DATA_HOPS[0]}"
+echo "data HOP10        = ${DATA_HOPS[9]}"
+echo "codebook HOP1     = ${CODEBOOK_HOPS[0]}"
+echo "codebook HOP10    = ${CODEBOOK_HOPS[9]}"
 echo "epochs/batch/lr   = ${EPOCHS}/${BATCH_SIZE}/${LR}"
 echo "VQW alpha init    = ${VQW_ALPHA_INIT}"
 echo "disable VQW       = ${DISABLE_VQW}"
@@ -207,8 +261,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python "${AR_SCRIPT}" \
   --mode "${AR_MODE}" \
-  --data "/vqword/${DATA_FILE}" \
-  --codebook "/vqword/${CODEBOOK_FILE}" \
+  --data_hops "${DATA_HOPS[@]}" \
+  --codebook_hops "${CODEBOOK_HOPS[@]}" \
   --gap "${VQ_GAP}" \
   --local_bpe_tokens "${LOCAL_BPE_TOKENS}" \
   --mixture_topk "${MIXTURE_TOPK}" \
@@ -228,7 +282,10 @@ python "${AR_SCRIPT}" \
   2>&1 | tee "${LOG_PATH}"
 
 for path_to_check in "${FINAL_PATH}" "${BEST_PATH}" "${LOG_PATH}"; do
-  test -s "${path_to_check}" || { echo "[error] missing ${path_to_check}"; exit 1; }
+  test -s "${path_to_check}" || {
+    echo "[error] missing ${path_to_check}"
+    exit 1
+  }
 done
 
 lftp -u "${FTP_USER}","${FTP_PASS}" "${FTP_HOST}" <<LFTP
