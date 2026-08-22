@@ -9,10 +9,9 @@ More exactly, a context token at distance d=t-pos uses
   HOP = min(10, d-1)
 when d >= 2.  VQW[t-1] is never exposed.
 
-local_bpe_direct uses all HOP1..10 data this way.
-global_vqwar keeps the original t-11/HOP10 pair-global objective for
-backward-compatible VQW-AR experiments; use local_bpe_direct for the
-full staircase HOP1..10 experiment.
+Both local_bpe_direct and global_vqwar use all HOP1..10 data this way.
+For global_vqwar, the input IDs distinguish (HOP, BPE, local-VQW), while
+the prediction target remains the HOP10 (BPE, local-VQW) pair-global ID.
 """
 
 import argparse
@@ -85,6 +84,93 @@ class GapPairDataset(Dataset):
         )[:length]
         valid[:length] = True
         return distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid
+
+
+class SamidareGlobalDataset(Dataset):
+    """Global-VQWAR windows with staircase HOP1..10 VQW inputs.
+
+    For each target t:
+      distant source t-11 -> HOP10 global input ID
+      recent t-10..t-2    -> HOP9..HOP1 global input IDs
+      recent t-1          -> no VQW (PAD)
+      target t            -> HOP10 pair-global output ID
+    """
+    def __init__(self, samples, token_ids, input_ids_by_hop, target_hop10_ids,
+                 input_vq_pad_id, gap=11, local_bpe_tokens=10, max_len=255):
+        self.token_ids = token_ids.long().reshape(-1)
+        self.input_ids_by_hop = input_ids_by_hop.long()
+        self.target_hop10_ids = target_hop10_ids.long().reshape(-1)
+        self.input_vq_pad_id = int(input_vq_pad_id)
+        self.gap = int(gap)
+        self.local_bpe_tokens = int(local_bpe_tokens)
+        self.max_len = int(max_len)
+        if self.local_bpe_tokens != self.gap - 1:
+            raise ValueError("local_bpe_tokens must equal gap - 1")
+        if self.input_ids_by_hop.shape != (10, self.token_ids.numel()):
+            raise ValueError(
+                f"input_ids_by_hop must be [10, N], got {tuple(self.input_ids_by_hop.shape)}"
+            )
+        if self.target_hop10_ids.numel() != self.token_ids.numel():
+            raise ValueError("target HOP10 IDs length mismatch")
+
+        self.examples = []
+        for sample in samples:
+            start, end = int(sample["start"]), int(sample["end"])
+            aligned = end - start - self.gap
+            if aligned < 1:
+                continue
+            for offset in range(0, aligned, self.max_len):
+                length = min(self.max_len, aligned - offset)
+                self.examples.append((start + offset, length))
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, index):
+        source_start, length = self.examples[index]
+        target_start = source_start + self.gap
+
+        distant_bpe = torch.zeros(self.max_len, dtype=torch.long)
+        distant_vq = torch.full(
+            (self.max_len,), self.input_vq_pad_id, dtype=torch.long
+        )
+        recent_bpe = torch.zeros(
+            (self.max_len, self.local_bpe_tokens), dtype=torch.long
+        )
+        recent_vq = torch.full(
+            (self.max_len, self.local_bpe_tokens),
+            self.input_vq_pad_id, dtype=torch.long
+        )
+        vq_y = torch.full((self.max_len,), -100, dtype=torch.long)
+        bpe_y = torch.full((self.max_len,), -100, dtype=torch.long)
+        valid = torch.zeros(self.max_len, dtype=torch.bool)
+
+        # One row j predicts t = source_start + j + 11.
+        # The distant source is therefore exactly t-11 and uses HOP10.
+        distant_pos = torch.arange(source_start, source_start + length)
+        distant_bpe[:length] = self.token_ids[distant_pos]
+        distant_vq[:length] = self.input_ids_by_hop[9, distant_pos]
+
+        # Recent positions are t-10 ... t-1.  Their staircase HOPs are
+        # HOP9 ... HOP1, NONE.  Column c has distance 10-c, hence HOP 9-c.
+        local_segment = self.token_ids[
+            source_start + 1:source_start + length + self.local_bpe_tokens
+        ]
+        recent_bpe[:length] = local_segment.unfold(
+            0, self.local_bpe_tokens, 1
+        )[:length]
+        for c in range(self.local_bpe_tokens - 1):
+            hop = self.local_bpe_tokens - 1 - c  # 9,8,...,1
+            pos = torch.arange(source_start + 1 + c,
+                               source_start + 1 + c + length)
+            recent_vq[:length, c] = self.input_ids_by_hop[hop - 1, pos]
+        # Last recent column is t-1 and intentionally remains PAD/no-VQW.
+
+        target_pos = torch.arange(target_start, target_start + length)
+        vq_y[:length] = self.target_hop10_ids[target_pos]
+        bpe_y[:length] = self.token_ids[target_pos]
+        valid[:length] = True
+        return distant_bpe, distant_vq, recent_bpe, recent_vq, vq_y, bpe_y, valid
 
 
 class TwoStreamLocalDataset(Dataset):
@@ -253,12 +339,18 @@ class FeatureCatMultiHopDataset(Dataset):
 
 
 class RecentBPEWindow(nn.Module):
-    """Process distant representation + ten recent BPEs as 11 tokens."""
-    def __init__(self, token_vocab_size, local_bpe_tokens, d_model,
-                 n_heads, dropout, n_layers=2):
+    """Fuse distant state with ten recent BPEs and optional staircase VQWs."""
+    def __init__(self, token_vocab_size, input_vq_vocab_size, local_bpe_tokens,
+                 d_model, n_heads, dropout, n_layers=2, use_vqw=True):
         super().__init__()
         self.local_bpe_tokens = int(local_bpe_tokens)
+        self.use_vqw = bool(use_vqw)
+        self.input_vq_pad_id = int(input_vq_vocab_size)
         self.bpe_embedding = nn.Embedding(token_vocab_size, d_model)
+        self.recent_vq_embedding = nn.Embedding(
+            input_vq_vocab_size + 1, d_model, padding_idx=self.input_vq_pad_id
+        )
+        self.recent_fusion = nn.Linear(2 * d_model, d_model)
         self.relative_pos = nn.Embedding(local_bpe_tokens + 1, d_model)
         layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
@@ -268,9 +360,14 @@ class RecentBPEWindow(nn.Module):
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, distant_h, bpe_gap):
+    def forward(self, distant_h, bpe_gap, recent_vq):
         batch, length, _ = distant_h.shape
-        recent = self.bpe_embedding(bpe_gap)
+        bpe_h = self.bpe_embedding(bpe_gap)
+        if self.use_vqw:
+            vq_h = self.recent_vq_embedding(recent_vq)
+        else:
+            vq_h = torch.zeros_like(bpe_h)
+        recent = F.gelu(self.recent_fusion(torch.cat([bpe_h, vq_h], dim=-1)))
         window = torch.cat([distant_h.unsqueeze(2), recent], dim=2)
         rel = torch.arange(
             self.local_bpe_tokens + 1, device=bpe_gap.device
@@ -476,39 +573,41 @@ class LocalBPEDirectAR(nn.Module):
 
 
 class GlobalVQWAR(nn.Module):
-    def __init__(self, vq_vocab_size, token_vocab_size, local_bpe_tokens=10,
+    def __init__(self, input_vq_vocab_size, output_vq_vocab_size,
+                 token_vocab_size, local_bpe_tokens=10,
                  d_model=256, n_layers=6, n_heads=8,
                  dropout=0.1, max_len=255, window_layers=2,
                  use_vqw=True):
         super().__init__()
         self.use_vqw = bool(use_vqw)
-        self.vq_vocab_size = int(vq_vocab_size)
-        self.vq_pad_id = self.vq_vocab_size
+        self.input_vq_vocab_size = int(input_vq_vocab_size)
+        self.output_vq_vocab_size = int(output_vq_vocab_size)
+        self.input_vq_pad_id = self.input_vq_vocab_size
         self.vq_embedding = nn.Embedding(
-            self.vq_vocab_size + 1, d_model, padding_idx=self.vq_pad_id
+            self.input_vq_vocab_size + 1, d_model,
+            padding_idx=self.input_vq_pad_id
         )
-        # Matched ablation input: retain the distant BPE at t-11 while
-        # removing only its local-VQW subtype information.
+        # Matched ablation keeps the distant BPE position but removes all VQW.
         self.distant_bpe_embedding = nn.Embedding(token_vocab_size, d_model)
         self.backbone = ARBackbone(
             d_model, n_layers, n_heads, dropout, max_len
         )
         self.window = RecentBPEWindow(
-            token_vocab_size, local_bpe_tokens, d_model,
-            n_heads, dropout, window_layers
+            token_vocab_size, self.input_vq_vocab_size, local_bpe_tokens,
+            d_model, n_heads, dropout, window_layers, use_vqw=self.use_vqw
         )
-        output_size = self.vq_vocab_size if self.use_vqw else token_vocab_size
+        output_size = self.output_vq_vocab_size if self.use_vqw else token_vocab_size
         self.output_head = nn.Linear(d_model, output_size)
 
-    def forward(self, distant_bpe, vq_in, bpe_gap,
+    def forward(self, distant_bpe, distant_vq, bpe_gap, recent_vq,
                 key_padding_mask=None):
         source_h = (
-            self.vq_embedding(vq_in)
+            self.vq_embedding(distant_vq)
             if self.use_vqw else
             self.distant_bpe_embedding(distant_bpe)
         )
         h = self.backbone(source_h, key_padding_mask)
-        h = self.window(h, bpe_gap)
+        h = self.window(h, bpe_gap, recent_vq)
         return self.output_head(h)
 
 
@@ -525,6 +624,25 @@ def make_pair_global_ids(token_ids, local_vq_ids, local_vq_vocab_size):
     )
     global_to_local = unique_keys.remainder(int(local_vq_vocab_size))
     return global_ids.long(), global_to_bpe.long(), global_to_local.long()
+
+
+
+def make_multihop_input_global_ids(token_ids, vq_ids_by_hop, local_sizes):
+    """Compact IDs for observed (HOP, BPE, local-VQW) triples."""
+    token_ids = token_ids.long().reshape(-1)
+    vq_ids_by_hop = vq_ids_by_hop.long()
+    if vq_ids_by_hop.shape != (10, token_ids.numel()):
+        raise ValueError("vq_ids_by_hop must have shape [10, N]")
+    max_local = int(max(local_sizes))
+    token_vocab = int(token_ids.max()) + 1
+    keys = []
+    for h in range(10):
+        key = ((h * token_vocab + token_ids) * max_local
+               + vq_ids_by_hop[h])
+        keys.append(key)
+    flat = torch.cat(keys, dim=0)
+    _unique, inv = torch.unique(flat, sorted=True, return_inverse=True)
+    return inv.reshape(10, -1).long(), int(_unique.numel())
 
 
 def accumulate_topk(logits, targets, k=5):
@@ -581,13 +699,14 @@ def evaluate_global(model, global_to_bpe, bpe_to_global, loader, device):
     bpe_to_global = bpe_to_global.to(device)
     total = dict(count=0, vq_loss=0.0, vq_top1=0, vq_top5=0,
                  bpe_loss=0.0, bpe_top1=0)
-    for distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid in tqdm(
+    for distant_bpe, distant_vq, bpe_gap, recent_vq, vq_y, bpe_y, valid in tqdm(
         loader, desc="[eval global]", leave=False
     ):
         distant_bpe = distant_bpe.to(device)
-        vq_in, vq_y = vq_in.to(device), vq_y.to(device)
-        bpe_gap, bpe_y, valid = bpe_gap.to(device), bpe_y.to(device), valid.to(device)
-        logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
+        distant_vq, vq_y = distant_vq.to(device), vq_y.to(device)
+        bpe_gap, recent_vq = bpe_gap.to(device), recent_vq.to(device)
+        bpe_y, valid = bpe_y.to(device), valid.to(device)
+        logits = model(distant_bpe, distant_vq, bpe_gap, recent_vq, ~valid)
         mask = vq_y.ne(-100)
         vl, vt, bt = logits[mask], vq_y[mask], bpe_y[mask]
         n = int(vt.numel()); total["count"] += n
@@ -630,15 +749,15 @@ def evaluate_global_bpe(model, loader, device):
     """Evaluate the --disable_vqw global-mode ablation as direct BPE AR."""
     model.eval()
     total = dict(count=0, bpe_loss=0.0, bpe_top1=0, bpe_top5=0)
-    for distant_bpe, vq_in, bpe_gap, _vq_y, bpe_y, valid in tqdm(
+    for distant_bpe, distant_vq, bpe_gap, recent_vq, _vq_y, bpe_y, valid in tqdm(
         loader, desc="[eval global BPE]", leave=False
     ):
         distant_bpe = distant_bpe.to(device)
-        vq_in = vq_in.to(device)
-        bpe_gap = bpe_gap.to(device)
+        distant_vq = distant_vq.to(device)
+        bpe_gap, recent_vq = bpe_gap.to(device), recent_vq.to(device)
         bpe_y = bpe_y.to(device)
         valid = valid.to(device)
-        logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
+        logits = model(distant_bpe, distant_vq, bpe_gap, recent_vq, ~valid)
         mask = bpe_y.ne(-100)
         pred, target = logits[mask], bpe_y[mask]
         n = int(target.numel())
@@ -701,51 +820,36 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {device}")
 
-    if args.mode == "local_bpe_direct":
-        if not args.data_hops or not args.codebook_hops:
-            ap.error("local_bpe_direct multi-HOP requires --data_hops H1 ... H10 and --codebook_hops C1 ... C10")
-        hop_data = [torch.load(p, map_location="cpu", weights_only=False) for p in args.data_hops]
-        hop_codebooks = [torch.load(p, map_location="cpu", weights_only=False) for p in args.codebook_hops]
-        for expected, (d, c) in enumerate(zip(hop_data, hop_codebooks), 1):
-            if checkpoint_hop(d) != expected or checkpoint_hop(c) != expected:
-                raise ValueError(
-                    f"HOP order mismatch at slot {expected}: data={checkpoint_hop(d)} codebook={checkpoint_hop(c)}"
-                )
-        data, codebook = hop_data[-1], hop_codebooks[-1]
-        for key in ("samples", "token_ids_flat", "vq_ids_flat"):
-            if key not in data:
-                raise KeyError(f"data missing {key}")
-        token_ids = data["token_ids_flat"].long().reshape(-1)
-        for h, d in enumerate(hop_data, 1):
-            if not torch.equal(d["token_ids_flat"].long().reshape(-1), token_ids):
-                raise ValueError(f"token_ids differ at HOP{h}")
-        local_sizes = [int(d.get("vq_vocab_size", c.get("max_local_clusters", -1)))
-                       for d, c in zip(hop_data, hop_codebooks)]
-        if min(local_sizes) < 1:
-            raise ValueError(f"invalid local VQ vocab sizes: {local_sizes}")
-        # Shared embedding table; IDs remain HOP-specific through hop_embedding.
-        local_vq_vocab_size_all = max(local_sizes)
-        vq_ids_by_hop = torch.stack([d["vq_ids_flat"].long().reshape(-1) for d in hop_data], dim=0)
-        for h, (ids, size) in enumerate(zip(vq_ids_by_hop, local_sizes), 1):
-            if int(ids.min()) < 0 or int(ids.max()) >= size:
-                raise ValueError(f"local VQ ID out of range at HOP{h}")
-        vq_ids = vq_ids_by_hop[-1]
-    else:
-        if not args.data or not args.codebook:
-            ap.error("global_vqwar requires --data and --codebook (HOP10)")
-        data = torch.load(args.data, map_location="cpu", weights_only=False)
-        codebook = torch.load(args.codebook, map_location="cpu", weights_only=False)
-        if checkpoint_hop(data) != 10 or checkpoint_hop(codebook) != 10:
+    # Both modes consume HOP1..10 data/codebooks in the same order.
+    if not args.data_hops or not args.codebook_hops:
+        ap.error("both modes require --data_hops H1 ... H10 and --codebook_hops C1 ... C10")
+    hop_data = [torch.load(p, map_location="cpu", weights_only=False) for p in args.data_hops]
+    hop_codebooks = [torch.load(p, map_location="cpu", weights_only=False) for p in args.codebook_hops]
+    for expected, (d, c) in enumerate(zip(hop_data, hop_codebooks), 1):
+        if checkpoint_hop(d) != expected or checkpoint_hop(c) != expected:
             raise ValueError(
-                f"global_vqwar HOP10 required: data={checkpoint_hop(data)}, codebook={checkpoint_hop(codebook)}"
+                f"HOP order mismatch at slot {expected}: data={checkpoint_hop(d)} codebook={checkpoint_hop(c)}"
             )
-        for key in ("samples", "token_ids_flat", "vq_ids_flat"):
-            if key not in data:
-                raise KeyError(f"data missing {key}")
-        token_ids = data["token_ids_flat"].long().reshape(-1)
-        vq_ids = data["vq_ids_flat"].long().reshape(-1)
-        if token_ids.numel() != vq_ids.numel():
-            raise ValueError("token/VQ length mismatch")
+    data, codebook = hop_data[-1], hop_codebooks[-1]
+    for key in ("samples", "token_ids_flat", "vq_ids_flat"):
+        if key not in data:
+            raise KeyError(f"data missing {key}")
+    token_ids = data["token_ids_flat"].long().reshape(-1)
+    for h, d in enumerate(hop_data, 1):
+        if not torch.equal(d["token_ids_flat"].long().reshape(-1), token_ids):
+            raise ValueError(f"token_ids differ at HOP{h}")
+    local_sizes = [int(d.get("vq_vocab_size", c.get("max_local_clusters", -1)))
+                   for d, c in zip(hop_data, hop_codebooks)]
+    if min(local_sizes) < 1:
+        raise ValueError(f"invalid local VQ vocab sizes: {local_sizes}")
+    local_vq_vocab_size_all = max(local_sizes)
+    vq_ids_by_hop = torch.stack(
+        [d["vq_ids_flat"].long().reshape(-1) for d in hop_data], dim=0
+    )
+    for h, (ids, size) in enumerate(zip(vq_ids_by_hop, local_sizes), 1):
+        if int(ids.min()) < 0 or int(ids.max()) >= size:
+            raise ValueError(f"local VQ ID out of range at HOP{h}")
+    vq_ids = vq_ids_by_hop[-1]
 
     token_vocab_size = int(codebook["model"]["tok_emb.weight"].shape[0])
 
@@ -771,51 +875,45 @@ def main():
             "multihop1to10_staircase_conditioned_adapter_gated_cat_fusion"
         )
     else:
-        if codebook.get("partition_type") != "bpe_local_kmeans":
-            raise ValueError("global_vqwar requires bpe_local_kmeans codebook")
-        local_vq_vocab_size = int(data.get(
-            "vq_vocab_size", codebook.get("max_local_clusters", -1)
-        ))
-        if local_vq_vocab_size < 1:
-            raise ValueError("invalid local vq_vocab_size")
-        if int(vq_ids.min()) < 0 or int(vq_ids.max()) >= local_vq_vocab_size:
-            raise ValueError("local VQ ID out of range")
-        if args.disable_vqw:
-            # Keep the original local IDs only as an ignored dataset field.
-            # No pair-global vocabulary or reverse mapping is constructed.
-            vq_vocab_size = local_vq_vocab_size
-        else:
-            vq_ids, global_to_bpe, global_to_local = make_pair_global_ids(
-                token_ids, vq_ids, local_vq_vocab_size
-            )
-            vq_vocab_size = int(global_to_bpe.numel())
+        for h, c in enumerate(hop_codebooks, 1):
+            if c.get("partition_type") != "bpe_local_kmeans":
+                raise ValueError(f"global_vqwar requires bpe_local_kmeans at HOP{h}")
 
-            # Reverse table used to sum pair-ID probabilities by BPE.
-            counts = torch.bincount(
-                global_to_bpe, minlength=token_vocab_size
-            )
-            max_pairs_per_bpe = int(counts.max())
-            bpe_to_global = torch.full(
-                (token_vocab_size, max_pairs_per_bpe), -1,
-                dtype=torch.long
-            )
-            cursor = torch.zeros(token_vocab_size, dtype=torch.long)
-            for gid, bpe in enumerate(global_to_bpe.tolist()):
-                column = int(cursor[bpe])
-                bpe_to_global[bpe, column] = gid
-                cursor[bpe] += 1
+        # Input vocabulary: observed (HOP, BPE, local-VQW) triples across HOP1..10.
+        global_input_ids_by_hop, input_vq_vocab_size = make_multihop_input_global_ids(
+            token_ids, vq_ids_by_hop, local_sizes
+        )
+
+        # Output vocabulary stays HOP10 pair-global for comparability with the
+        # original global_vqwar objective and compact BPE marginalization.
+        hop10_target_ids, global_to_bpe, global_to_local = make_pair_global_ids(
+            token_ids, vq_ids_by_hop[9], local_sizes[9]
+        )
+        output_vq_vocab_size = int(global_to_bpe.numel())
+        vq_vocab_size = output_vq_vocab_size
+
+        counts = torch.bincount(global_to_bpe, minlength=token_vocab_size)
+        max_pairs_per_bpe = int(counts.max())
+        bpe_to_global = torch.full(
+            (token_vocab_size, max_pairs_per_bpe), -1, dtype=torch.long
+        )
+        cursor = torch.zeros(token_vocab_size, dtype=torch.long)
+        for gid, bpe in enumerate(global_to_bpe.tolist()):
+            column = int(cursor[bpe])
+            bpe_to_global[bpe, column] = gid
+            cursor[bpe] += 1
 
         model = GlobalVQWAR(
-            vq_vocab_size, token_vocab_size, args.local_bpe_tokens,
-            args.d_model, args.n_layers, args.n_heads, args.dropout,
-            args.max_len, args.window_layers,
+            input_vq_vocab_size, output_vq_vocab_size, token_vocab_size,
+            args.local_bpe_tokens, args.d_model, args.n_layers, args.n_heads,
+            args.dropout, args.max_len, args.window_layers,
             use_vqw=not args.disable_vqw,
         ).to(device)
         selection_metric = "bpe_ppl"
         architecture = (
-            "matched_global_bpe_tminus11_11token_window_bpe_head"
+            "matched_global_bpe_samidare_window_bpe_head"
             if args.disable_vqw else
-            "pair_global_vqwar_11token_window_bpe_aux"
+            "multihop1to10_samidare_global_vqwar_hop10_target"
         )
 
     samples = list(data["samples"])
@@ -828,9 +926,9 @@ def main():
             max_hop=10, max_len=args.max_len, train=(i == 0)
         ) for i, split in enumerate(splits)]
     else:
-        datasets = [GapPairDataset(
-            split, token_ids, vq_ids, vq_vocab_size, args.gap,
-            args.local_bpe_tokens, args.max_len
+        datasets = [SamidareGlobalDataset(
+            split, token_ids, global_input_ids_by_hop, hop10_target_ids,
+            input_vq_vocab_size, args.gap, args.local_bpe_tokens, args.max_len
         ) for split in splits]
     loaders = [DataLoader(
         ds, batch_size=args.batch_size, shuffle=(i == 0), num_workers=4,
@@ -855,9 +953,10 @@ def main():
         print(f"[ablation] use_vqw={not args.disable_vqw}")
         print(f"[alpha] init={args.vqw_alpha_init:g}; learned sigmoid scalar")
     else:
-        print(f"[window] layers={args.window_layers}; no recent-BPE pooling")
+        print(f"[window] layers={args.window_layers}; samidare recent BPE+VQW window")
+        print("[alignment] t-11:HOP10, t-10:HOP9, ..., t-2:HOP1, t-1:none")
         print(f"[ablation] use_vqw={not args.disable_vqw}; "
-              f"distant_input={'pair-global VQW' if not args.disable_vqw else 'BPE'}")
+              f"distant_input={'(HOP,BPE,local) global VQW' if not args.disable_vqw else 'BPE'}")
     if args.mode == "global_vqwar":
         if args.disable_vqw:
             print("[target] BPE; [loss] bpe_ce")
@@ -877,14 +976,15 @@ def main():
                 target = target.to(device)
                 logits = model(bpe, local_vq, hop_used, valid, vqw_available)
             else:
-                distant_bpe, vq_in, bpe_gap, vq_y, bpe_y, valid = batch
+                distant_bpe, distant_vq, bpe_gap, recent_vq, vq_y, bpe_y, valid = batch
                 distant_bpe = distant_bpe.to(device)
-                vq_in, bpe_gap = vq_in.to(device), bpe_gap.to(device)
+                distant_vq = distant_vq.to(device)
+                bpe_gap, recent_vq = bpe_gap.to(device), recent_vq.to(device)
                 valid = valid.to(device)
                 pair_target = vq_y.to(device)
                 bpe_target = bpe_y.to(device)
                 target = bpe_target if args.disable_vqw else pair_target
-                logits = model(distant_bpe, vq_in, bpe_gap, ~valid)
+                logits = model(distant_bpe, distant_vq, bpe_gap, recent_vq, ~valid)
             pair_or_bpe_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), target.reshape(-1),
                 ignore_index=-100
@@ -934,13 +1034,15 @@ def main():
             "model": model.state_dict(), "args": vars(args), "history": history,
             "mode": args.mode, "architecture": architecture,
             "vq_vocab_size": vq_vocab_size, "token_vocab_size": token_vocab_size,
+            "input_vq_vocab_size": (input_vq_vocab_size if args.mode == "global_vqwar" else None),
+            "samidare_hops": list(range(1, 11)),
             "pair_global_id": (
                 args.mode == "global_vqwar" and not args.disable_vqw
             ),
             "pair_global_role": (
                 "none_local_vqw_input" if args.mode == "local_bpe_direct"
                 else (
-                    "ar_input_and_target"
+                    "samidare_hop1to10_input_hop10_target"
                     if not args.disable_vqw else
                     "disabled_bpe_input_and_target"
                 )
@@ -963,3 +1065,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
