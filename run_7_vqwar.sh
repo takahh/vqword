@@ -18,8 +18,6 @@ FTP_HOST="${FTP_HOST:-ftp.lolipop.jp}"
 
 if [ "$#" -ne 1 ]; then
   echo "Usage: $0 {local_bpe_direct|global_vqwar}"
-  echo "  $0 local_bpe_direct"
-  echo "  $0 global_vqwar"
   exit 1
 fi
 
@@ -91,90 +89,106 @@ LFTP
 }
 
 # ============================================================
-# HOP1..10 samidare inputs
-#
-# For prediction target t:
-#   t-11 and older : HOP10
-#   t-10           : HOP9
-#   ...
-#   t-3            : HOP2
-#   t-2            : HOP1
-#   t-1            : no VQW
-#
-# Both local_bpe_direct and global_vqwar use all ten HOPs.
+# TinyStories HOP1..10 inputs
 # ============================================================
 
 DATA_PREFIX="tinystories_vqword_bpe50257_tiedgnn_separatehop"
 DATA_SUFFIX="_center0_localbpe5_seed0_ids.pt"
 
-CB_PREFIX="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0"
-CB_SUFFIX="_ids.pt"
-
 DATA_HOPS=()
-CODEBOOK_HOPS=()
 
 for HOP in $(seq 1 10); do
   HOP2=$(printf "%02d" "${HOP}")
-  HOP3=$(printf "%03d" "${HOP}")
-
   DATA_FILE="${DATA_PREFIX}${HOP2}${DATA_SUFFIX}"
   DATA_PATH="/vqword/${DATA_FILE}"
 
-  # Each HOP-specific WikiText file contains the metadata/codebook needed
-  # for that HOP.  Do not use the old single HOP10 file or the merged ~2GB
-  # checkpoint for the multi-HOP AR input.
-  CB_FILE="${CB_PREFIX}_hop_${HOP3}${CB_SUFFIX}"
-  CB_PATH="/vqword/${CB_FILE}"
-
   download_file "${DATA_FILE}" "${DATA_PATH}"
-  download_file "${CB_FILE}" "${CB_PATH}"
-
   DATA_HOPS+=("${DATA_PATH}")
-  CODEBOOK_HOPS+=("${CB_PATH}")
 done
 
 # ============================================================
-# Verify all ten HOPs before starting the long AR run.
+# Shared model: rebuild once from WikiText HOP1 part if needed.
 # ============================================================
-python - "${AR_MODE}" "${DATA_HOPS[@]}" -- "${CODEBOOK_HOPS[@]}" <<'PY'
+
+CKPT_PREFIX="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0"
+HOP1_FILE="${CKPT_PREFIX}_hop_001_ids.pt"
+HOP1_PATH="/vqword/${HOP1_FILE}"
+
+CODEBOOK_FILE="${CKPT_PREFIX}_shared_model.pt"
+CODEBOOK_PATH="/vqword/${CODEBOOK_FILE}"
+
+if [ ! -s "${CODEBOOK_PATH}" ]; then
+  download_file "${HOP1_FILE}" "${HOP1_PATH}"
+
+  if [ -f /vqword/rebuild_shared_model_from_hop.py ]; then
+    REBUILD_SCRIPT="/vqword/rebuild_shared_model_from_hop.py"
+  elif [ -f /vqword/rebuild_shared_gnn.py ]; then
+    REBUILD_SCRIPT="/vqword/rebuild_shared_gnn.py"
+  else
+    echo "[error] rebuild helper not found"
+    exit 1
+  fi
+
+  echo "============================================================"
+  echo "[rebuild] shared model from WikiText HOP1"
+  echo "source            = ${HOP1_PATH}"
+  echo "output            = ${CODEBOOK_PATH}"
+  echo "============================================================"
+
+  python "${REBUILD_SCRIPT}" \
+    --hop_file "${HOP1_PATH}" \
+    --out "${CODEBOOK_PATH}"
+
+  test -s "${CODEBOOK_PATH}" || {
+    echo "[error] shared-model rebuild failed"
+    exit 1
+  }
+
+  rm -f "${HOP1_PATH}"
+else
+  echo "[reuse] ${CODEBOOK_PATH}"
+fi
+
+# ============================================================
+# Verification: ten TinyStories HOPs + ONE shared model
+# ============================================================
+
+python - "${AR_MODE}" "${CODEBOOK_PATH}" "${DATA_HOPS[@]}" <<'PY'
 import sys
 import torch
 
 mode = sys.argv[1]
-sep = sys.argv.index("--")
-data_paths = sys.argv[2:sep]
-codebook_paths = sys.argv[sep + 1:]
+codebook_path = sys.argv[2]
+data_paths = sys.argv[3:]
 
-if len(data_paths) != 10 or len(codebook_paths) != 10:
+if len(data_paths) != 10:
+    raise ValueError(f"expected 10 HOP data files, got {len(data_paths)}")
+
+cb = torch.load(codebook_path, map_location="cpu", weights_only=False)
+
+if cb.get("partition_type") != "bpe_local_kmeans":
     raise ValueError(
-        f"expected 10 data and 10 codebook files, "
-        f"got {len(data_paths)} and {len(codebook_paths)}"
+        f"{mode} requires shared model partition_type='bpe_local_kmeans', "
+        f"got {cb.get('partition_type')!r}"
     )
+
+cb_hops = cb.get("hops")
+if cb_hops is not None:
+    cb_hops = [int(x) for x in cb_hops]
+    if cb_hops != list(range(1, 11)):
+        raise ValueError(f"shared model hops mismatch: {cb_hops}")
 
 reference_tokens = None
 reference_samples = None
 local_sizes = []
-rows = []
 
-for expected_hop, (data_path, cb_path) in enumerate(
-    zip(data_paths, codebook_paths), 1
-):
+for expected_hop, data_path in enumerate(data_paths, 1):
     data = torch.load(data_path, map_location="cpu", weights_only=False)
-    cb = torch.load(cb_path, map_location="cpu", weights_only=False)
 
-    hop_data = int(data.get("hop", data.get("args", {}).get("hop", -1)))
-    hop_cb = int(cb.get("hop", cb.get("args", {}).get("hop", -1)))
-
-    if hop_data != expected_hop or hop_cb != expected_hop:
+    hop = int(data.get("hop", data.get("args", {}).get("hop", -1)))
+    if hop != expected_hop:
         raise ValueError(
-            f"HOP{expected_hop} mismatch: "
-            f"data={hop_data}, codebook={hop_cb}"
-        )
-
-    if cb.get("partition_type") != "bpe_local_kmeans":
-        raise ValueError(
-            f"HOP{expected_hop}: {mode} requires bpe_local_kmeans, "
-            f"got {cb.get('partition_type')!r}"
+            f"HOP order mismatch: slot={expected_hop} data_hop={hop}"
         )
 
     for key in ("samples", "token_ids_flat", "vq_ids_flat"):
@@ -196,45 +210,38 @@ for expected_hop, (data_path, cb_path) in enumerate(
         if len(data["samples"]) != reference_samples:
             raise ValueError(f"HOP{expected_hop}: sample count differs from HOP1")
 
-    local_vq_size = int(
+    local_size = int(
         data.get("vq_vocab_size", cb.get("max_local_clusters", -1))
     )
-    if local_vq_size < 1:
-        raise ValueError(
-            f"HOP{expected_hop}: invalid local VQ vocabulary size "
-            f"{local_vq_size}"
-        )
+    if local_size < 1:
+        raise ValueError(f"HOP{expected_hop}: invalid local VQ size")
 
     vmin = int(local_vq.min())
     vmax = int(local_vq.max())
-    if vmin < 0 or vmax >= local_vq_size:
+    if vmin < 0 or vmax >= local_size:
         raise ValueError(
-            f"HOP{expected_hop}: local VQ IDs out of range "
-            f"{vmin}..{vmax}, vocab={local_vq_size}"
+            f"HOP{expected_hop}: local VQ range {vmin}..{vmax}, vocab={local_size}"
         )
 
-    local_sizes.append(local_vq_size)
-    rows.append(
-        f"HOP{expected_hop:02d}: "
+    local_sizes.append(local_size)
+
+    print(
+        f"[HOP{expected_hop:02d}] "
         f"tokens={tokens.numel():,} "
         f"samples={len(data['samples']):,} "
-        f"local_vq_vocab={local_vq_size} "
+        f"local_vq_vocab={local_size} "
         f"range={vmin}..{vmax}"
     )
 
-print(f"[verification OK] mode={mode}; HOP1..10 aligned")
-for row in rows:
-    print("  " + row)
+print(f"[verification OK] mode={mode}; HOP1..10 + one shared model")
 
 if mode == "global_vqwar":
-    # Output target remains HOP10 (BPE, local-VQW) pair-global.
-    hop10_data = torch.load(data_paths[9], map_location="cpu", weights_only=False)
-    tokens = hop10_data["token_ids_flat"].long().reshape(-1)
-    local_vq = hop10_data["vq_ids_flat"].long().reshape(-1)
-    local_vq_size = local_sizes[9]
-    pair_keys = tokens * local_vq_size + local_vq
-    pair_global_vocab = int(torch.unique(pair_keys).numel())
-    print(f"  HOP10 target pair_global_vocab={pair_global_vocab:,}")
+    d10 = torch.load(data_paths[9], map_location="cpu", weights_only=False)
+    tokens = d10["token_ids_flat"].long().reshape(-1)
+    local_vq = d10["vq_ids_flat"].long().reshape(-1)
+    size = local_sizes[9]
+    pair_vocab = int(torch.unique(tokens * size + local_vq).numel())
+    print(f"[global target] HOP10 pair_global_vocab={pair_vocab:,}")
 PY
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -247,12 +254,10 @@ echo "============================================================"
 echo "mode              = ${AR_MODE}"
 echo "HOP input         = HOP1..10 samidare"
 echo "alignment         = <=t-11:HOP10, t-10:HOP9, ..., t-2:HOP1, t-1:none"
+echo "shared model      = ${CODEBOOK_PATH}"
 echo "data HOP1         = ${DATA_HOPS[0]}"
 echo "data HOP10        = ${DATA_HOPS[9]}"
-echo "codebook HOP1     = ${CODEBOOK_HOPS[0]}"
-echo "codebook HOP10    = ${CODEBOOK_HOPS[9]}"
 echo "epochs/batch/lr   = ${EPOCHS}/${BATCH_SIZE}/${LR}"
-echo "VQW alpha init    = ${VQW_ALPHA_INIT}"
 echo "disable VQW       = ${DISABLE_VQW}"
 echo "run               = ${RUN}"
 echo "============================================================"
@@ -262,7 +267,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python "${AR_SCRIPT}" \
   --mode "${AR_MODE}" \
   --data_hops "${DATA_HOPS[@]}" \
-  --codebook_hops "${CODEBOOK_HOPS[@]}" \
+  --codebook "${CODEBOOK_PATH}" \
   --gap "${VQ_GAP}" \
   --local_bpe_tokens "${LOCAL_BPE_TOKENS}" \
   --mixture_topk "${MIXTURE_TOPK}" \
@@ -281,9 +286,9 @@ python "${AR_SCRIPT}" \
   "${EXTRA_ARGS[@]}" \
   2>&1 | tee "${LOG_PATH}"
 
-for path_to_check in "${FINAL_PATH}" "${BEST_PATH}" "${LOG_PATH}"; do
-  test -s "${path_to_check}" || {
-    echo "[error] missing ${path_to_check}"
+for p in "${FINAL_PATH}" "${BEST_PATH}" "${LOG_PATH}"; do
+  test -s "${p}" || {
+    echo "[error] missing ${p}"
     exit 1
   }
 done
