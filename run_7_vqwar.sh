@@ -26,13 +26,13 @@ fi
 AR_MODE="$1"
 case "${AR_MODE}" in
   local_bpe_direct)
-    DATA_FILE="tinystories_vqword_bpe50257_bilateral10_center0_localbpe5_seed0_ids.pt"
-    CODEBOOK_FILE="wikitext103_vqword_bpe50257_bilateral10_center0_localbpe5_seed0.pt"
+    DATA_FILE="tinystories_vqword_bpe50257_tiedgnn_separatehop10_center0_localbpe5_seed0_ids.pt"
+    CODEBOOK_FILE="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0.pt"
     VQ_LABEL="localbpe5_center0"
     ;;
   global_vqwar)
-    DATA_FILE="tinystories_vqword_bpe50257_bilateral10_center0_localbpe5_seed0_ids.pt"
-    CODEBOOK_FILE="wikitext103_vqword_bpe50257_bilateral10_center0_localbpe5_seed0.pt"
+    DATA_FILE="tinystories_vqword_bpe50257_tiedgnn_separatehop10_center0_localbpe5_seed0_ids.pt"
+    CODEBOOK_FILE="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0.pt"
     VQ_LABEL="pairglobal_localbpe5_center0"
     ;;
   *)
