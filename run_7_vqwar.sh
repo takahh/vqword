@@ -27,12 +27,12 @@ AR_MODE="$1"
 case "${AR_MODE}" in
   local_bpe_direct)
     DATA_FILE="tinystories_vqword_bpe50257_tiedgnn_separatehop10_center0_localbpe5_seed0_ids.pt"
-    CODEBOOK_FILE="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0.pt"
+    CODEBOOK_FILE="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0_shared_model.pt"
     VQ_LABEL="localbpe5_center0"
     ;;
   global_vqwar)
     DATA_FILE="tinystories_vqword_bpe50257_tiedgnn_separatehop10_center0_localbpe5_seed0_ids.pt"
-    CODEBOOK_FILE="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0.pt"
+    CODEBOOK_FILE="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0_shared_model.pt"
     VQ_LABEL="pairglobal_localbpe5_center0"
     ;;
   *)
@@ -88,7 +88,48 @@ LFTP
   test -s "${local_path}" || { echo "[error] download failed"; exit 1; }
 }
 
-download_file "${CODEBOOK_FILE}" "/vqword/${CODEBOOK_FILE}"
+# ============================================================
+# Rebuild the shared tied-GNN model from the HOP1 part.
+# The large merged ~2GB checkpoint is intentionally not downloaded.
+# ============================================================
+CKPT_PREFIX="wikitext103_vqword_bpe50257_tiedgnn_separatehop01to10_center0_localbpe5_seed0"
+HOP1_FILE="${CKPT_PREFIX}_hop_001_ids.pt"
+HOP1_PATH="/vqword/${HOP1_FILE}"
+CODEBOOK_PATH="/vqword/${CODEBOOK_FILE}"
+
+if [ -f /vqword/rebuild_shared_model_from_hop.py ]; then
+  REBUILD_SCRIPT="/vqword/rebuild_shared_model_from_hop.py"
+elif [ -f /vqword/rebuild_shared_gnn.py ]; then
+  REBUILD_SCRIPT="/vqword/rebuild_shared_gnn.py"
+else
+  echo "[error] rebuild helper not found"
+  echo "        expected /vqword/rebuild_shared_model_from_hop.py"
+  echo "        or       /vqword/rebuild_shared_gnn.py"
+  exit 1
+fi
+
+download_file "${HOP1_FILE}" "${HOP1_PATH}"
+
+echo "============================================================"
+echo "[rebuild] shared tied-GNN model from HOP1"
+echo "helper            = ${REBUILD_SCRIPT}"
+echo "hop source        = ${HOP1_PATH}"
+echo "codebook output   = ${CODEBOOK_PATH}"
+echo "============================================================"
+
+rm -f "${CODEBOOK_PATH}"
+python "${REBUILD_SCRIPT}" \
+  --hop_file "${HOP1_PATH}" \
+  --out "${CODEBOOK_PATH}"
+
+test -s "${CODEBOOK_PATH}" || {
+  echo "[error] shared-model rebuild failed: ${CODEBOOK_PATH}"
+  exit 1
+}
+
+# HOP1 is no longer needed after reconstruction.
+rm -f "${HOP1_PATH}"
+
 download_file "${DATA_FILE}" "/vqword/${DATA_FILE}"
 
 python - "${AR_MODE}" "/vqword/${DATA_FILE}" "/vqword/${CODEBOOK_FILE}" <<'PY'
