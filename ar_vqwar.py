@@ -786,10 +786,8 @@ def format_metrics(prefix, metrics):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", required=True, choices=MODES)
-    ap.add_argument("--data")
-    ap.add_argument("--codebook")
-    ap.add_argument("--data_hops", nargs=10, metavar="HOP_PT")
-    ap.add_argument("--codebook_hops", nargs=10, metavar="HOP_CB")
+    ap.add_argument("--codebook", required=True)
+    ap.add_argument("--data_hops", nargs=10, metavar="HOP_PT", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--gap", type=int, default=11)
     ap.add_argument("--local_bpe_tokens", type=int, default=10)
@@ -820,28 +818,53 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {device}")
 
-    # Both modes consume HOP1..10 data/codebooks in the same order.
-    if not args.data_hops or not args.codebook_hops:
-        ap.error("both modes require --data_hops H1 ... H10 and --codebook_hops C1 ... C10")
+    # Both modes consume HOP1..10 TinyStories data in the same order.
+    # One shared tied-GNN model provides the common model/codebook metadata.
     hop_data = [torch.load(p, map_location="cpu", weights_only=False) for p in args.data_hops]
-    hop_codebooks = [torch.load(p, map_location="cpu", weights_only=False) for p in args.codebook_hops]
-    for expected, (d, c) in enumerate(zip(hop_data, hop_codebooks), 1):
-        if checkpoint_hop(d) != expected or checkpoint_hop(c) != expected:
+    codebook = torch.load(args.codebook, map_location="cpu", weights_only=False)
+
+    for expected, d in enumerate(hop_data, 1):
+        if checkpoint_hop(d) != expected:
             raise ValueError(
-                f"HOP order mismatch at slot {expected}: data={checkpoint_hop(d)} codebook={checkpoint_hop(c)}"
+                f"HOP order mismatch at slot {expected}: data={checkpoint_hop(d)}"
             )
-    data, codebook = hop_data[-1], hop_codebooks[-1]
+
+    shared_hops = codebook.get("hops")
+    if shared_hops is not None:
+        shared_hops = [int(h) for h in shared_hops]
+        if shared_hops != list(range(1, 11)):
+            raise ValueError(f"shared model must contain HOP1..10, got {shared_hops}")
+
+    if codebook.get("partition_type") != "bpe_local_kmeans":
+        raise ValueError(
+            f"{args.mode} requires bpe_local_kmeans shared model, "
+            f"got {codebook.get('partition_type')!r}"
+        )
+
+    data = hop_data[-1]
     for key in ("samples", "token_ids_flat", "vq_ids_flat"):
         if key not in data:
             raise KeyError(f"data missing {key}")
+
     token_ids = data["token_ids_flat"].long().reshape(-1)
+
     for h, d in enumerate(hop_data, 1):
+        for key in ("samples", "token_ids_flat", "vq_ids_flat"):
+            if key not in d:
+                raise KeyError(f"HOP{h} data missing {key}")
         if not torch.equal(d["token_ids_flat"].long().reshape(-1), token_ids):
             raise ValueError(f"token_ids differ at HOP{h}")
-    local_sizes = [int(d.get("vq_vocab_size", c.get("max_local_clusters", -1)))
-                   for d, c in zip(hop_data, hop_codebooks)]
+        if len(d["samples"]) != len(data["samples"]):
+            raise ValueError(f"sample count differs at HOP{h}")
+
+    shared_local_default = int(codebook.get("max_local_clusters", -1))
+    local_sizes = [
+        int(d.get("vq_vocab_size", shared_local_default))
+        for d in hop_data
+    ]
     if min(local_sizes) < 1:
         raise ValueError(f"invalid local VQ vocab sizes: {local_sizes}")
+
     local_vq_vocab_size_all = max(local_sizes)
     vq_ids_by_hop = torch.stack(
         [d["vq_ids_flat"].long().reshape(-1) for d in hop_data], dim=0
@@ -849,8 +872,8 @@ def main():
     for h, (ids, size) in enumerate(zip(vq_ids_by_hop, local_sizes), 1):
         if int(ids.min()) < 0 or int(ids.max()) >= size:
             raise ValueError(f"local VQ ID out of range at HOP{h}")
-    vq_ids = vq_ids_by_hop[-1]
 
+    vq_ids = vq_ids_by_hop[-1]
     token_vocab_size = int(codebook["model"]["tok_emb.weight"].shape[0])
 
     global_to_bpe = None
@@ -875,10 +898,6 @@ def main():
             "multihop1to10_staircase_conditioned_adapter_gated_cat_fusion"
         )
     else:
-        for h, c in enumerate(hop_codebooks, 1):
-            if c.get("partition_type") != "bpe_local_kmeans":
-                raise ValueError(f"global_vqwar requires bpe_local_kmeans at HOP{h}")
-
         # Input vocabulary: observed (HOP, BPE, local-VQW) triples across HOP1..10.
         global_input_ids_by_hop, input_vq_vocab_size = make_multihop_input_global_ids(
             token_ids, vq_ids_by_hop, local_sizes
